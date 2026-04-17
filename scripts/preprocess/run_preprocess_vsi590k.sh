@@ -1,38 +1,41 @@
 #!/usr/bin/env bash
 # =============================================================================
 # run_preprocess_vsi590k.sh
-# SLURM batch script — wraps preprocess_vsi590k.py
+# Plain bash script — wraps preprocess_vsi590k.py
+# Runs on ubuntu@27.190.15.135 (no SLURM). (D-06)
 #
 # Usage:
-#   sbatch run_preprocess_vsi590k.sh
+#   bash run_preprocess_vsi590k.sh
 #
-# Variables to edit before submitting:
+# Variables to edit before running:
 #   VIDEO_DIR   — local root of VSI video files
 #   OUTPUT_DIR  — where JSON + extracted frames are written
 #   NUM_SAMPLES — 0 = full dataset; set >0 to subsample
 # =============================================================================
 
-#SBATCH --account=bgkq-delta-cpu
-#SBATCH --partition=cpu
-#SBATCH --nodes=1
-#SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
-#SBATCH --time=08:00:00
-#SBATCH --job-name=space_preprocess
-#SBATCH --output=/u/lwu9/Space_sensing/projects/space/logs/preprocess_%j.out
-#SBATCH --error=/u/lwu9/Space_sensing/projects/space/logs/preprocess_%j.err
+# =============================================================================
+# Log setup: stdout + stderr → terminal AND log file simultaneously
+# =============================================================================
+
+LOG_DIR="/home/nvme03/wlx/Space_sensing/projects/space/logs"
+mkdir -p "${LOG_DIR}"
+LOG_FILE="${LOG_DIR}/preprocess_$(date +%Y%m%d_%H%M%S).log"
+
+# Redirect all subsequent stdout and stderr through tee into the log file
+exec > >(tee -a "${LOG_FILE}") 2>&1
 
 # =============================================================================
-# User-configurable variables — edit before submitting
+# User-configurable variables — edit before running
 # =============================================================================
 
 # TODO: set VIDEO_DIR to the local root directory that contains
 #       {dataset}/{scene_name}.mp4 files for VSI-590K
-VIDEO_DIR=""                      # e.g. /work/hdd/bgkq/lwu9/data/vsi_videos
+#       e.g. /home/nvme03/wlx/Space_sensing/data/vsi_videos
+VIDEO_DIR=""
 
 # TODO: set OUTPUT_DIR to where you want the JSON files and extracted frames
-OUTPUT_DIR=""                     # e.g. /work/hdd/bgkq/lwu9/data/vsi590k_processed
+#       e.g. /home/nvme03/wlx/Space_sensing/data/vsi590k_processed
+OUTPUT_DIR=""
 
 # Number of samples to use; 0 = full dataset
 NUM_SAMPLES=0
@@ -43,23 +46,23 @@ NUM_FRAMES=8
 # HuggingFace dataset identifier
 HF_DATASET="nyu-visionx/VSI-590K"
 
-# HuggingFace cache directory (large files must live under /work/ per cluster rules)
-HF_CACHE_DIR="/work/hdd/bgkq/lwu9/hf_cache"
+# HuggingFace cache directory
+HF_CACHE_DIR="/home/nvme03/wlx/Space_sensing/data/hf_cache"
 
 # Absolute path to the Python preprocessing script
-PYTHON_SCRIPT="/u/lwu9/Space_sensing/projects/space/src/preprocess/preprocess_vsi590k.py"
+PYTHON_SCRIPT="/home/nvme03/wlx/Space_sensing/projects/space/src/preprocess/preprocess_vsi590k.py"
 
 # =============================================================================
 # Validate required variables
 # =============================================================================
 
 if [[ -z "${VIDEO_DIR}" ]]; then
-    echo "ERROR: VIDEO_DIR is not set. Edit this script and set VIDEO_DIR before submitting." >&2
+    echo "ERROR: VIDEO_DIR is not set. Edit this script and set VIDEO_DIR before running." >&2
     exit 1
 fi
 
 if [[ -z "${OUTPUT_DIR}" ]]; then
-    echo "ERROR: OUTPUT_DIR is not set. Edit this script and set OUTPUT_DIR before submitting." >&2
+    echo "ERROR: OUTPUT_DIR is not set. Edit this script and set OUTPUT_DIR before running." >&2
     exit 1
 fi
 
@@ -76,9 +79,9 @@ fi
 
 echo "=========================================="
 echo "Job start:  $(date '+%Y-%m-%d %H:%M:%S')"
-echo "Job ID:     ${SLURM_JOB_ID}"
-echo "Node:       $(hostname)"
-echo "CPUs:       ${SLURM_CPUS_PER_TASK}"
+echo "Host:       $(hostname)"
+echo "CPUs:       $(nproc)"
+echo "Log file:   ${LOG_FILE}"
 echo "------------------------------------------"
 echo "VIDEO_DIR:  ${VIDEO_DIR}"
 echo "OUTPUT_DIR: ${OUTPUT_DIR}"
