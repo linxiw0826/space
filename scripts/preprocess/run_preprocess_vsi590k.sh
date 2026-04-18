@@ -68,6 +68,9 @@ fi
 # TODO: fill in conda env name (run `conda env list` to find it)
 # conda activate YOUR_ENV_NAME
 
+# Force HuggingFace to use the large-disk cache directory
+export HF_HOME="${HF_CACHE_DIR}"
+
 # =============================================================================
 # Main
 # =============================================================================
