@@ -310,26 +310,34 @@ def main():
 
         sample_id = f"vsi_{dataset_name}_{scene_name}_{i}"
 
-        # 视频路径（实际磁盘结构为三层：video_dir/dataset/scene_name/<camera>.mp4）
+        # 视频路径：两种磁盘结构
+        #   扁平结构（如 scannet）: {video_dir}/{dataset}/{scene_name}.mp4
+        #   目录结构（如 procthor）: {video_dir}/{dataset}/{scene_name}/{camera}.mp4
+        _flat_mp4 = Path(args.video_dir) / dataset_name / f"{scene_name}.mp4"
         _scene_dir = Path(args.video_dir) / dataset_name / scene_name
-        _preferred = _scene_dir / "raw_navigation_camera__0.mp4"
-        if _preferred.exists():
-            video_abs = _preferred
-            video_rel = f"videos/{dataset_name}/{scene_name}/raw_navigation_camera__0.mp4"
+
+        if _flat_mp4.exists():
+            video_abs = _flat_mp4
+            video_rel = f"videos/{dataset_name}/{scene_name}.mp4"
         elif _scene_dir.is_dir():
-            _candidates = sorted(_scene_dir.glob("*.mp4"))
-            if _candidates:
-                video_abs = _candidates[0]
-                video_rel = f"videos/{dataset_name}/{scene_name}/{_candidates[0].name}"
+            _preferred = _scene_dir / "raw_navigation_camera__0.mp4"
+            if _preferred.exists():
+                video_abs = _preferred
+                video_rel = f"videos/{dataset_name}/{scene_name}/raw_navigation_camera__0.mp4"
             else:
-                skipped += 1
-                if skipped <= 5:
-                    print(f"  场景目录无 .mp4，跳过：{_scene_dir}")
-                continue
+                _candidates = sorted(_scene_dir.glob("*.mp4"))
+                if _candidates:
+                    video_abs = _candidates[0]
+                    video_rel = f"videos/{dataset_name}/{scene_name}/{_candidates[0].name}"
+                else:
+                    skipped += 1
+                    if skipped <= 5:
+                        print(f"  场景目录无 .mp4，跳过：{_scene_dir}")
+                    continue
         else:
             skipped += 1
             if skipped <= 5:
-                print(f"  视频不存在，跳过：{_scene_dir}")
+                print(f"  视频不存在，跳过：{_flat_mp4} 或 {_scene_dir}")
             continue
 
         # ── LLaVA-Video 格式 ──────────────────────────────────────────────────
