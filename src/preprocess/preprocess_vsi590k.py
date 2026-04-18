@@ -4,7 +4,7 @@ preprocess_vsi590k.py
   1. LLaVA-Video 格式：<video> token，走 Qwen2.5-VL video 路径（不过 VGGT）
   2. SPAR-style 格式：多个 <image> token，走图像路径（过 VGGT + MoPE）
 
-数据集来源：https://huggingface.co/datasets/nyu-visionx/VSI-590K
+数据来源：本地 JSONL 标注文件（默认：{video_dir}/vsi_590k.jsonl）
 
 用法：
   python preprocess_vsi590k.py \
@@ -13,6 +13,12 @@ preprocess_vsi590k.py
       --num_samples 10000 \
       --num_frames 8 \
       --seed 42
+
+  # 可选：指定标注文件路径
+  python preprocess_vsi590k.py \
+      --video_dir /path/to/videos \
+      --annotation_file /path/to/vsi_590k.jsonl \
+      --output_dir /path/to/output
 
 输出：
   {output_dir}/
@@ -28,7 +34,6 @@ import random
 from pathlib import Path
 
 import cv2
-from datasets import load_dataset
 from tqdm import tqdm
 
 
@@ -48,27 +53,6 @@ NA_QUESTION_TYPES = [
     "room_size_estimation",
 ]
 ALL_QUESTION_TYPES = MCA_QUESTION_TYPES + NA_QUESTION_TYPES
-
-
-# ── 问题文本构建 ──────────────────────────────────────────────────────────────
-
-def build_question_text(doc: dict) -> str:
-    """根据 task type 构造带后缀的问题文本（与 VSI-Bench 评测格式保持一致）。"""
-    question = doc["question"]
-    question_type = doc["question_type"]
-
-    if question_type in MCA_QUESTION_TYPES:
-        options = doc.get("options", [])
-        options_str = "Options:\n" + "\n".join(options) if options else ""
-        post_prompt = "Answer with the option's letter from the given choices directly."
-        parts = ["These are frames of a video.", question]
-        if options_str:
-            parts.append(options_str)
-        parts.append(post_prompt)
-        return "\n".join(parts)
-    else:  # NA
-        post_prompt = "Please answer the question using a single word or phrase."
-        return "\n".join(["These are frames of a video.", question, post_prompt])
 
 
 # ── 视频帧提取 ────────────────────────────────────────────────────────────────
@@ -118,7 +102,12 @@ def extract_frames(video_path: str, num_frames: int, out_dir: str) -> list[str]:
 
 # ── 单条样本转换 ──────────────────────────────────────────────────────────────
 
-def to_llava_video_format(doc: dict, video_rel_path: str, sample_id: str) -> dict:
+def to_llava_video_format(
+    doc: dict,
+    video_rel_path: str,
+    sample_id: str,
+    question_text: str,
+) -> dict:
     """
     LLaVA-Video 格式：
     {
@@ -133,7 +122,6 @@ def to_llava_video_format(doc: dict, video_rel_path: str, sample_id: str) -> dic
         "metadata": {...}
     }
     """
-    question_text = build_question_text(doc)
     return {
         "id": sample_id,
         "conversations": [
@@ -145,7 +133,7 @@ def to_llava_video_format(doc: dict, video_rel_path: str, sample_id: str) -> dic
         "question_type": doc["question_type"],
         "metadata": {
             "scene_name": doc.get("scene_name", ""),
-            "dataset": doc.get("dataset", ""),
+            "dataset": doc.get("dataset_name", ""),
         },
     }
 
@@ -154,6 +142,7 @@ def to_spar_format(
     doc: dict,
     frame_rel_paths: list[str],
     sample_id: str,
+    question_text: str,
 ) -> dict:
     """
     SPAR-style 格式（多帧图像路径，过 VGGT geometry encoder）：
@@ -170,12 +159,11 @@ def to_spar_format(
     """
     n = len(frame_rel_paths)
     image_tokens = "\n".join(["<image>"] * n)
-    question_text = build_question_text(doc)
 
     spar_info = json.dumps({
         "question_type": doc["question_type"],
         "scene_name": doc.get("scene_name", ""),
-        "dataset": doc.get("dataset", ""),
+        "dataset": doc.get("dataset_name", ""),
     })
 
     return {
@@ -195,14 +183,9 @@ def to_spar_format(
 def parse_args():
     p = argparse.ArgumentParser(description="VSI-590K → VG-LLM 两种训练格式")
     p.add_argument(
-        "--hf_dataset",
-        default="nyu-visionx/VSI-590K",
-        help="HuggingFace 数据集名称或本地路径（默认: nyu-visionx/VSI-590K）",
-    )
-    p.add_argument(
-        "--hf_split",
-        default="train",
-        help="数据集 split（默认: train）",
+        "--annotation_file",
+        default=None,
+        help="本地 JSONL 标注文件路径（默认: {video_dir}/vsi_590k.jsonl）",
     )
     p.add_argument(
         "--video_dir",
@@ -230,7 +213,7 @@ def parse_args():
         "--question_types",
         nargs="*",
         default=None,
-        help="只处理指定 task type（默认: 全部 10 种）",
+        help="只处理指定 task type（默认: 不过滤，使用全部类型）",
     )
     p.add_argument(
         "--seed",
@@ -243,11 +226,6 @@ def parse_args():
         action="store_true",
         help="跳过帧提取（假设帧已存在，仅重新生成 JSON）",
     )
-    p.add_argument(
-        "--hf_cache_dir",
-        default=None,
-        help="HuggingFace 缓存目录（可选）",
-    )
     return p.parse_args()
 
 
@@ -259,28 +237,36 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     frames_root = output_dir / "frames"
 
-    # ── 1. 加载数据集 ─────────────────────────────────────────────────────────
-    print(f"加载数据集：{args.hf_dataset} [{args.hf_split}] ...")
-    dataset = load_dataset(
-        args.hf_dataset,
-        split=args.hf_split,
-        cache_dir=args.hf_cache_dir,
-    )
+    # ── annotation_file 默认值：{video_dir}/vsi_590k.jsonl ───────────────────
+    annotation_file = args.annotation_file
+    if annotation_file is None:
+        annotation_file = str(Path(args.video_dir) / "vsi_590k.jsonl")
 
-    # ── 2. 过滤 task type ─────────────────────────────────────────────────────
-    question_types = args.question_types or ALL_QUESTION_TYPES
-    print(f"使用 task types: {question_types}")
-    dataset = dataset.filter(
-        lambda doc: doc["question_type"] in question_types,
-        desc="过滤 task type",
-    )
+    # ── 1. 加载本地 JSONL 标注文件 ────────────────────────────────────────────
+    print(f"加载标注文件：{annotation_file} ...")
+    dataset = []
+    with open(annotation_file, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                dataset.append(json.loads(line))
+    print(f"共读取 {len(dataset)} 条记录")
+
+    # ── 2. 过滤 task type（仅在 --question_types 指定时过滤）────────────────
+    if args.question_types is not None:
+        question_types = args.question_types
+        print(f"按 task type 过滤: {question_types}")
+        dataset = [doc for doc in dataset if doc["question_type"] in question_types]
+        print(f"过滤后剩余：{len(dataset)} 条")
+    else:
+        print("未指定 --question_types，使用全部类型，不过滤")
 
     # ── 3. 采样 ───────────────────────────────────────────────────────────────
     total = len(dataset)
     if args.num_samples > 0 and args.num_samples < total:
         indices = random.sample(range(total), args.num_samples)
         indices.sort()
-        dataset = dataset.select(indices)
+        dataset = [dataset[i] for i in indices]
         print(f"采样 {args.num_samples} / {total} 条")
     else:
         print(f"使用全量数据：{total} 条")
@@ -296,9 +282,32 @@ def main():
     spar_records = []
     skipped = 0
 
-    for i, doc in enumerate(tqdm(dataset, desc="处理样本")):
-        scene_name = doc.get("scene_name", f"scene_{i:06d}")
-        dataset_name = doc.get("dataset", "vsibench")
+    for i, raw_doc in enumerate(tqdm(dataset, desc="处理样本")):
+        # 从 video 字段提取 dataset_name 和 scene_name
+        # video 格式："{dataset_name}/{scene_name}.mp4"，例如 "scannet/scene0191_00.mp4"
+        video_field = raw_doc.get("video", "")
+        video_parts = video_field.split("/")
+        if len(video_parts) >= 2:
+            dataset_name = video_parts[0]
+            scene_name = Path(video_parts[-1]).stem  # 去掉 .mp4
+        else:
+            dataset_name = "vsibench"
+            scene_name = Path(video_field).stem if video_field else f"scene_{i:06d}"
+
+        # 构建统一的 doc 结构，补充提取出的字段
+        doc = dict(raw_doc)
+        doc["dataset_name"] = dataset_name
+        doc["scene_name"] = scene_name
+        doc["ground_truth"] = raw_doc["conversations"][1]["value"]
+        doc["question_type"] = raw_doc["question_type"]
+
+        # 从 conversations[0]["value"] 去掉 "<image>\n" 前缀得到 question_text
+        human_value = raw_doc["conversations"][0]["value"]
+        if human_value.startswith("<image>\n"):
+            question_text = human_value[len("<image>\n"):]
+        else:
+            question_text = human_value
+
         sample_id = f"vsi_{dataset_name}_{scene_name}_{i}"
 
         # 视频路径（实际磁盘结构为三层：video_dir/dataset/scene_name/<camera>.mp4）
@@ -315,17 +324,17 @@ def main():
             else:
                 skipped += 1
                 if skipped <= 5:
-                    print(f"  ⚠️  场景目录无 .mp4，跳过：{_scene_dir}")
+                    print(f"  场景目录无 .mp4，跳过：{_scene_dir}")
                 continue
         else:
             skipped += 1
             if skipped <= 5:
-                print(f"  ⚠️  视频不存在，跳过：{_scene_dir}")
+                print(f"  视频不存在，跳过：{_scene_dir}")
             continue
 
         # ── LLaVA-Video 格式 ──────────────────────────────────────────────────
         video_records.append(
-            to_llava_video_format(doc, video_rel, sample_id + "_video")
+            to_llava_video_format(doc, video_rel, sample_id + "_video", question_text)
         )
 
         # ── SPAR-style 格式：提取帧 ───────────────────────────────────────────
@@ -348,7 +357,7 @@ def main():
             except Exception as e:
                 skipped += 1
                 if skipped <= 5:
-                    print(f"  ⚠️  帧提取失败，跳过：{e}")
+                    print(f"  帧提取失败，跳过：{e}")
                 continue
 
         if not frame_rel_paths:
@@ -356,7 +365,7 @@ def main():
             continue
 
         spar_records.append(
-            to_spar_format(doc, frame_rel_paths, sample_id + "_spar")
+            to_spar_format(doc, frame_rel_paths, sample_id + "_spar", question_text)
         )
 
     # ── 6. 保存 JSON ──────────────────────────────────────────────────────────
@@ -368,17 +377,23 @@ def main():
 
     # ── 7. 统计报告 ───────────────────────────────────────────────────────────
     print("\n" + "=" * 60)
-    print(f"✅ 完成！共处理 {len(dataset)} 条，跳过 {skipped} 条")
-    print(f"   LLaVA-Video 格式：{len(video_records)} 条 → {video_json_path}")
-    print(f"   SPAR-style  格式：{len(spar_records)} 条 → {spar_json_path}")
+    print(f"完成！共处理 {len(dataset)} 条，跳过 {skipped} 条")
+    print(f"   LLaVA-Video 格式：{len(video_records)} 条 -> {video_json_path}")
+    print(f"   SPAR-style  格式：{len(spar_records)} 条 -> {spar_json_path}")
 
     # 按 task type 统计
     from collections import Counter
     video_type_counts = Counter(r["question_type"] for r in video_records)
     print("\n按 task type 分布（LLaVA-Video 格式，SPAR 同）：")
+    # 先打印已知类型
     for qt in ALL_QUESTION_TYPES:
         count = video_type_counts.get(qt, 0)
-        print(f"  {qt:<40s}: {count}")
+        if count > 0:
+            print(f"  {qt:<40s}: {count}")
+    # 打印不在 ALL_QUESTION_TYPES 中的类型（JSONL 可能有新类型名称）
+    for qt, count in sorted(video_type_counts.items()):
+        if qt not in ALL_QUESTION_TYPES:
+            print(f"  {qt:<40s}: {count}  (not in ALL_QUESTION_TYPES)")
     print("=" * 60)
 
 
