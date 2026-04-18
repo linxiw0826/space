@@ -28,14 +28,9 @@ exec > >(tee -a "${LOG_FILE}") 2>&1
 # User-configurable variables — edit before running
 # =============================================================================
 
-# TODO: set VIDEO_DIR to the local root directory that contains
-#       {dataset}/{scene_name}.mp4 files for VSI-590K
-#       e.g. /home/nvme03/wlx/Space_sensing/data/vsi_videos
-VIDEO_DIR=""
+VIDEO_DIR="/home/nvme03/wlx/Space_sensing/data/VSI-590K"
 
-# TODO: set OUTPUT_DIR to where you want the JSON files and extracted frames
-#       e.g. /home/nvme03/wlx/Space_sensing/data/vsi590k_processed
-OUTPUT_DIR=""
+OUTPUT_DIR="/home/nvme03/wlx/Space_sensing/data/vsi590k_processed"
 
 # Number of samples to use; 0 = full dataset
 NUM_SAMPLES=0
@@ -70,7 +65,7 @@ fi
 # Environment setup
 # =============================================================================
 
-# TODO: activate your conda environment — replace YOUR_ENV_NAME with the actual name
+# TODO: fill in conda env name (run `conda env list` to find it)
 # conda activate YOUR_ENV_NAME
 
 # =============================================================================
