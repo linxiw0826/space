@@ -25,6 +25,20 @@ exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "=== Log: ${LOG_FILE} ==="
 
 # ============================================================
+# HELPERS
+# ============================================================
+_hf_download() {
+    local attempt=1
+    while [[ $attempt -le 5 ]]; do
+        hf download "$@" && return 0
+        echo "  [retry] Attempt ${attempt}/5 failed — retrying in 30s ..."
+        sleep 30
+        ((attempt++))
+    done
+    return 1
+}
+
+# ============================================================
 # SECTION 0: Create directories
 # ============================================================
 echo ""
@@ -36,6 +50,7 @@ mkdir -p "${DONE_DIR}"
 mkdir -p "${DATA_ROOT}/guide_repro/train"
 mkdir -p "${DATA_ROOT}/guide_repro/media/llava_hound/frames"
 mkdir -p "${DATA_ROOT}/guide_repro/media/spar/scannet/images"
+mkdir -p "${DATA_ROOT}/guide_repro/media/spar/structured3d/images"
 mkdir -p "${DATA_ROOT}/VSI-590K"
 mkdir -p "${DATA_ROOT}/vsi590k_processed"
 mkdir -p "${DATA_ROOT}/VSIBench"
@@ -53,13 +68,13 @@ if [[ -f "${DONE_DIR}/models" ]]; then
 else
     _ok=true
     echo "  Downloading Qwen/Qwen3-VL-4B-Instruct ..."
-    hf download Qwen/Qwen3-VL-4B-Instruct \
+    _hf_download Qwen/Qwen3-VL-4B-Instruct \
         --local-dir "${MODELS_ROOT}/Qwen3-VL-4B-Instruct" \
         || { echo "WARNING: Qwen3-VL-4B-Instruct download failed or incomplete"; _ok=false; }
 
     echo "  Downloading facebook/vggt-1b ..."
     # VGGT uses PyTorchModelHubMixin — downloaded directly from HF hub
-    hf download facebook/vggt-1b \
+    _hf_download facebook/vggt-1b \
         --local-dir "${MODELS_ROOT}/VGGT-1B" \
         || { echo "WARNING: vggt-1b download failed or incomplete"; _ok=false; }
 
@@ -82,9 +97,9 @@ if [[ -f "${DONE_DIR}/guide_annotations" ]]; then
 else
     _ok=true
     echo "  Downloading llava_hound_64k.json and spar_234k.json from zd11024/VG-LLM-Data ..."
-    hf download zd11024/VG-LLM-Data \
+    _hf_download zd11024/VG-LLM-Data \
+        "train/llava_hound_64k.json" "train/spar_234k.json" \
         --repo-type dataset \
-        --include "train/llava_hound_64k.json" "train/spar_234k.json" \
         --local-dir "${DATA_ROOT}/guide_repro" \
         || { echo "WARNING: VG-LLM-Data annotation download failed or incomplete"; _ok=false; }
 
@@ -149,11 +164,11 @@ if [[ -f "${DONE_DIR}/spar_images" ]]; then
 else
     SPAR_MEDIA="${DATA_ROOT}/guide_repro/media"
     SPAR_STAGE="${DATA_ROOT}/.stage_spar7m"
-    mkdir -p "${SPAR_STAGE}" "${SPAR_MEDIA}"
+    mkdir -p "${SPAR_STAGE}" "${SPAR_MEDIA}/spar"
 
     _ok=true
     echo "  Downloading scannet.tar.gz (~650 MB) from jasonzhango/SPAR-7M ..."
-    hf download jasonzhango/SPAR-7M \
+    _hf_download jasonzhango/SPAR-7M \
         --repo-type dataset \
         --include "scannet.tar.gz" \
         --local-dir "${SPAR_STAGE}" \
@@ -161,13 +176,13 @@ else
 
     if [[ -f "${SPAR_STAGE}/scannet.tar.gz" ]]; then
         echo "  Extracting scannet.tar.gz → ${SPAR_MEDIA}/spar/scannet/ ..."
-        tar -xzf "${SPAR_STAGE}/scannet.tar.gz" -C "${SPAR_MEDIA}" \
+        tar -xzf "${SPAR_STAGE}/scannet.tar.gz" -C "${SPAR_MEDIA}/spar" \
             && rm -f "${SPAR_STAGE}/scannet.tar.gz" \
             || { echo "WARNING: scannet.tar.gz extraction failed"; _ok=false; }
     fi
 
     echo "  Downloading scannetpp.tar.gz (~1.25 GB) from jasonzhango/SPAR-7M ..."
-    hf download jasonzhango/SPAR-7M \
+    _hf_download jasonzhango/SPAR-7M \
         --repo-type dataset \
         --include "scannetpp.tar.gz" \
         --local-dir "${SPAR_STAGE}" \
@@ -175,9 +190,23 @@ else
 
     if [[ -f "${SPAR_STAGE}/scannetpp.tar.gz" ]]; then
         echo "  Extracting scannetpp.tar.gz → ${SPAR_MEDIA}/spar/scannetpp/ ..."
-        tar -xzf "${SPAR_STAGE}/scannetpp.tar.gz" -C "${SPAR_MEDIA}" \
+        tar -xzf "${SPAR_STAGE}/scannetpp.tar.gz" -C "${SPAR_MEDIA}/spar" \
             && rm -f "${SPAR_STAGE}/scannetpp.tar.gz" \
             || { echo "WARNING: scannetpp.tar.gz extraction failed"; _ok=false; }
+    fi
+
+    echo "  Downloading structured3d.tar.gz from jasonzhango/SPAR-7M ..."
+    _hf_download jasonzhango/SPAR-7M \
+        --repo-type dataset \
+        --include "structured3d.tar.gz" \
+        --local-dir "${SPAR_STAGE}" \
+        || { echo "WARNING: SPAR-7M structured3d.tar.gz download failed or incomplete"; _ok=false; }
+
+    if [[ -f "${SPAR_STAGE}/structured3d.tar.gz" ]]; then
+        echo "  Extracting structured3d.tar.gz → ${SPAR_MEDIA}/spar/structured3d/ ..."
+        tar -xzf "${SPAR_STAGE}/structured3d.tar.gz" -C "${SPAR_MEDIA}/spar" \
+            && rm -f "${SPAR_STAGE}/structured3d.tar.gz" \
+            || { echo "WARNING: structured3d.tar.gz extraction failed"; _ok=false; }
     fi
 
     if [[ "${_ok}" == "true" ]]; then
@@ -206,7 +235,7 @@ else
             || { echo "WARNING: rsync of VSI-590K from nvme03 failed or incomplete"; _ok=false; }
     else
         echo "  nvme03 source not found (${NVME03_DATA}/VSI-590K). Falling back to hf ..."
-        hf download nyu-visionx/VSI-590K \
+        _hf_download nyu-visionx/VSI-590K \
             --repo-type dataset \
             --local-dir "${DATA_ROOT}/VSI-590K" \
             || { echo "WARNING: VSI-590K HuggingFace download failed or incomplete"; _ok=false; }
@@ -260,7 +289,7 @@ if [[ -f "${DONE_DIR}/vsibench" ]]; then
 else
     _ok=true
     echo "  Downloading nyu-visionx/VSIBench ..."
-    hf download nyu-visionx/VSIBench \
+    _hf_download nyu-visionx/VSI-Bench \
         --repo-type dataset \
         --local-dir "${DATA_ROOT}/VSIBench" \
         || { echo "WARNING: VSIBench download failed or incomplete"; _ok=false; }
@@ -322,6 +351,9 @@ _check_dir_nonempty "SPAR scannet images (non-empty)" \
 
 _check_dir_nonempty "SPAR scannetpp images (non-empty)" \
     "${DATA_ROOT}/guide_repro/media/spar/scannetpp/images"
+
+_check_dir_nonempty "SPAR structured3d images (non-empty)" \
+    "${DATA_ROOT}/guide_repro/media/spar/structured3d/images"
 
 echo ""
 echo "=== DOWNLOAD SUMMARY ==="
