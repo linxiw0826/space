@@ -1,0 +1,4 @@
+task: scannet_4frames
+dataset_name: scannet_4frames
+include: default_yaml
+test_split: val

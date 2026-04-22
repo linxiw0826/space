@@ -39,18 +39,18 @@ from tqdm import tqdm
 
 # ── Task type 分类（来自 VSI-Bench utils.py）─────────────────────────────────
 MCA_QUESTION_TYPES = [
-    "object_rel_direction_easy",
-    "object_rel_direction_medium",
-    "object_rel_direction_hard",
-    "object_rel_distance",
-    "route_planning",
-    "obj_appearance_order",
+    "relative_direction_object",
+    "relative_distance_object",
+    "relative_size_object",
+    "relative_count",
+    "appearance_order",
 ]
 NA_QUESTION_TYPES = [
-    "object_abs_distance",
-    "object_counting",
-    "object_size_estimation",
-    "room_size_estimation",
+    "absolute_distance_object",
+    "absolute_count",
+    "absolute_size_object",
+    "absolute_size_room",
+    "absolute_direction_object",
 ]
 ALL_QUESTION_TYPES = MCA_QUESTION_TYPES + NA_QUESTION_TYPES
 
@@ -172,7 +172,7 @@ def to_spar_format(
             {"from": "human", "value": f"{image_tokens}\n{question_text}"},
             {"from": "gpt", "value": str(doc["ground_truth"])},
         ],
-        "images": frame_rel_paths,
+        "image": frame_rel_paths,
         "question_type": doc["question_type"],
         "spar_info": spar_info,
     }

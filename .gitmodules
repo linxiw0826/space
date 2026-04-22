@@ -1,0 +1,3 @@
+[submodule "refs/Let_Geometry_GUIDE"]
+	path = refs/Let_Geometry_GUIDE
+	url = git@github.com:Chongyu-hub/Let_Geometry_GUIDE.git
