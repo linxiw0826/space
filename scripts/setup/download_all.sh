@@ -18,7 +18,7 @@ export HF_ENDPOINT=https://hf-mirror.com
 # ============================================================
 # LOGGING
 # ============================================================
-LOG_DIR="/home/nvme01/wlx/Space_sensing/logs/setup"
+LOG_DIR="/home/nvme03/wlx/Space_sensing/logs/setup"
 mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/download_$(date +%Y%m%d_%H%M%S).log"
 exec > >(tee -a "${LOG_FILE}") 2>&1
@@ -55,14 +55,12 @@ else
     echo "  Downloading Qwen/Qwen3-VL-4B-Instruct ..."
     hf download Qwen/Qwen3-VL-4B-Instruct \
         --local-dir "${MODELS_ROOT}/Qwen3-VL-4B-Instruct" \
-        --resume-download \
         || { echo "WARNING: Qwen3-VL-4B-Instruct download failed or incomplete"; _ok=false; }
 
     echo "  Downloading facebook/vggt-1b ..."
     # VGGT uses PyTorchModelHubMixin — downloaded directly from HF hub
     hf download facebook/vggt-1b \
         --local-dir "${MODELS_ROOT}/VGGT-1B" \
-        --resume-download \
         || { echo "WARNING: vggt-1b download failed or incomplete"; _ok=false; }
 
     if [[ "${_ok}" == "true" ]]; then
@@ -88,7 +86,6 @@ else
         --repo-type dataset \
         --include "train/llava_hound_64k.json" "train/spar_234k.json" \
         --local-dir "${DATA_ROOT}/guide_repro" \
-        --resume-download \
         || { echo "WARNING: VG-LLM-Data annotation download failed or incomplete"; _ok=false; }
 
     # Verify
@@ -160,7 +157,6 @@ else
         --repo-type dataset \
         --include "scannet.tar.gz" \
         --local-dir "${SPAR_STAGE}" \
-        --resume-download \
         || { echo "WARNING: SPAR-7M scannet.tar.gz download failed or incomplete"; _ok=false; }
 
     if [[ -f "${SPAR_STAGE}/scannet.tar.gz" ]]; then
@@ -175,7 +171,6 @@ else
         --repo-type dataset \
         --include "scannetpp.tar.gz" \
         --local-dir "${SPAR_STAGE}" \
-        --resume-download \
         || { echo "WARNING: SPAR-7M scannetpp.tar.gz download failed or incomplete"; _ok=false; }
 
     if [[ -f "${SPAR_STAGE}/scannetpp.tar.gz" ]]; then
@@ -214,7 +209,6 @@ else
         hf download nyu-visionx/VSI-590K \
             --repo-type dataset \
             --local-dir "${DATA_ROOT}/VSI-590K" \
-            --resume-download \
             || { echo "WARNING: VSI-590K HuggingFace download failed or incomplete"; _ok=false; }
     fi
 
@@ -269,7 +263,6 @@ else
     hf download nyu-visionx/VSIBench \
         --repo-type dataset \
         --local-dir "${DATA_ROOT}/VSIBench" \
-        --resume-download \
         || { echo "WARNING: VSIBench download failed or incomplete"; _ok=false; }
 
     if [[ "${_ok}" == "true" ]]; then
