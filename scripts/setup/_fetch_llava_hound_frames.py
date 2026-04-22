@@ -102,17 +102,18 @@ def parse_annotation(ann_json: str) -> dict:
 
         for img_path in images:
             parts = img_path.replace("\\", "/").split("/")
-            # Expected: llava_hound / frames / {video_id} / {frame_file}
-            if len(parts) < 4:
+            # Format: llava_hound/frames/{video_id}  (3 parts, no frame filename)
+            #      or llava_hound/frames/{video_id}/{frame_file}  (4 parts)
+            if len(parts) < 3:
                 logger.warning(
-                    f"Unexpected image path format (expected >=4 parts): {img_path!r}"
+                    f"Unexpected image path format (expected >=3 parts): {img_path!r}"
                 )
                 continue
             video_id = parts[2]
-            frame_file = parts[3]
             if video_id not in video_frames:
                 video_frames[video_id] = set()
-            video_frames[video_id].add(frame_file)
+            if len(parts) >= 4:
+                video_frames[video_id].add(parts[3])
 
     if skipped:
         logger.warning(f"Skipped {skipped} annotation items with no image/video field.")

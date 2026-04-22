@@ -151,62 +151,42 @@ else
 fi
 
 # ============================================================
-# SECTION 4: SPAR image data (jasonzhango/SPAR-7M on HuggingFace)
-# Includes ScanNet + ScanNet++ frames pre-packaged as SPAR-format tar archives.
-# No official ScanNet license required — frames distributed as part of SPAR-7M (MIT).
-# Extracts to: ${DATA_ROOT}/guide_repro/media/spar/{scannet,scannetpp}/images/
+# SECTION 4: SPAR image data (jasonzhango/SPAR-7M-RGBD on HuggingFace)
+# Contains RGB images + depth + pose for ScanNet, ScanNet++, Structured3D (~184 GB).
+# Split into 18 shards (spar-rgbd-00..17.tar.gz); must be concatenated before extraction.
+# Extracts to: ${DATA_ROOT}/guide_repro/media/spar/{scannet,scannetpp,structured3d}/
 # ============================================================
 echo ""
-echo "=== SECTION 4: SPAR image data (jasonzhango/SPAR-7M) ==="
+echo "=== SECTION 4: SPAR image data (jasonzhango/SPAR-7M-RGBD) ==="
 
 if [[ -f "${DONE_DIR}/spar_images" ]]; then
     echo "  Already done — skipping (delete ${DONE_DIR}/spar_images to re-run)"
 else
     SPAR_MEDIA="${DATA_ROOT}/guide_repro/media"
     SPAR_STAGE="${DATA_ROOT}/.stage_spar7m"
-    mkdir -p "${SPAR_STAGE}" "${SPAR_MEDIA}/spar"
+    mkdir -p "${SPAR_STAGE}" "${SPAR_MEDIA}"
 
     _ok=true
-    echo "  Downloading scannet.tar.gz (~650 MB) from jasonzhango/SPAR-7M ..."
-    _hf_download jasonzhango/SPAR-7M \
+    echo "  Downloading 18 shards from jasonzhango/SPAR-7M-RGBD (~184 GB total) ..."
+    _hf_download jasonzhango/SPAR-7M-RGBD \
         --repo-type dataset \
-        --include "scannet.tar.gz" \
+        --include "spar-rgbd-*.tar.gz" \
         --local-dir "${SPAR_STAGE}" \
-        || { echo "WARNING: SPAR-7M scannet.tar.gz download failed or incomplete"; _ok=false; }
+        || { echo "WARNING: SPAR-7M-RGBD download failed or incomplete"; _ok=false; }
 
-    if [[ -f "${SPAR_STAGE}/scannet.tar.gz" ]]; then
-        echo "  Extracting scannet.tar.gz → ${SPAR_MEDIA}/spar/scannet/ ..."
-        tar -xzf "${SPAR_STAGE}/scannet.tar.gz" -C "${SPAR_MEDIA}/spar" \
-            && rm -f "${SPAR_STAGE}/scannet.tar.gz" \
-            || { echo "WARNING: scannet.tar.gz extraction failed"; _ok=false; }
-    fi
+    shard_count=$(ls "${SPAR_STAGE}"/spar-rgbd-*.tar.gz 2>/dev/null | wc -l)
+    echo "  Shards present: ${shard_count}/18"
 
-    echo "  Downloading scannetpp.tar.gz (~1.25 GB) from jasonzhango/SPAR-7M ..."
-    _hf_download jasonzhango/SPAR-7M \
-        --repo-type dataset \
-        --include "scannetpp.tar.gz" \
-        --local-dir "${SPAR_STAGE}" \
-        || { echo "WARNING: SPAR-7M scannetpp.tar.gz download failed or incomplete"; _ok=false; }
-
-    if [[ -f "${SPAR_STAGE}/scannetpp.tar.gz" ]]; then
-        echo "  Extracting scannetpp.tar.gz → ${SPAR_MEDIA}/spar/scannetpp/ ..."
-        tar -xzf "${SPAR_STAGE}/scannetpp.tar.gz" -C "${SPAR_MEDIA}/spar" \
-            && rm -f "${SPAR_STAGE}/scannetpp.tar.gz" \
-            || { echo "WARNING: scannetpp.tar.gz extraction failed"; _ok=false; }
-    fi
-
-    echo "  Downloading structured3d.tar.gz from jasonzhango/SPAR-7M ..."
-    _hf_download jasonzhango/SPAR-7M \
-        --repo-type dataset \
-        --include "structured3d.tar.gz" \
-        --local-dir "${SPAR_STAGE}" \
-        || { echo "WARNING: SPAR-7M structured3d.tar.gz download failed or incomplete"; _ok=false; }
-
-    if [[ -f "${SPAR_STAGE}/structured3d.tar.gz" ]]; then
-        echo "  Extracting structured3d.tar.gz → ${SPAR_MEDIA}/spar/structured3d/ ..."
-        tar -xzf "${SPAR_STAGE}/structured3d.tar.gz" -C "${SPAR_MEDIA}/spar" \
-            && rm -f "${SPAR_STAGE}/structured3d.tar.gz" \
-            || { echo "WARNING: structured3d.tar.gz extraction failed"; _ok=false; }
+    if [[ "${shard_count}" -eq 18 ]]; then
+        echo "  Extracting all shards → ${SPAR_MEDIA}/ ..."
+        # Split archives must be concatenated; extracts to spar/{scannet,scannetpp,structured3d}/
+        cat "${SPAR_STAGE}"/spar-rgbd-*.tar.gz \
+            | tar -xzf - -C "${SPAR_MEDIA}" \
+            && rm -f "${SPAR_STAGE}"/spar-rgbd-*.tar.gz \
+            || { echo "WARNING: SPAR-7M-RGBD extraction failed"; _ok=false; }
+    else
+        echo "WARNING: Only ${shard_count}/18 shards present — skipping extraction. Re-run to retry."
+        _ok=false
     fi
 
     if [[ "${_ok}" == "true" ]]; then
