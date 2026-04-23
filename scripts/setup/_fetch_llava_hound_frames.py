@@ -218,33 +218,32 @@ def fetch_frames(ann_json: str, output_dir: str, progress_file: str) -> None:
         "ShareGPTVideo/train_video_and_instruction",
         split="train",
         streaming=True,
-        trust_remote_code=True,
     )
 
-    # 4. Inspect first few items to understand field names
-    field_names_printed = False
+    # 4. Stream through dataset, saving all frames for each needed video_id.
+    #    Each dataset item is one frame (WebDataset format: jpeg + __key__ + __url__).
+    #    __key__ format: "{video_id}/{frame_idx}" — first part is the video_id.
+    #    We scan the full dataset to collect ALL frames per video (not just the first).
+    #    Checkpoint: save progress every 1000 frames in case of interruption.
+
     inspected = 0
     MAX_INSPECT = 3
 
-    total_done_this_run = 0
-    total_to_do = len(pending_ids)
-
-    # We need to scan the entire stream until all pending_ids are resolved
-    remaining = set(pending_ids)
+    frames_saved_this_run = 0
+    saved_ids: set = set()   # video_ids with ≥1 frame saved this run
 
     for item in ds:
-        # Debug: print field names for the first MAX_INSPECT items
-        if not field_names_printed and inspected < MAX_INSPECT:
-            logger.info(f"[DEBUG] Dataset item keys (item #{inspected}): {list(item.keys())}")
+        # Debug: print actual field values for first few items
+        if inspected < MAX_INSPECT:
+            debug_vals = {
+                k: (f"<bytes len={len(v)}>" if isinstance(v, (bytes, bytearray))
+                    else str(v)[:120])
+                for k, v in item.items()
+            }
+            logger.info(f"[DEBUG] item #{inspected}: {debug_vals}")
             inspected += 1
-            if inspected >= MAX_INSPECT:
-                field_names_printed = True
 
-        if not remaining:
-            logger.info("All pending video_ids processed. Stopping stream early.")
-            break
-
-        # Resolve video_id from item
+        # Resolve video_id from item fields
         item_vid = (
             item.get("video_id")
             or item.get("id")
@@ -252,19 +251,29 @@ def fetch_frames(ann_json: str, output_dir: str, progress_file: str) -> None:
             or item.get("clip_id")
         )
         if item_vid is None:
-            # Try to derive from a video path field
             for key in ("video", "video_path", "file"):
                 if key in item and isinstance(item[key], str):
                     item_vid = Path(item[key]).stem
                     break
 
-        if item_vid not in remaining:
+        # WebDataset format: __key__ is "{video_id}/{frame_idx}"
+        if item_vid is None and "__key__" in item:
+            key_str = str(item["__key__"])
+            candidate = key_str.split("/")[0]
+            if candidate in pending_ids or candidate in done_ids:
+                item_vid = candidate
+            elif key_str in pending_ids or key_str in done_ids:
+                item_vid = key_str
+
+        if item_vid is None:
             continue
+        if item_vid in done_ids:
+            continue  # fully completed in a previous run
+        if item_vid not in pending_ids and item_vid not in saved_ids:
+            continue  # not needed
 
-        # Resolve output directory for this video_id
         vid_output_dir = os.path.join(output_dir, item_vid)
-        frame_files = video_frames[item_vid]
-
+        frame_files = video_frames.get(item_vid, [])
         success = False
 
         # Case A: item contains pre-extracted frames as PIL images or bytes
@@ -281,13 +290,9 @@ def fetch_frames(ann_json: str, output_dir: str, progress_file: str) -> None:
             Path(vid_output_dir).mkdir(parents=True, exist_ok=True)
             saved = 0
             for i, frame in enumerate(frames):
-                # Use the i-th expected frame filename if available
-                if i < len(frame_files):
-                    fname = frame_files[i]
-                else:
-                    fname = f"{i + 1:04d}.jpg"
+                fname = frame_files[i] if i < len(frame_files) else f"{i + 1:04d}.jpg"
                 dest = os.path.join(vid_output_dir, fname)
-                if save_image(frame, dest):
+                if not os.path.exists(dest) and save_image(frame, dest):
                     saved += 1
             if saved > 0:
                 success = True
@@ -306,43 +311,62 @@ def fetch_frames(ann_json: str, output_dir: str, progress_file: str) -> None:
                         success = extract_frames_ffmpeg(video_path, vid_output_dir)
                     else:
                         logger.warning(
-                            f"video_id={item_vid}: video path {video_path!r} "
-                            f"does not exist on disk."
+                            f"video_id={item_vid}: video path {video_path!r} does not exist."
                         )
                     break
 
+        # Case C: WebDataset per-frame format — one jpeg per item
+        elif "jpeg" in item:
+            jpeg_data = item["jpeg"]
+            if isinstance(jpeg_data, (bytes, bytearray)):
+                key_str = str(item.get("__key__", ""))
+                key_parts = key_str.split("/")
+                frame_part = key_parts[-1] if len(key_parts) > 1 else key_str
+                try:
+                    frame_num = int(frame_part)
+                    fname = f"{frame_num:04d}.jpg"
+                except (ValueError, TypeError):
+                    existing = len(list(Path(vid_output_dir).glob("*.jpg"))) if Path(vid_output_dir).exists() else 0
+                    fname = f"{existing + 1:04d}.jpg"
+                dest = os.path.join(vid_output_dir, fname)
+                if not os.path.exists(dest) and save_image(jpeg_data, dest):
+                    success = True
+
         else:
             logger.warning(
-                f"video_id={item_vid}: cannot determine frame/video field from keys "
-                f"{list(item.keys())}. Skipping."
+                f"video_id={item_vid}: unrecognised item keys {list(item.keys())}. Skipping."
             )
 
         if success:
-            remaining.discard(item_vid)
-            done_ids.add(item_vid)
-            total_done_this_run += 1
+            saved_ids.add(item_vid)
+            frames_saved_this_run += 1
 
-            # Persist progress after each completed video_id
-            save_progress(progress_file, done_ids)
-
-            # Print progress every 100 completions
-            if total_done_this_run % 100 == 0:
+            # Checkpoint every 1000 frames
+            if frames_saved_this_run % 1000 == 0:
+                for vid in saved_ids:
+                    done_ids.add(vid)
+                save_progress(progress_file, done_ids)
                 logger.info(
-                    f"[{total_done_this_run}/{total_to_do}] "
-                    f"video_ids downloaded this run  "
-                    f"(total done: {len(done_ids)}/{total_needed})"
+                    f"[checkpoint] {frames_saved_this_run} frames saved this run, "
+                    f"{len(saved_ids)} videos started, "
+                    f"{len(done_ids)}/{total_needed} total done"
                 )
 
-    if remaining:
+    # Final: mark all videos with ≥1 frame as done
+    for vid in saved_ids:
+        done_ids.add(vid)
+    save_progress(progress_file, done_ids)
+
+    not_found = pending_ids - done_ids
+    if not_found:
         logger.warning(
-            f"{len(remaining)} video_ids were NOT found in the dataset stream: "
-            f"{sorted(remaining)[:20]}{'...' if len(remaining) > 20 else ''}"
+            f"{len(not_found)} video_ids NOT found in dataset stream: "
+            f"{sorted(not_found)[:20]}{'...' if len(not_found) > 20 else ''}"
         )
 
-    total_done_overall = len(done_ids)
     logger.info(
-        f"Completed: {total_done_overall}/{total_needed} video_ids "
-        f"({total_done_this_run} newly downloaded this run)"
+        f"Completed: {len(done_ids)}/{total_needed} video_ids "
+        f"({frames_saved_this_run} frames saved this run)"
     )
 
 
