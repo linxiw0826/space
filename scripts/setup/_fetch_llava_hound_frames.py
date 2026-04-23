@@ -256,9 +256,11 @@ def fetch_frames(ann_json: str, output_dir: str, progress_file: str) -> None:
                     item_vid = Path(item[key]).stem
                     break
 
-        # WebDataset format: __key__ is "{video_id}/{frame_idx}"
+        # WebDataset format: __key__ is "{video_id}/{frame_idx}" (may have leading "./")
         if item_vid is None and "__key__" in item:
             key_str = str(item["__key__"])
+            if key_str.startswith("./"):
+                key_str = key_str[2:]
             candidate = key_str.split("/")[0]
             if candidate in pending_ids or candidate in done_ids:
                 item_vid = candidate
@@ -315,22 +317,18 @@ def fetch_frames(ann_json: str, output_dir: str, progress_file: str) -> None:
                         )
                     break
 
-        # Case C: WebDataset per-frame format — one jpeg per item
+        # Case C: WebDataset per-frame format — one PIL Image or bytes per item
         elif "jpeg" in item:
             jpeg_data = item["jpeg"]
-            if isinstance(jpeg_data, (bytes, bytearray)):
-                key_str = str(item.get("__key__", ""))
-                key_parts = key_str.split("/")
-                frame_part = key_parts[-1] if len(key_parts) > 1 else key_str
-                try:
-                    frame_num = int(frame_part)
-                    fname = f"{frame_num:04d}.jpg"
-                except (ValueError, TypeError):
-                    existing = len(list(Path(vid_output_dir).glob("*.jpg"))) if Path(vid_output_dir).exists() else 0
-                    fname = f"{existing + 1:04d}.jpg"
-                dest = os.path.join(vid_output_dir, fname)
-                if not os.path.exists(dest) and save_image(jpeg_data, dest):
-                    success = True
+            key_str = str(item.get("__key__", ""))
+            if key_str.startswith("./"):
+                key_str = key_str[2:]
+            key_parts = key_str.split("/")
+            frame_part = key_parts[-1] if len(key_parts) > 1 else key_str
+            fname = f"{frame_part}.jpg" if frame_part else "frame.jpg"
+            dest = os.path.join(vid_output_dir, fname)
+            if not os.path.exists(dest) and save_image(jpeg_data, dest):
+                success = True
 
         else:
             logger.warning(
