@@ -143,7 +143,7 @@ echo "MODEL_SIZE=${MODEL_SIZE}  batch_size=${batch_size}  grad_accum=${grad_accu
 echo "output_dir=${output_dir}"
 echo "log → ${LOG_FILE}"
 
-torchrun --nproc_per_node=${NPROC_PER_NODE} \
+python -m torch.distributed.run --nproc_per_node=${NPROC_PER_NODE} \
          --master_addr=${MASTER_ADDR} \
          --master_port=${MASTER_PORT} \
          ${entry_file} ${args} \

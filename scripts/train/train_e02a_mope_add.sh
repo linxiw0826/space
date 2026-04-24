@@ -156,7 +156,7 @@ echo "=== E-02a Training (MODEL_SIZE=${MODEL_SIZE}) ==="
 echo "Output : ${output_dir}"
 echo "Log    : ${LOG_FILE}"
 
-torchrun --nproc_per_node=${NPROC_PER_NODE} \
+python -m torch.distributed.run --nproc_per_node=${NPROC_PER_NODE} \
          --master_addr=${MASTER_ADDR} \
          --master_port=${MASTER_PORT} \
          ${entry_file} ${args} \

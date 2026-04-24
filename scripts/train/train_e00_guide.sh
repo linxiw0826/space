@@ -126,7 +126,7 @@ echo "  deepspeed  : ${DEEPSPEED_CONFIG}"
 echo "  log        : ${LOG_FILE}"
 echo ""
 
-torchrun --nproc_per_node=${NPROC_PER_NODE} \
+python -m torch.distributed.run --nproc_per_node=${NPROC_PER_NODE} \
          --master_addr=${MASTER_ADDR} \
          --master_port=${MASTER_PORT} \
          ${entry_file} ${args} \
