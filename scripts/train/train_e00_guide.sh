@@ -1,13 +1,13 @@
 #!/bin/bash
 # =============================================================================
-# E-01: GUIDE fine-tune (no MoPE) — baseline
-# Supports 4B and 8B via MODEL_SIZE env var (default: 4b)
+# E-00: GUIDE 4B SR 复现训练
+# 从 Qwen3-VL-4B-Instruct 开始，用 spar_234k + llava_hound_64k 训练。
+# 产出：models/guide_reproduced/4b/  (~9h / 8×H800)
 #
 # Usage:
-#   bash train_e01_guide.sh                   # 4B (default)
-#   MODEL_SIZE=8b bash train_e01_guide.sh     # 8B
+#   bash train_e00_guide.sh
 #
-# Log directory can be overridden via LOG_DIR env var.
+# 关键路径可通过 env var 覆盖（见下方 PATH CONFIG 节）。
 # =============================================================================
 set -e
 
@@ -16,57 +16,41 @@ set -e
 # ---------------------------------------------------------------------------
 MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 MASTER_PORT=${MASTER_PORT:-$(shuf -i 20001-29999 -n 1)}
-# Single-node training only; multi-node not supported.
 NPROC_PER_NODE=${NPROC_PER_NODE:-8}
 
 # ---------------------------------------------------------------------------
-# Root paths (overridable via env vars)
+# PATH CONFIG — 全部可通过 env var 覆盖
 # ---------------------------------------------------------------------------
 SPACE_ROOT=${SPACE_ROOT:-"/home/nvme03/wlx/Space_sensing/projects/space"}
 GUIDE_ROOT="${SPACE_ROOT}/src"
 MOPE_ROOT="${SPACE_ROOT}/src/vendor/mope"
-
-# ---------------------------------------------------------------------------
-# Model size selection (4b | 8b)
-# ---------------------------------------------------------------------------
-MODEL_SIZE=${MODEL_SIZE:-4b}
-
-QWEN3_VL_4B_PATH=${QWEN3_VL_4B_PATH:-/home/nvme03/wlx/Space_sensing/models/Qwen3-VL-4B-Instruct}
-QWEN3_VL_8B_PATH=${QWEN3_VL_8B_PATH:-/home/nvme03/wlx/Space_sensing/models/Qwen3-VL-8B-Instruct}
-VGGT_PATH=${VGGT_PATH:-/home/nvme03/wlx/Space_sensing/models/VGGT-1B}
-GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-/home/nvme03/wlx/Space_sensing/models/guide_reproduced/4b}
-
 CONFIGS_DIR="${SPACE_ROOT}/configs"
 
-if [ "${MODEL_SIZE}" = "8b" ]; then
-    # 8B: larger model requires ZeRO-3 to fit on 8×H800
-    batch_size=1
-    grad_accum_steps=16
-    DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${CONFIGS_DIR}/zero3.json}
-    output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/models/e01_guide_8b}"
-    run_name="space_e01_guide_8b_lr1e-5"
-elif [ "${MODEL_SIZE}" = "4b" ]; then
-    batch_size=1
-    grad_accum_steps=8
-    DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${CONFIGS_DIR}/zero2.json}
-    output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/models/e01_guide_4b}"
-    run_name="space_e01_guide_4b_lr1e-5"
-else
-    echo "ERROR: MODEL_SIZE must be '4b' or '8b', got '${MODEL_SIZE}'" >&2
-    exit 1
-fi
+# 模型路径 (nvme01)
+QWEN3_VL_4B_PATH=${QWEN3_VL_4B_PATH:-/home/nvme01/wlx/Space_sensing/models/Qwen3-VL-4B-Instruct}
+VGGT_PATH=${VGGT_PATH:-/home/nvme01/wlx/Space_sensing/models/VGGT-1B}
+
+# 数据路径 (nvme01 guide_repro)
+export SPAR_234K_ANN=${SPAR_234K_ANN:-/home/nvme01/wlx/Space_sensing/data/guide_repro/train/spar_234k.json}
+export LLAVA_HOUND_64K_ANN=${LLAVA_HOUND_64K_ANN:-/home/nvme01/wlx/Space_sensing/data/guide_repro/train/llava_hound_64k.json}
+export GUIDE_DATA_ROOT=${GUIDE_DATA_ROOT:-/home/nvme01/wlx/Space_sensing/data/guide_repro/media}
+
+# 输出路径 (nvme03，空间更大)
+output_dir=${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/models/guide_reproduced/4b}
 
 # ---------------------------------------------------------------------------
-# Python path
+# Hyperparameters
+# ---------------------------------------------------------------------------
+lr=1e-5
+batch_size=1
+grad_accum_steps=8
+DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${CONFIGS_DIR}/zero2.json}
+run_name="space_e00_guide_4b_sr_lr1e-5"
+
+# ---------------------------------------------------------------------------
+# Python path (src/train_framework 最优先，覆盖 refs 版本)
 # ---------------------------------------------------------------------------
 export PYTHONPATH="${SPACE_ROOT}/src/train_framework:${SPACE_ROOT}:${GUIDE_ROOT}:${MOPE_ROOT}:${PYTHONPATH}"
-
-# ---------------------------------------------------------------------------
-# Dataset paths
-# ---------------------------------------------------------------------------
-export VSI590K_SPAR_ANN=${VSI590K_SPAR_ANN:-${SPACE_ROOT}/data/vsi590k_spar.json}
-export VSI590K_VIDEO_ANN=${VSI590K_VIDEO_ANN:-${SPACE_ROOT}/data/vsi590k_video.json}
-export VSI590K_DATA_ROOT=${VSI590K_DATA_ROOT:-${SPACE_ROOT}/data/}
 
 # ---------------------------------------------------------------------------
 # WandB
@@ -76,18 +60,13 @@ if [ -z "${WANDB_API_KEY:-}" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Hyperparameters
-# ---------------------------------------------------------------------------
-lr=1e-5
-
-# ---------------------------------------------------------------------------
-# Output & log directories
+# Output & log
 # ---------------------------------------------------------------------------
 mkdir -p "${output_dir}"
 
 LOG_DIR=${LOG_DIR:-/home/nvme03/wlx/Space_sensing/logs/train}
 mkdir -p "${LOG_DIR}"
-LOG_FILE="${LOG_DIR}/e01_guide_${MODEL_SIZE}_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="${LOG_DIR}/e00_guide_4b_$(date +%Y%m%d_%H%M%S).log"
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -96,8 +75,8 @@ entry_file="${SPACE_ROOT}/src/train_framework/train_space.py"
 
 args="
     --deepspeed ${DEEPSPEED_CONFIG} \
-    --model_name_or_path ${GUIDE_CKPT_PATH} \
-    --dataset_use vsi590k_spar \
+    --model_name_or_path ${QWEN3_VL_4B_PATH} \
+    --dataset_use llava_hound_64k,spar_234k \
     --data_flatten False \
     --tune_mm_vision False \
     --tune_mm_mlp False \
@@ -138,9 +117,13 @@ args="
     --use_mope False \
     --group_by_modality_length True"
 
-echo "MODEL_SIZE=${MODEL_SIZE}  batch_size=${batch_size}  grad_accum=${grad_accum_steps}  deepspeed=${DEEPSPEED_CONFIG}"
-echo "output_dir=${output_dir}"
-echo "log → ${LOG_FILE}"
+echo "=== E-00: GUIDE 4B SR ==="
+echo "  base model : ${QWEN3_VL_4B_PATH}"
+echo "  datasets   : llava_hound_64k, spar_234k"
+echo "  output_dir : ${output_dir}"
+echo "  deepspeed  : ${DEEPSPEED_CONFIG}"
+echo "  log        : ${LOG_FILE}"
+echo ""
 
 torchrun --nproc_per_node=${NPROC_PER_NODE} \
          --master_addr=${MASTER_ADDR} \

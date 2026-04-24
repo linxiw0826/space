@@ -30,11 +30,8 @@ SPACE_ROOT=${SPACE_ROOT:-"/home/nvme03/wlx/Space_sensing/projects/space"}
 GUIDE_ROOT="${SPACE_ROOT}/src"
 MOPE_ROOT="${SPACE_ROOT}/src/vendor/mope"
 
-QWEN3_VL_4B_PATH=${QWEN3_VL_4B_PATH:-/home/nvme03/wlx/Space_sensing/models/Qwen3-VL-4B-Instruct}
-QWEN3_VL_8B_PATH=${QWEN3_VL_8B_PATH:-/home/nvme03/wlx/Space_sensing/models/Qwen3-VL-8B-Instruct}
-
 VGGT_PATH=${VGGT_PATH:-/home/nvme03/wlx/Space_sensing/models/VGGT-1B}
-GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-/home/nvme03/wlx/Space_sensing/models/guide/}
+GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-/home/nvme03/wlx/Space_sensing/models/guide_reproduced/4b}
 
 # MoPE checkpoint (ep199, vitb_1 full training run)
 MOPE_CKPT_PATH=${MOPE_CKPT_PATH:-/home/nvme04/mope-jepa/output/mope_jepa_wisa7k_vitb_1/checkpoint-199.pth}
@@ -46,19 +43,17 @@ MOPE_CODE_PATH=${MOPE_CODE_PATH:-${SPACE_ROOT}/src/vendor/mope}
 # Per-size configuration
 # ---------------------------------------------------------------------------
 if [ "${MODEL_SIZE}" = "4b" ]; then
-    MODEL_PATH=${QWEN3_VL_4B_PATH}
     batch_size=1
     grad_accum_steps=8
     DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${SPACE_ROOT}/configs/zero2.json}
-    output_dir="${SPACE_ROOT}/outputs/e02a_mope_add_4b"
+    output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/models/e02a_mope_add_4b}"
     run_name="space_e02a_mope_add_4b_lr1e-5"
 elif [ "${MODEL_SIZE}" = "8b" ]; then
-    MODEL_PATH=${QWEN3_VL_8B_PATH}
     batch_size=1
     grad_accum_steps=16
     # 8B requires ZeRO-3 to fit on 8x H800 GPUs
     DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${SPACE_ROOT}/configs/zero3.json}
-    output_dir="${SPACE_ROOT}/outputs/e02a_mope_add_8b"
+    output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/models/e02a_mope_add_8b}"
     run_name="space_e02a_mope_add_8b_lr1e-5"
 else
     echo "ERROR: Unknown MODEL_SIZE='${MODEL_SIZE}'. Must be '4b' or '8b'." >&2
@@ -68,7 +63,7 @@ fi
 # ---------------------------------------------------------------------------
 # Log directory
 # ---------------------------------------------------------------------------
-LOG_DIR=${LOG_DIR:-${SPACE_ROOT}/logs/train}
+LOG_DIR=${LOG_DIR:-/home/nvme03/wlx/Space_sensing/logs/train}
 mkdir -p "${LOG_DIR}"
 mkdir -p "${output_dir}"
 

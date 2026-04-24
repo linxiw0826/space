@@ -33,20 +33,20 @@ SPAR = {
 }
 
 SPAR_234K = {
-    "annotation_path": "data/train/spar_234k.json",
-    "data_path": "data/media",
+    "annotation_path": os.environ.get("SPAR_234K_ANN", "data/train/spar_234k.json"),
+    "data_path": os.environ.get("GUIDE_DATA_ROOT", "data/media"),
     "tag": "3d"
 }
 
 LLAVA_HOUND = {
-    "annotation_path": "data/train/llava_hound_255k.json",
-    "data_path": "data/media",
+    "annotation_path": os.environ.get("LLAVA_HOUND_ANN", "data/train/llava_hound_255k.json"),
+    "data_path": os.environ.get("GUIDE_DATA_ROOT", "data/media"),
     "tag": "2d"
 }
 
 LLAVA_HOUND_64K = {
-    "annotation_path": "data/train/llava_hound_64k.json",
-    "data_path": "data/media",
+    "annotation_path": os.environ.get("LLAVA_HOUND_64K_ANN", "data/train/llava_hound_64k.json"),
+    "data_path": os.environ.get("GUIDE_DATA_ROOT", "data/media"),
     "tag": "2d"
 }
 SQA3D_32FRAMES = {
