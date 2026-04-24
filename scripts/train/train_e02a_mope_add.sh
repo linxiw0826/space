@@ -21,7 +21,8 @@ MODEL_SIZE=${MODEL_SIZE:-4b}
 MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 MASTER_PORT=${MASTER_PORT:-$(shuf -i 20001-29999 -n 1)}
 # Single-node training only; multi-node not supported.
-NPROC_PER_NODE=${NPROC_PER_NODE:-8}
+NPROC_PER_NODE=${NPROC_PER_NODE:-6}
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5}
 
 # ---------------------------------------------------------------------------
 # Path configuration (override via env vars as needed)

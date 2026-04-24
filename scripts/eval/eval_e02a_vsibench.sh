@@ -17,8 +17,8 @@
 #   GUIDE_LMMS_EVAL      — path to GUIDE's lmms-eval repo root
 #   RESULTS_DIR          — base directory for evaluation results
 #   LOG_DIR              — directory for log files (default: SPACE_ROOT/logs/eval)
-#   CUDA_VISIBLE_DEVICES — GPUs to use (default: 0,1,2,3,4,5,6,7)
-#   NUM_PROCESSES        — number of accelerate processes (default: 8)
+#   CUDA_VISIBLE_DEVICES — GPUs to use (default: 0,1,2,3,4,5)
+#   NUM_PROCESSES        — number of accelerate processes (default: 6)
 # =============================================================================
 set -e
 
@@ -73,8 +73,8 @@ mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/e02a_vsibench_${MODEL_SIZE}_$(date +%Y%m%d_%H%M%S).log"
 
 # GPU configuration
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
-NUM_PROCESSES=${NUM_PROCESSES:-8}
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5}
+NUM_PROCESSES=${NUM_PROCESSES:-6}
 MAIN_PORT=${MAIN_PORT:-$(shuf -i 20001-29999 -n 1)}
 
 # ---------------------------------------------------------------------------

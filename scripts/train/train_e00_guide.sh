@@ -16,7 +16,8 @@ set -e
 # ---------------------------------------------------------------------------
 MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 MASTER_PORT=${MASTER_PORT:-$(shuf -i 20001-29999 -n 1)}
-NPROC_PER_NODE=${NPROC_PER_NODE:-8}
+NPROC_PER_NODE=${NPROC_PER_NODE:-6}
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5}
 
 # ---------------------------------------------------------------------------
 # PATH CONFIG — 全部可通过 env var 覆盖
@@ -43,7 +44,7 @@ output_dir=${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/models/guide_reproduced/
 # ---------------------------------------------------------------------------
 lr=1e-5
 batch_size=1
-grad_accum_steps=8
+grad_accum_steps=11
 DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${CONFIGS_DIR}/zero2.json}
 run_name="space_e00_guide_4b_sr_lr1e-5"
 
