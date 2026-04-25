@@ -32,10 +32,10 @@ MODEL_SIZE=${MODEL_SIZE:-4b}
 SPACE_ROOT=${SPACE_ROOT:-"/home/nvme03/wlx/Space_sensing/projects/space"}
 
 if [ "${MODEL_SIZE}" = "4b" ]; then
-    CKPT_PATH=${1:-/home/nvme03/wlx/Space_sensing/models/guide/4b/}
+    CKPT_PATH=${1:-/home/nvme03/wlx/Space_sensing/models/guide_reproduced/4b}
     EXP_NAME=${2:-e00_zeroshot_4b}
 elif [ "${MODEL_SIZE}" = "8b" ]; then
-    CKPT_PATH=${1:-/home/nvme03/wlx/Space_sensing/models/guide/8b/}
+    CKPT_PATH=${1:-/home/nvme03/wlx/Space_sensing/models/guide_reproduced/8b}
     EXP_NAME=${2:-e00_zeroshot_8b}
 else
     echo "ERROR: MODEL_SIZE must be '4b' or '8b', got '${MODEL_SIZE}'"
@@ -51,8 +51,8 @@ GUIDE_TRAIN_ROOT=${SPACE_ROOT}/src
 # VSIBench data paths
 # VSIBENCH_VIDEO_ROOT: directory that contains <dataset>/<scene_name>.mp4
 # The vsibench utils.py resolves: ${VSIBENCH_VIDEO_ROOT}/<dataset>/<scene_name>.mp4
-VSIBENCH_VIDEO_ROOT=${VSIBENCH_VIDEO_ROOT:-/home/nvme03/wlx/Space_sensing/data/vsibench/}
-VSIBENCH_JSONL=${VSIBENCH_JSONL:-/home/nvme03/wlx/Space_sensing/data/vsibench/test.jsonl}
+VSIBENCH_VIDEO_ROOT=${VSIBENCH_VIDEO_ROOT:-/home/nvme01/wlx/Space_sensing/data/VSIBench}
+VSIBENCH_JSONL=${VSIBENCH_JSONL:-/home/nvme01/wlx/Space_sensing/data/VSIBench/test.jsonl}
 
 # Results output
 RESULTS_DIR=${RESULTS_DIR:-${SPACE_ROOT}/results/vsibench}

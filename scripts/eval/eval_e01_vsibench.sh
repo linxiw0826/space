@@ -59,8 +59,8 @@ GUIDE_LMMS_EVAL=${GUIDE_LMMS_EVAL:-${SPACE_ROOT}/src/vendor/lmms-eval}
 GUIDE_TRAIN_ROOT=${SPACE_ROOT}/src
 
 # VSIBench data paths
-VSIBENCH_VIDEO_ROOT=${VSIBENCH_VIDEO_ROOT:-/home/nvme03/wlx/Space_sensing/data/vsibench/}
-VSIBENCH_JSONL=${VSIBENCH_JSONL:-/home/nvme03/wlx/Space_sensing/data/vsibench/test.jsonl}
+VSIBENCH_VIDEO_ROOT=${VSIBENCH_VIDEO_ROOT:-/home/nvme01/wlx/Space_sensing/data/VSIBench}
+VSIBENCH_JSONL=${VSIBENCH_JSONL:-/home/nvme01/wlx/Space_sensing/data/VSIBench/test.jsonl}
 
 # Results output
 RESULTS_DIR=${RESULTS_DIR:-${SPACE_ROOT}/results/vsibench}
