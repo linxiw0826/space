@@ -35,11 +35,11 @@ MODEL_SIZE=${MODEL_SIZE:-4b}
 
 case "${MODEL_SIZE}" in
     4b)
-        DEFAULT_CKPT_PATH="${SPACE_ROOT}/outputs/e01_guide_4b"
+        DEFAULT_CKPT_PATH="/home/nvme03/wlx/Space_sensing/output/train/e01_guide_4b"
         DEFAULT_EXP_NAME="e01_guide_4b"
         ;;
     8b)
-        DEFAULT_CKPT_PATH="${SPACE_ROOT}/outputs/e01_guide_8b"
+        DEFAULT_CKPT_PATH="/home/nvme03/wlx/Space_sensing/output/train/e01_guide_8b"
         DEFAULT_EXP_NAME="e01_guide_8b"
         ;;
     *)
@@ -63,12 +63,12 @@ VSIBENCH_VIDEO_ROOT=${VSIBENCH_VIDEO_ROOT:-/home/nvme01/wlx/Space_sensing/data/V
 VSIBENCH_JSONL=${VSIBENCH_JSONL:-/home/nvme01/wlx/Space_sensing/data/VSIBench/test.jsonl}
 
 # Results output
-RESULTS_DIR=${RESULTS_DIR:-${SPACE_ROOT}/results/vsibench}
+RESULTS_DIR=${RESULTS_DIR:-/home/nvme03/wlx/Space_sensing/output/eval/vsibench}
 OUTPUT_PATH="${RESULTS_DIR}/${EXP_NAME}"
 mkdir -p "${OUTPUT_PATH}"
 
 # Log file — independent log directory, tee'd to stdout
-LOG_DIR=${LOG_DIR:-${SPACE_ROOT}/logs/eval}
+LOG_DIR=${LOG_DIR:-/home/nvme03/wlx/Space_sensing/logs/eval}
 mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/e01_vsibench_${MODEL_SIZE}_$(date +%Y%m%d_%H%M%S).log"
 

@@ -31,8 +31,8 @@ SPACE_ROOT=${SPACE_ROOT:-"/home/nvme03/wlx/Space_sensing/projects/space"}
 GUIDE_ROOT="${SPACE_ROOT}/src"
 MOPE_ROOT="${SPACE_ROOT}/src/vendor/mope"
 
-VGGT_PATH=${VGGT_PATH:-/home/nvme03/wlx/Space_sensing/models/VGGT-1B}
-GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-/home/nvme03/wlx/Space_sensing/models/guide_reproduced/4b}
+VGGT_PATH=${VGGT_PATH:-/home/nvme01/wlx/Space_sensing/models/VGGT-1B}
+GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-/home/nvme03/wlx/Space_sensing/output/train/guide_reproduced/4b}
 
 # MoPE checkpoint (ep199, vitb_1 full training run)
 MOPE_CKPT_PATH=${MOPE_CKPT_PATH:-/home/nvme04/mope-jepa/output/mope_jepa_wisa7k_vitb_1/checkpoint-199.pth}
@@ -47,14 +47,14 @@ if [ "${MODEL_SIZE}" = "4b" ]; then
     batch_size=1
     grad_accum_steps=8
     DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${SPACE_ROOT}/configs/zero2.json}
-    output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/models/e02a_mope_add_4b}"
+    output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/output/train/e02a_mope_add_4b}"
     run_name="space_e02a_mope_add_4b_lr1e-5"
 elif [ "${MODEL_SIZE}" = "8b" ]; then
     batch_size=1
     grad_accum_steps=16
     # 8B requires ZeRO-3 to fit on 8x H800 GPUs
     DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${SPACE_ROOT}/configs/zero3.json}
-    output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/models/e02a_mope_add_8b}"
+    output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/output/train/e02a_mope_add_8b}"
     run_name="space_e02a_mope_add_8b_lr1e-5"
 else
     echo "ERROR: Unknown MODEL_SIZE='${MODEL_SIZE}'. Must be '4b' or '8b'." >&2
@@ -76,9 +76,9 @@ export PYTHONPATH="${SPACE_ROOT}/src/train_framework:${SPACE_ROOT}:${GUIDE_ROOT}
 # ---------------------------------------------------------------------------
 # VSI-590K dataset paths (read by src/train_framework/data/__init__.py)
 # ---------------------------------------------------------------------------
-export VSI590K_SPAR_ANN=${VSI590K_SPAR_ANN:-${SPACE_ROOT}/data/vsi590k_spar.json}
-export VSI590K_VIDEO_ANN=${VSI590K_VIDEO_ANN:-${SPACE_ROOT}/data/vsi590k_video.json}
-export VSI590K_DATA_ROOT=${VSI590K_DATA_ROOT:-${SPACE_ROOT}/data/}
+export VSI590K_SPAR_ANN=${VSI590K_SPAR_ANN:-/home/nvme01/wlx/Space_sensing/data/vsi590k_processed/vsi590k_spar_590k.json}
+export VSI590K_VIDEO_ANN=${VSI590K_VIDEO_ANN:-/home/nvme01/wlx/Space_sensing/data/vsi590k_processed/vsi590k_video_590k.json}
+export VSI590K_DATA_ROOT=${VSI590K_DATA_ROOT:-/home/nvme01/wlx/Space_sensing/data/vsi590k_processed/}
 
 # ---------------------------------------------------------------------------
 # Weights & Biases (optional — leave WANDB_API_KEY unset to disable)

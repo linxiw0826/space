@@ -37,7 +37,7 @@ export LLAVA_HOUND_64K_ANN=${LLAVA_HOUND_64K_ANN:-/home/nvme01/wlx/Space_sensing
 export GUIDE_DATA_ROOT=${GUIDE_DATA_ROOT:-/home/nvme01/wlx/Space_sensing/data/guide_repro/media}
 
 # 输出路径 (nvme03，空间更大)
-output_dir=${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/models/guide_reproduced/4b}
+output_dir=${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/output/train/guide_reproduced/4b}
 
 # ---------------------------------------------------------------------------
 # Hyperparameters

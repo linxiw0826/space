@@ -34,8 +34,8 @@ MODEL_SIZE=${MODEL_SIZE:-4b}
 
 QWEN3_VL_4B_PATH=${QWEN3_VL_4B_PATH:-/home/nvme03/wlx/Space_sensing/models/Qwen3-VL-4B-Instruct}
 QWEN3_VL_8B_PATH=${QWEN3_VL_8B_PATH:-/home/nvme03/wlx/Space_sensing/models/Qwen3-VL-8B-Instruct}
-VGGT_PATH=${VGGT_PATH:-/home/nvme03/wlx/Space_sensing/models/VGGT-1B}
-GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-/home/nvme03/wlx/Space_sensing/models/guide_reproduced/4b}
+VGGT_PATH=${VGGT_PATH:-/home/nvme01/wlx/Space_sensing/models/VGGT-1B}
+GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-/home/nvme03/wlx/Space_sensing/output/train/guide_reproduced/4b}
 
 CONFIGS_DIR="${SPACE_ROOT}/configs"
 
@@ -44,13 +44,13 @@ if [ "${MODEL_SIZE}" = "8b" ]; then
     batch_size=1
     grad_accum_steps=16
     DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${CONFIGS_DIR}/zero3.json}
-    output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/models/e01_guide_8b}"
+    output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/output/train/e01_guide_8b}"
     run_name="space_e01_guide_8b_lr1e-5"
 elif [ "${MODEL_SIZE}" = "4b" ]; then
     batch_size=1
     grad_accum_steps=8
     DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${CONFIGS_DIR}/zero2.json}
-    output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/models/e01_guide_4b}"
+    output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/output/train/e01_guide_4b}"
     run_name="space_e01_guide_4b_lr1e-5"
 else
     echo "ERROR: MODEL_SIZE must be '4b' or '8b', got '${MODEL_SIZE}'" >&2
@@ -65,9 +65,9 @@ export PYTHONPATH="${SPACE_ROOT}/src/train_framework:${SPACE_ROOT}:${GUIDE_ROOT}
 # ---------------------------------------------------------------------------
 # Dataset paths
 # ---------------------------------------------------------------------------
-export VSI590K_SPAR_ANN=${VSI590K_SPAR_ANN:-${SPACE_ROOT}/data/vsi590k_spar.json}
-export VSI590K_VIDEO_ANN=${VSI590K_VIDEO_ANN:-${SPACE_ROOT}/data/vsi590k_video.json}
-export VSI590K_DATA_ROOT=${VSI590K_DATA_ROOT:-${SPACE_ROOT}/data/}
+export VSI590K_SPAR_ANN=${VSI590K_SPAR_ANN:-/home/nvme01/wlx/Space_sensing/data/vsi590k_processed/vsi590k_spar_590k.json}
+export VSI590K_VIDEO_ANN=${VSI590K_VIDEO_ANN:-/home/nvme01/wlx/Space_sensing/data/vsi590k_processed/vsi590k_video_590k.json}
+export VSI590K_DATA_ROOT=${VSI590K_DATA_ROOT:-/home/nvme01/wlx/Space_sensing/data/vsi590k_processed/}
 
 # ---------------------------------------------------------------------------
 # WandB

@@ -32,10 +32,10 @@ MODEL_SIZE=${MODEL_SIZE:-4b}
 SPACE_ROOT=${SPACE_ROOT:-"/home/nvme03/wlx/Space_sensing/projects/space"}
 
 if [ "${MODEL_SIZE}" = "4b" ]; then
-    CKPT_PATH=${1:-/home/nvme03/wlx/Space_sensing/models/guide_reproduced/4b}
+    CKPT_PATH=${1:-/home/nvme03/wlx/Space_sensing/output/train/guide_reproduced/4b}
     EXP_NAME=${2:-e00_zeroshot_4b}
 elif [ "${MODEL_SIZE}" = "8b" ]; then
-    CKPT_PATH=${1:-/home/nvme03/wlx/Space_sensing/models/guide_reproduced/8b}
+    CKPT_PATH=${1:-/home/nvme03/wlx/Space_sensing/output/train/guide_reproduced/8b}
     EXP_NAME=${2:-e00_zeroshot_8b}
 else
     echo "ERROR: MODEL_SIZE must be '4b' or '8b', got '${MODEL_SIZE}'"
@@ -55,12 +55,12 @@ VSIBENCH_VIDEO_ROOT=${VSIBENCH_VIDEO_ROOT:-/home/nvme01/wlx/Space_sensing/data/V
 VSIBENCH_JSONL=${VSIBENCH_JSONL:-/home/nvme01/wlx/Space_sensing/data/VSIBench/test.jsonl}
 
 # Results output
-RESULTS_DIR=${RESULTS_DIR:-${SPACE_ROOT}/results/vsibench}
+RESULTS_DIR=${RESULTS_DIR:-/home/nvme03/wlx/Space_sensing/output/eval/vsibench}
 OUTPUT_PATH="${RESULTS_DIR}/${EXP_NAME}"
 mkdir -p "${OUTPUT_PATH}"
 
 # Log directory (separate from results, as required)
-LOG_DIR=${LOG_DIR:-${SPACE_ROOT}/logs/eval}
+LOG_DIR=${LOG_DIR:-/home/nvme03/wlx/Space_sensing/logs/eval}
 mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/e00_vsibench_${MODEL_SIZE}_$(date +%Y%m%d_%H%M%S).log"
 
