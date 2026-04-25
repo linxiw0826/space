@@ -131,7 +131,7 @@ args="
     --use_geometry_encoder True \
     --use_feature_fusion_module True \
     --use_patch_size_alin True \
-    --geometry_deepstack_indexes_pro \"7:0,10:1,13:2,16:3,19:4,22:5\" \
+    --geometry_deepstack_indexes_pro 7:0,10:1,13:2,16:3,19:4,22:5 \
     --use_deepstack_importance_gate all \
     --use_deepstack_global_gate all \
     --geometry_encoder_type vggt \
