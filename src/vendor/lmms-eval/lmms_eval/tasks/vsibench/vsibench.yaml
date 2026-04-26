@@ -1,7 +1,7 @@
 dataset_path: json
 dataset_kwargs:
   data_files:
-    test: /storage/chongyu/Qwen3-VL/data/evaluation/vsibench/test.jsonl
+    test: /home/nvme01/wlx/Space_sensing/data/VSIBench/test.jsonl
 task: vsibench
 test_split: test
 output_type: generate_until
@@ -36,5 +36,5 @@ lmms_eval_specific_kwargs:
     mca_post_prompt: "Answer with the option's letter from the given choices directly."
     na_post_prompt: "Do not response anything other than a single number!"
 metadata:
-  media_dir: /storage/chongyu/Qwen3-VL/data/evaluation/vsibench
+  media_dir: /home/nvme01/wlx/Space_sensing/data/VSIBench
   version: 0.0
