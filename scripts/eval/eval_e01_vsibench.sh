@@ -88,53 +88,6 @@ export PYTHONPATH="${GUIDE_LMMS_EVAL}:${GUIDE_TRAIN_ROOT}:${PYTHONPATH}"
 export NCCL_NVLS_ENABLE=0
 
 # ---------------------------------------------------------------------------
-# VSIBench task override
-#
-# The built-in vsibench.yaml hardcodes paths to /storage/chongyu/...
-# We write a local override yaml that redirects to our data paths and
-# pass it via --include_path so lmms-eval finds it first.
-# ---------------------------------------------------------------------------
-TASK_OVERRIDE_DIR="${OUTPUT_PATH}/task_override"
-mkdir -p "${TASK_OVERRIDE_DIR}/vsibench"
-
-cat > "${TASK_OVERRIDE_DIR}/vsibench/vsibench.yaml" << YAML_EOF
-dataset_path: json
-dataset_kwargs:
-  data_files:
-    test: ${VSIBENCH_JSONL}
-task: vsibench
-test_split: test
-output_type: generate_until
-process_docs: !function utils.process_docs
-doc_to_visual: !function utils.vsibench_doc_to_visual
-doc_to_text: !function utils.vsibench_doc_to_text
-doc_to_target: "ground_truth"
-generation_kwargs:
-  max_new_tokens: 16
-  temperature: 0
-  top_p: 1.0
-  num_beams: 1
-  do_sample: false
-process_results: !function utils.vsibench_process_results
-metric_list:
-  - metric: vsibench_score
-    aggregation: !function utils.vsibench_aggregate_results
-    higher_is_better: true
-lmms_eval_specific_kwargs:
-  default:
-    pre_prompt: ""
-    mca_post_prompt: "Answer with the option's letter from the given choices directly."
-    na_post_prompt: "Please answer the question using a single word or phrase."
-metadata:
-  media_dir: ${VSIBENCH_VIDEO_ROOT}
-  version: 0.0
-YAML_EOF
-
-# Copy utils.py from the GUIDE reference so the override task dir is complete
-cp "${GUIDE_LMMS_EVAL}/lmms_eval/tasks/vsibench/utils.py" \
-   "${TASK_OVERRIDE_DIR}/vsibench/utils.py"
-
-# ---------------------------------------------------------------------------
 # Model args — standard GUIDE model (qwen3_vl_my), no MoPE
 # ---------------------------------------------------------------------------
 MODEL_ARGS="pretrained=${CKPT_PATH},max_pixels=268324,min_pixels=8192,attn_implementation=flash_attention_2"
@@ -171,7 +124,6 @@ accelerate launch \
     --log_samples \
     --log_samples_suffix "${EXP_NAME}" \
     --output_path "${OUTPUT_PATH}" \
-    --include_path "${TASK_OVERRIDE_DIR}" \
     --force_simple \
     2>&1 | tee "${LOG_FILE}"
 
