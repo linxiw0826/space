@@ -1566,70 +1566,101 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
                 self._geometry_deepstack_only_logged = True
             return image_embeds, None, geo_deepstack_embeds, geo_deepstack_camera_tokens
 
-        geo_embeds = torch.cat(geo_embeds, dim=0) if geo_embeds else None
-        if geo_embeds is None:
+        if not geo_embeds:
             return image_embeds, None, geo_deepstack_embeds, geo_deepstack_camera_tokens
-
-        h_grid = int(image_grid_thw[0, 1].item() // self.visual.spatial_merge_size)
-        w_grid = int(image_grid_thw[0, 2].item() // self.visual.spatial_merge_size)
-        n_image = int(image_grid_thw.shape[0])
-        image_embeds = image_embeds.view(n_image, h_grid, w_grid, -1)
 
         if self.use_feature_fusion_module:
             if not self._feature_fusion_logged:
                 print("[Geometry Encoder] Applying FeatureFusionModule for 2D/3D feature fusion")
                 self._feature_fusion_logged = True
-            if geo_embeds.shape[1] != h_grid or geo_embeds.shape[2] != w_grid:
-                raise ValueError(
-                    f"Geometry/visual grid mismatch: geo {geo_embeds.shape[1:3]} vs visual {(h_grid, w_grid)}"
-                )
             if not hasattr(self, "feature_fusion_module"):
                 raise RuntimeError("FeatureFusionModule is enabled but not initialized.")
 
-            if self.use_camera_method == "mlp_gate" and gate_list:
-                if not self._camera_method_logged:
-                    print("[Geometry Encoder] Applying MLPGate: output = 2d + (1+gate)*vggt")
-                    self._camera_method_logged = True
-                gate_cat = torch.cat(gate_list, dim=0)
-                geo_embeds = (1 + gate_cat) * geo_embeds
+            # Process each batch item independently to support variable spatial resolutions
+            # across batch items (required when batch_size > 1).
+            merge = self.visual.spatial_merge_size
+            img_thw_offset = 0
+            tok_offset = 0
+            geo_item_idx = 0
+            fused_list = []
+            geo_flat_list = []
 
-            if self.use_camera_method == "mlp_gate_vgllm" and gate_list:
-                if not self._camera_method_logged:
-                    print("[Geometry Encoder] Applying VGLLMStyleMLPGate: output = 2d + gate*vggt")
-                    self._camera_method_logged = True
-                gate_cat = torch.cat(gate_list, dim=0)
-                geo_embeds = gate_cat * geo_embeds
+            for bn in range(batch_size):
+                if geometry_encoder_inputs[bn].shape[0] == 0:
+                    continue
 
-            if self.use_camera_method == "adaLN_dual" and camera_features_list:
-                if not self._camera_method_logged:
-                    print("[Geometry Encoder] Applying DualCameraAdaLN: modulating geo and image features "
-                          "separately with camera token before fusion")
-                    self._camera_method_logged = True
-                camera_features_cat = torch.cat(camera_features_list, dim=0)  # [n_image, 1, vggt_dim]
-                geo_embeds = self.camera_adaln_geo(geo_embeds, camera_features_cat)
-                image_embeds = self.camera_adaln_img(image_embeds, camera_features_cat)
+                n_img_bn = geometry_encoder_inputs[bn].shape[0]
+                g_feat = geo_embeds[geo_item_idx]  # (n_img_bn, h_p, w_p, D_geo)
 
-            fused = self.feature_fusion_module(image_embeds, geo_embeds)
-            if fused.dim() == 3:
-                fused = fused.view(n_image, h_grid, w_grid, -1)
+                thw_bn = image_grid_thw[img_thw_offset : img_thw_offset + n_img_bn]
+                h_grid_bn = int(thw_bn[0, 1].item() // merge)
+                w_grid_bn = int(thw_bn[0, 2].item() // merge)
+                n_tokens_bn = n_img_bn * h_grid_bn * w_grid_bn
 
-            if self.use_camera_method == "adaLN" and camera_features_list:
-                if not self._camera_method_logged:
-                    print("[Geometry Encoder] Applying CameraAdaLN: modulating fused features with camera token")
-                    self._camera_method_logged = True
-                camera_features_cat = torch.cat(camera_features_list, dim=0)  # [n_image, 1, vggt_dim]
-                fused = self.camera_adaln(fused, camera_features_cat)
-            elif self.use_camera_method == "adaLN_all" and camera_features_list and raw_geo_embeds:
-                if not self._camera_method_logged:
-                    print("[Geometry Encoder] Applying CameraGeoAdaLN: modulating fused features with camera + raw geometry")
-                    self._camera_method_logged = True
-                camera_features_cat = torch.cat(camera_features_list, dim=0)  # [n_image, 1, vggt_dim]
-                raw_geo_cat = torch.cat(raw_geo_embeds, dim=0)                # [n_image, h_patch, w_patch, vggt_dim]
-                fused = self.camera_geo_adaln(fused, camera_features_cat, raw_geo_cat)
+                img_emb_bn = image_embeds[tok_offset : tok_offset + n_tokens_bn].view(
+                    n_img_bn, h_grid_bn, w_grid_bn, -1
+                )
 
-            image_embeds = fused.view(-1, fused.shape[-1])
-            geo_embeds = geo_embeds.view(-1, geo_embeds.shape[-1])
+                if g_feat.shape[1] != h_grid_bn or g_feat.shape[2] != w_grid_bn:
+                    raise ValueError(
+                        f"Geometry/visual grid mismatch for item {bn}: "
+                        f"geo {g_feat.shape[1:3]} vs visual {(h_grid_bn, w_grid_bn)}"
+                    )
+
+                if self.use_camera_method == "mlp_gate" and gate_list:
+                    if not self._camera_method_logged:
+                        print("[Geometry Encoder] Applying MLPGate: output = 2d + (1+gate)*vggt")
+                        self._camera_method_logged = True
+                    g_feat = (1 + gate_list[geo_item_idx]) * g_feat
+
+                if self.use_camera_method == "mlp_gate_vgllm" and gate_list:
+                    if not self._camera_method_logged:
+                        print("[Geometry Encoder] Applying VGLLMStyleMLPGate: output = 2d + gate*vggt")
+                        self._camera_method_logged = True
+                    g_feat = gate_list[geo_item_idx] * g_feat
+
+                if self.use_camera_method == "adaLN_dual" and camera_features_list:
+                    if not self._camera_method_logged:
+                        print("[Geometry Encoder] Applying DualCameraAdaLN: modulating geo and image features "
+                              "separately with camera token before fusion")
+                        self._camera_method_logged = True
+                    cf = camera_features_list[geo_item_idx]
+                    g_feat = self.camera_adaln_geo(g_feat, cf)
+                    img_emb_bn = self.camera_adaln_img(img_emb_bn, cf)
+
+                fused_bn = self.feature_fusion_module(img_emb_bn, g_feat)
+                if fused_bn.dim() == 3:
+                    fused_bn = fused_bn.view(n_img_bn, h_grid_bn, w_grid_bn, -1)
+
+                if self.use_camera_method == "adaLN" and camera_features_list:
+                    if not self._camera_method_logged:
+                        print("[Geometry Encoder] Applying CameraAdaLN: modulating fused features with camera token")
+                        self._camera_method_logged = True
+                    fused_bn = self.camera_adaln(fused_bn, camera_features_list[geo_item_idx])
+                elif self.use_camera_method == "adaLN_all" and camera_features_list and raw_geo_embeds:
+                    if not self._camera_method_logged:
+                        print("[Geometry Encoder] Applying CameraGeoAdaLN: modulating fused features with camera + raw geometry")
+                        self._camera_method_logged = True
+                    fused_bn = self.camera_geo_adaln(
+                        fused_bn, camera_features_list[geo_item_idx], raw_geo_embeds[geo_item_idx]
+                    )
+
+                fused_list.append(fused_bn.view(-1, fused_bn.shape[-1]))
+                geo_flat_list.append(g_feat.view(-1, g_feat.shape[-1]))
+
+                img_thw_offset += n_img_bn
+                tok_offset += n_tokens_bn
+                geo_item_idx += 1
+
+            image_embeds = torch.cat(fused_list, dim=0)
+            geo_embeds = torch.cat(geo_flat_list, dim=0)
             return image_embeds, geo_embeds, geo_deepstack_embeds, geo_deepstack_camera_tokens
+
+        geo_embeds = torch.cat(geo_embeds, dim=0)
+        h_grid = int(image_grid_thw[0, 1].item() // self.visual.spatial_merge_size)
+        w_grid = int(image_grid_thw[0, 2].item() // self.visual.spatial_merge_size)
+        n_image = int(image_grid_thw.shape[0])
+        image_embeds = image_embeds.view(n_image, h_grid, w_grid, -1)
 
         if not hasattr(self, "cross_attn_gate"):
             raise RuntimeError("CGMF is not initialized but FeatureFusionModule is disabled.")
