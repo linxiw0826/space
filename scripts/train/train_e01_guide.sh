@@ -41,14 +41,14 @@ CONFIGS_DIR="${SPACE_ROOT}/configs"
 
 if [ "${MODEL_SIZE}" = "8b" ]; then
     # 8B: larger model requires ZeRO-3 to fit on 8×H800
-    batch_size=1
-    grad_accum_steps=16
+    batch_size=2
+    grad_accum_steps=8
     DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${CONFIGS_DIR}/zero3.json}
     output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/output/train/e01_guide_8b}"
     run_name="space_e01_guide_8b_lr1e-5"
 elif [ "${MODEL_SIZE}" = "4b" ]; then
-    batch_size=1
-    grad_accum_steps=8
+    batch_size=2
+    grad_accum_steps=4
     DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${CONFIGS_DIR}/zero2.json}
     output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/output/train/e01_guide_4b}"
     run_name="space_e01_guide_4b_lr1e-5"
@@ -123,7 +123,7 @@ args="
     --lr_scheduler_type cosine \
     --logging_steps 1 \
     --model_max_length 12800 \
-    --gradient_checkpointing True \
+    --gradient_checkpointing False \
     --dataloader_num_workers 16 \
     --run_name ${run_name} \
     --report_to none \
