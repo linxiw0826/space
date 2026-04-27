@@ -225,9 +225,11 @@ class Qwen3_VL_MoPE(Qwen3_VL_MY):
         Collator: (context, gen_kwargs, doc_to_visual, doc_id, task, split).
         We extract visuals by calling doc_to_visual(self.task_dict[task][split][doc_id]).
         """
+        from tqdm import tqdm
+
         results = []
 
-        for request in requests:
+        for request in tqdm(requests, desc="[MoPE] generate_until", dynamic_ncols=True):
             # ----------------------------------------------------------
             # Extract visuals from this single request.
             # request.args = (context, gen_kwargs, doc_to_visual, doc_id, task, split)
