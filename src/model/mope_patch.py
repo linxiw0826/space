@@ -87,15 +87,21 @@ def _patch_model_for_mope(model) -> None:
             def _mope_get_image_features(pixel_values, grid_thw):
                 image_embeds_list, deepstack = original_get_image_features(pixel_values, grid_thw)
                 mope_feats = _mope_encoder(mope_frames)
-                mope_embeds = _mope_projector(mope_feats)        # [B, 1, llm_dim]
-                B_mope = mope_embeds.shape[0]
-                assert B_mope == 1, (
-                    f"MoPE additive fusion requires per_device_train_batch_size=1; got {B_mope}. "
-                    f"Increase gradient_accumulation_steps instead."
+                mope_embeds = _mope_projector(mope_feats)   # [B, 1, llm_dim]
+                mope_bias = mope_embeds.squeeze(1)          # [B, llm_dim]
+                B_mope = mope_bias.shape[0]
+                n_total = len(image_embeds_list)
+                assert n_total % B_mope == 0, (
+                    f"MoPE: image_embeds_list length ({n_total}) not divisible by "
+                    f"batch size ({B_mope}). Unequal images-per-sample not supported."
                 )
-                mope_bias = mope_embeds.squeeze(1)  # [1, llm_dim]
-                image_embeds_list = [e + mope_bias.to(e.dtype) for e in image_embeds_list]
-                return image_embeds_list, deepstack
+                imgs_per_sample = n_total // B_mope
+                new_embeds = []
+                for b in range(B_mope):
+                    bias = mope_bias[b:b+1]  # [1, llm_dim]
+                    for e in image_embeds_list[b * imgs_per_sample:(b + 1) * imgs_per_sample]:
+                        new_embeds.append(e + bias.to(e.dtype))
+                return new_embeds, deepstack
 
             self.get_image_features = _mope_get_image_features
 
