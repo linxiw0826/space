@@ -125,10 +125,12 @@ class Qwen3_VL_MoPE(Qwen3_VL_MY):
 
         success = _load_mope_weights_from_pretrained(inner, pretrained)
 
-        # Cast MoPE modules to match the base model dtype (typically bfloat16)
-        model_dtype = next(self._model.parameters()).dtype
-        inner._mope_encoder.to(dtype=model_dtype)
-        inner._mope_projector.to(dtype=model_dtype)
+        # Move MoPE modules to match the base model device and dtype (typically cuda:N, bfloat16)
+        ref_param = next(self._model.parameters())
+        model_dtype = ref_param.dtype
+        model_device = ref_param.device
+        inner._mope_encoder.to(device=model_device, dtype=model_dtype)
+        inner._mope_projector.to(device=model_device, dtype=model_dtype)
 
         if success:
             _patch_model_for_mope(self._model)
