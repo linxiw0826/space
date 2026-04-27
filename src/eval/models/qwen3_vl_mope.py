@@ -112,7 +112,7 @@ class Qwen3_VL_MoPE(Qwen3_VL_MY):
         self.mope_all_frames = mope_all_frames
 
         inner = self._model.model  # Qwen3VLModel / Qwen2_5_VLModel
-        llm_dim = self._model.config.hidden_size
+        llm_dim = self._model.config.text_config.hidden_size
 
         from model.mope_encoder import MoPEEncoder
         from model.mope_projector import MoPEProjector
@@ -124,6 +124,11 @@ class Qwen3_VL_MoPE(Qwen3_VL_MY):
         inner.add_module("_mope_projector", projector)
 
         success = _load_mope_weights_from_pretrained(inner, pretrained)
+
+        # Cast MoPE modules to match the base model dtype (typically bfloat16)
+        model_dtype = next(self._model.parameters()).dtype
+        inner._mope_encoder.to(dtype=model_dtype)
+        inner._mope_projector.to(dtype=model_dtype)
 
         if success:
             _patch_model_for_mope(self._model)
