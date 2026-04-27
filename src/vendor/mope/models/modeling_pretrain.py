@@ -164,6 +164,7 @@ class PretrainVisionTransformer(nn.Module):
         with_cp=False, all_frames=16, cos_attn=False,
         moe_layer_indices=None,
         num_routable_experts=17, num_shared_experts=4, top_k=5,
+        **kwargs,  # absorb timm-injected kwargs (e.g. pretrained_cfg)
     ):
         super().__init__()
         self.encoder = PretrainVisionTransformerEncoder(
