@@ -161,11 +161,18 @@ def _attach_mope_to_model(model, mope_args: MoPEArguments):
     inner_model.add_module("_mope_encoder", encoder)
 
     rank0_print("[Space Sensing] Attaching MoPEProjector (trainable) ...")
-    llm_dim = (
-        model.config.hidden_size
-        if mope_args.mope_llm_dim <= 0
-        else mope_args.mope_llm_dim
+    # Qwen3VLConfig stores LLM hidden_size under text_config; Qwen2.5-VL puts it
+    # directly on config.  Fall back gracefully so both model families work.
+    _cfg = model.config
+    _llm_hidden = getattr(_cfg, "hidden_size", None) or getattr(
+        getattr(_cfg, "text_config", None), "hidden_size", None
     )
+    if _llm_hidden is None:
+        raise AttributeError(
+            "Cannot determine LLM hidden_size from model.config. "
+            "Set --mope_llm_dim explicitly."
+        )
+    llm_dim = _llm_hidden if mope_args.mope_llm_dim <= 0 else mope_args.mope_llm_dim
     rank0_print(
         f"[Space Sensing] MoPE llm_dim = {llm_dim} "
         f"({'auto from config' if mope_args.mope_llm_dim <= 0 else 'manual'})"
