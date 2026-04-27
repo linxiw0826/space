@@ -82,7 +82,16 @@ class MoPEEncoder(nn.Module):
             # Strip _orig_mod. prefix from torch.compile artefacts.
             state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
 
-            msg = pretrain_model.load_state_dict(state_dict, strict=False)
+            # Exclude predictor weights: predictor_pos_embed size depends on the
+            # all_frames the checkpoint was trained with, which may differ from the
+            # all_frames used here.  We only need the encoder sub-module anyway.
+            encoder_state_dict = {k: v for k, v in state_dict.items()
+                                  if not k.startswith('predictor.')}
+            skipped = len(state_dict) - len(encoder_state_dict)
+            if skipped:
+                print(f"[MoPEEncoder] Skipped {skipped} predictor.* keys (not used at inference)")
+
+            msg = pretrain_model.load_state_dict(encoder_state_dict, strict=False)
             print(f"[MoPEEncoder] Missing keys: {len(msg.missing_keys)}, "
                   f"Unexpected keys: {len(msg.unexpected_keys)}")
             if msg.missing_keys:
