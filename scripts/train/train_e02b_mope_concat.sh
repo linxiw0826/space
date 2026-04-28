@@ -14,8 +14,8 @@
 #
 # Key differences from E-02a:
 #   - --mope_fusion_mode concat       (prepend 784 tokens, not broadcast add)
-#   - batch_size 1  / grad_accum 8    (same effective batch=48 as E-02a 2×4×6)
-#   - gradient_checkpointing True     (longer sequences need memory savings)
+#   - batch_size 2  / grad_accum 4    (same effective batch=48 as E-02a 2×4×6)
+#   - gradient_checkpointing False    (H20 96GB has headroom; avoids recompute overhead)
 #   - output_dir → e02b_mope_concat_{size}
 # =============================================================================
 set -e
@@ -53,8 +53,8 @@ MOPE_CODE_PATH=${MOPE_CODE_PATH:-${SPACE_ROOT}/src/vendor/mope}
 # Per-size configuration
 # ---------------------------------------------------------------------------
 if [ "${MODEL_SIZE}" = "4b" ]; then
-    batch_size=1
-    grad_accum_steps=8
+    batch_size=2
+    grad_accum_steps=4
     DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${SPACE_ROOT}/configs/zero2.json}
     output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/output/train/e02b_mope_concat_4b}"
     run_name="space_e02b_mope_concat_4b_lr1e-5"
@@ -143,7 +143,7 @@ args="
     --lr_scheduler_type cosine \
     --logging_steps 1 \
     --model_max_length 12800 \
-    --gradient_checkpointing True \
+    --gradient_checkpointing False \
     --dataloader_num_workers 16 \
     --run_name ${run_name} \
     --report_to none \
