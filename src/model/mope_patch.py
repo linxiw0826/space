@@ -162,100 +162,49 @@ def _patch_model_for_mope_concat(model) -> None:
         mope_embeds = _mope_projector(mope_feats)    # [B, N_mope, llm_dim]
         N_mope = mope_embeds.shape[1]
 
-        _first_layer_done = [False]
-
-        def _layer_hook(module, args, layer_kwargs):
-            hidden_states = args[0]  # [B, T or T+N_mope, dim]
-
-            new_hs = hidden_states
-            # Layer 0 only: prepend MoPE token embeddings.
-            if not _first_layer_done[0]:
-                _first_layer_done[0] = True
-                new_hs = torch.cat(
-                    [mope_embeds.to(hidden_states.dtype), hidden_states], dim=1
+        def _lm_pre_hook(module, args, kwargs):
+            # Prepend MoPE tokens to inputs_embeds: [B, L, D] → [B, N+L, D]
+            inputs_embeds = kwargs.get('inputs_embeds', None)
+            if inputs_embeds is not None:
+                kwargs['inputs_embeds'] = torch.cat(
+                    [mope_embeds.to(inputs_embeds.dtype), inputs_embeds], dim=1
                 )
 
-            T_hs = new_hs.shape[1]
-
-            # Extend 4-D causal attention mask if present and not yet extended.
-            attn_mask = layer_kwargs.get('attention_mask', None)
-            if attn_mask is not None:
-                if attn_mask.dim() == 4:
-                    T_mask = attn_mask.shape[-1]
-                    if T_mask < T_hs:
-                        n_ext = T_hs - T_mask
-                        B_m = attn_mask.shape[0]
-                        dt, dv = attn_mask.dtype, attn_mask.device
-                        min_val = torch.finfo(dt).min
-                        # MoPE-to-MoPE: all attend (0).
-                        # MoPE-to-original: causal mask (MoPE comes first, -inf for future).
-                        # Original-to-MoPE: all attend (0).
-                        top = torch.cat([
-                            torch.zeros(B_m, 1, n_ext, n_ext, dtype=dt, device=dv),
-                            torch.full((B_m, 1, n_ext, T_mask), min_val, dtype=dt, device=dv),
-                        ], dim=-1)
-                        bot = torch.cat([
-                            torch.zeros(B_m, 1, T_mask, n_ext, dtype=dt, device=dv),
-                            attn_mask,
-                        ], dim=-1)
-                        layer_kwargs['attention_mask'] = torch.cat([top, bot], dim=-2)
-                elif attn_mask.dim() == 2:
-                    # Flash-Attention style 2-D mask [B, T]: prepend ones for MoPE.
-                    T_mask = attn_mask.shape[1]
-                    if T_mask < T_hs:
-                        n_ext = T_hs - T_mask
-                        ones = attn_mask.new_ones(attn_mask.shape[0], n_ext)
-                        layer_kwargs['attention_mask'] = torch.cat([ones, attn_mask], dim=1)
-
-            # Extend pre-computed rotary position embeddings (cos, sin).
-            pos_emb = layer_kwargs.get('position_embeddings', None)
-            if pos_emb is not None and isinstance(pos_emb, (tuple, list)) and len(pos_emb) == 2:
-                cos, sin = pos_emb
-                if cos.dim() >= 2:
-                    T_pos = cos.shape[-2]
-                    if T_pos < T_hs:
-                        n_ext = T_hs - T_pos
-                        # Use position=0 values (cos(0)=1, sin(0)=0) so RoPE
-                        # degrades to identity for MoPE tokens instead of zeroing
-                        # out Q/K vectors.  cos/sin shape: (..., seq_len, head_dim).
-                        pos0_cos = cos[..., :1, :].expand(
-                            *cos.shape[:-2], n_ext, cos.shape[-1]
-                        )
-                        pos0_sin = sin[..., :1, :].expand(
-                            *sin.shape[:-2], n_ext, sin.shape[-1]
-                        )
-                        layer_kwargs['position_embeddings'] = (
-                            torch.cat([pos0_cos, cos], dim=-2),
-                            torch.cat([pos0_sin, sin], dim=-2),
-                        )
-
-            # Extend position_ids if passed separately (Qwen3 3-D RoPE).
-            pos_ids = layer_kwargs.get('position_ids', None)
+            # Extend position_ids (last dim): [..., L] → [..., N+L] (prepend zeros).
+            # RoPE at position 0 is identity (cos=1, sin=0), preserving Q/K values.
+            pos_ids = kwargs.get('position_ids', None)
             if pos_ids is not None:
-                T_pos = pos_ids.shape[-1]
-                if T_pos < T_hs:
-                    n_ext = T_hs - T_pos
-                    shape = list(pos_ids.shape)
-                    shape[-1] = n_ext
-                    z_ids = torch.zeros(shape, dtype=pos_ids.dtype, device=pos_ids.device)
-                    layer_kwargs['position_ids'] = torch.cat([z_ids, pos_ids], dim=-1)
+                z = torch.zeros(
+                    *pos_ids.shape[:-1], N_mope,
+                    dtype=pos_ids.dtype, device=pos_ids.device,
+                )
+                kwargs['position_ids'] = torch.cat([z, pos_ids], dim=-1)
 
-            return (new_hs,) + args[1:], layer_kwargs
+            # Extend 2-D attention_mask [B, L] → [B, N+L]: prepend ones for MoPE.
+            attn_mask = kwargs.get('attention_mask', None)
+            if attn_mask is not None and attn_mask.dim() == 2:
+                ones = attn_mask.new_ones(attn_mask.shape[0], N_mope)
+                kwargs['attention_mask'] = torch.cat([ones, attn_mask], dim=1)
 
-        layers = getattr(self, 'layers', None)
-        if layers is None:
+            # Extend visual_pos_masks [B, L] → [B, N+L]: prepend False for MoPE.
+            vis_mask = kwargs.get('visual_pos_masks', None)
+            if vis_mask is not None:
+                false_prefix = vis_mask.new_zeros(
+                    vis_mask.shape[0], N_mope, dtype=torch.bool
+                )
+                kwargs['visual_pos_masks'] = torch.cat([false_prefix, vis_mask], dim=1)
+
+            return args, kwargs
+
+        lm = getattr(self, 'language_model', None)
+        if lm is None:
             return original_forward(*args, **kwargs)
 
-        handles = [
-            layer.register_forward_pre_hook(_layer_hook, with_kwargs=True, prepend=True)
-            for layer in layers
-        ]
-
+        handle = lm.register_forward_pre_hook(_lm_pre_hook, with_kwargs=True, prepend=True)
         try:
             output = original_forward(*args, **kwargs)
         finally:
-            for h in handles:
-                h.remove()
+            handle.remove()
 
         return output
 
