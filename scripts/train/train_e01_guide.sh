@@ -32,8 +32,6 @@ MOPE_ROOT="${SPACE_ROOT}/src/vendor/mope"
 # ---------------------------------------------------------------------------
 MODEL_SIZE=${MODEL_SIZE:-4b}
 
-QWEN3_VL_4B_PATH=${QWEN3_VL_4B_PATH:-/home/nvme03/wlx/Space_sensing/models/Qwen3-VL-4B-Instruct}
-QWEN3_VL_8B_PATH=${QWEN3_VL_8B_PATH:-/home/nvme03/wlx/Space_sensing/models/Qwen3-VL-8B-Instruct}
 VGGT_PATH=${VGGT_PATH:-/home/nvme01/wlx/Space_sensing/models/VGGT-1B}
 GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-/home/nvme03/wlx/Space_sensing/output/train/guide_reproduced/4b}
 

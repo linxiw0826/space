@@ -64,3 +64,41 @@ class MoPEProjector(nn.Module):
         x = x.unsqueeze(1)
 
         return x
+
+
+class MoPEProjectorConcat(nn.Module):
+    """E-02b per-token projector — no global avg pool.
+
+    Projects each MoPE patch token independently to LLM embedding space.
+    Output shape [B, N_patches, llm_dim] is concatenated into the LLM input
+    sequence rather than broadcast-added.
+
+    Args:
+        mope_dim: MoPE feature dimension (default: 768, ViT-B).
+        llm_dim:  LLM hidden dimension (default: 3584, Qwen3-VL-4B).
+    """
+
+    def __init__(self, mope_dim: int = 768, llm_dim: int = 3584):
+        super().__init__()
+        self.mope_dim = mope_dim
+        self.llm_dim = llm_dim
+
+        self.norm = nn.LayerNorm(mope_dim)
+        self.proj = nn.Linear(mope_dim, llm_dim, bias=True)
+
+        # Zero-init: MoPE contribution is zero at training start.
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, mope_features: torch.Tensor) -> torch.Tensor:
+        """Project each MoPE patch token to LLM embedding space.
+
+        Args:
+            mope_features: Float tensor [B, N_patches, mope_dim].
+
+        Returns:
+            mope_embeds: Float tensor [B, N_patches, llm_dim] for sequence concat.
+        """
+        x = self.norm(mope_features)   # [B, N_patches, mope_dim]
+        x = self.proj(x)               # [B, N_patches, llm_dim]
+        return x

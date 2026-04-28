@@ -135,7 +135,7 @@ def set_model(model_args, model):
 # MoPE integration helpers (new)
 # ---------------------------------------------------------------------------
 
-from model.mope_patch import _patch_model_for_mope  # noqa: E402
+from model.mope_patch import _patch_model_for_mope, _patch_model_for_mope_concat  # noqa: E402
 
 
 def _attach_mope_to_model(model, mope_args: MoPEArguments):
@@ -175,12 +175,14 @@ def _attach_mope_to_model(model, mope_args: MoPEArguments):
     llm_dim = _llm_hidden if mope_args.mope_llm_dim <= 0 else mope_args.mope_llm_dim
     rank0_print(
         f"[Space Sensing] MoPE llm_dim = {llm_dim} "
-        f"({'auto from config' if mope_args.mope_llm_dim <= 0 else 'manual'})"
+        f"({'auto from config' if mope_args.mope_llm_dim <= 0 else 'manual'}), "
+        f"fusion_mode = {mope_args.mope_fusion_mode}"
     )
-    projector = MoPEProjector(
-        mope_dim=768,
-        llm_dim=llm_dim,
-    )
+    if mope_args.mope_fusion_mode == "concat":
+        from model.mope_projector import MoPEProjectorConcat
+        projector = MoPEProjectorConcat(mope_dim=768, llm_dim=llm_dim)
+    else:
+        projector = MoPEProjector(mope_dim=768, llm_dim=llm_dim)
     inner_model.add_module("_mope_projector", projector)
 
     # Ensure projector is trainable (encoder is already frozen internally).
@@ -456,7 +458,10 @@ def train(attn_implementation="flash_attention_2"):
     # accidentally making patch-internal references trainable).
     # ------------------------------------------------------------------
     if mope_args.use_mope:
-        _patch_model_for_mope(model)
+        if mope_args.mope_fusion_mode == "concat":
+            _patch_model_for_mope_concat(model)
+        else:
+            _patch_model_for_mope(model)
 
     # ------------------------------------------------------------------
     # Data + training (verbatim from GUIDE)
@@ -472,9 +477,20 @@ def train(attn_implementation="flash_attention_2"):
             data_module["train_dataset"],
             mope_all_frames=mope_args.mope_all_frames,
         )
-        data_module["data_collator"] = MoPECollatorWrapper(data_module["data_collator"])
+        # For concat fusion, prepend N_mope -100 labels so loss shape matches
+        # the extended logit sequence produced by _patch_model_for_mope_concat.
+        n_mope_tokens = (
+            mope_args.mope_concat_num_tokens
+            if mope_args.mope_fusion_mode == "concat"
+            else 0
+        )
+        data_module["data_collator"] = MoPECollatorWrapper(
+            data_module["data_collator"],
+            mope_num_tokens=n_mope_tokens,
+        )
         rank0_print(
-            f"[Space Sensing] MoPE data pipeline: {mope_args.mope_all_frames} frames/sample"
+            f"[Space Sensing] MoPE data pipeline: {mope_args.mope_all_frames} frames/sample, "
+            f"fusion={mope_args.mope_fusion_mode}, label_pad={n_mope_tokens}"
         )
         training_args.remove_unused_columns = False
 

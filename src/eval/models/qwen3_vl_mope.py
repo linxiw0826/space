@@ -37,7 +37,7 @@ if str(_SRC_ROOT) not in sys.path:
 # ---------------------------------------------------------------------------
 from lmms_eval.api.registry import register_model  # noqa: E402
 from lmms_eval.models.simple.qwen3_vl_my import Qwen3_VL_MY  # noqa: E402
-from model.mope_patch import _patch_model_for_mope  # noqa: E402
+from model.mope_patch import _patch_model_for_mope, _patch_model_for_mope_concat  # noqa: E402
 
 
 def _load_mope_weights_from_pretrained(inner_model, pretrained_path: str) -> bool:
@@ -218,7 +218,7 @@ class Qwen3_VL_MoPE(Qwen3_VL_MY):
     # have its own mope_frames injected via the sidecar.
     # ------------------------------------------------------------------
 
-    def generate_until(self, requests) -> List[str]:
+    def generate_until(self, requests: list) -> List[str]:
         """Process requests one-by-one, injecting MoPE frames per sample.
 
         Each request element has the structure produced by lmms-eval's
@@ -267,3 +267,132 @@ class Qwen3_VL_MoPE(Qwen3_VL_MY):
                 inner._pending_mope_frames = None
 
         return results
+
+
+@register_model("qwen3_vl_mope_concat")
+class Qwen3_VL_MoPE_Concat(Qwen3_VL_MoPE):
+    """E-02b inference model: Qwen3-VL + MoPE concat fusion for lmms-eval.
+
+    Identical to Qwen3_VL_MoPE except:
+      - Uses MoPEProjectorConcat (no avg pool, per-token projection).
+      - Applies _patch_model_for_mope_concat (prepend tokens to LLM sequence).
+
+    Registers model type ``qwen3_vl_mope_concat`` via LMMS_EVAL_PLUGINS.
+    """
+
+    def __init__(
+        self,
+        pretrained: str = "Qwen/Qwen3-VL-4B-Instruct",
+        mope_all_frames: int = 8,
+        **kwargs,
+    ) -> None:
+        # Call Qwen3_VL_MY.__init__ directly to skip the E-02a MoPE setup
+        # in Qwen3_VL_MoPE.__init__.
+        Qwen3_VL_MY.__init__(self, pretrained=pretrained, **kwargs)
+        self.mope_all_frames = mope_all_frames
+
+        inner = self._model.model
+        llm_dim = self._model.config.text_config.hidden_size
+
+        from model.mope_encoder import MoPEEncoder
+        from model.mope_projector import MoPEProjectorConcat
+
+        encoder = MoPEEncoder(checkpoint_path=None, all_frames=self.mope_all_frames)
+        projector = MoPEProjectorConcat(mope_dim=768, llm_dim=llm_dim)
+
+        inner.add_module("_mope_encoder", encoder)
+        inner.add_module("_mope_projector", projector)
+
+        success = _load_mope_weights_from_pretrained(inner, pretrained)
+
+        ref_param = next(self._model.parameters())
+        inner._mope_encoder.to(device=ref_param.device, dtype=ref_param.dtype)
+        inner._mope_projector.to(device=ref_param.device, dtype=ref_param.dtype)
+
+        if success:
+            _patch_model_for_mope_concat(self._model)
+            print(
+                f"[Qwen3_VL_MoPE_Concat] MoPE concat patch applied. "
+                f"mope_all_frames={self.mope_all_frames}"
+            )
+        else:
+            print(
+                "[Qwen3_VL_MoPE_Concat] WARNING: MoPE weights could not be loaded "
+                "— running as standard GUIDE model."
+            )
+
+    # ------------------------------------------------------------------
+    # Override _compute_mope_frames to support PIL.Image list input
+    # (VSIBench / SPAR evaluation passes 8 PIL.Image frames, not a video path).
+    # ------------------------------------------------------------------
+
+    def _compute_mope_frames(self, visuals) -> Optional[torch.Tensor]:
+        """Sample T frames from visuals and return a [1, 3, T, 224, 224] float tensor.
+
+        Supports two input types:
+          1. Video file path (str with .mp4/.avi/.mov/.mkv extension) — delegates
+             to parent class logic via decord (E-02a compatibility).
+          2. List of PIL.Image objects — directly used as frames (SPAR / VSIBench
+             evaluation format where lmms-eval passes 8 pre-loaded images).
+
+        Args:
+            visuals: list of (str path | PIL.Image) or a single such item.
+
+        Returns:
+            Tensor of shape [1, 3, T, 224, 224] on CPU, dtype float32.
+            None if neither video path nor PIL.Image objects are found.
+        """
+        # Normalise to list
+        if not isinstance(visuals, (list, tuple)):
+            visuals = [visuals]
+
+        # --- Path 1: video file present — delegate to parent ---
+        for v in visuals:
+            if isinstance(v, str) and v.lower().endswith(_VIDEO_EXTENSIONS):
+                return super()._compute_mope_frames(visuals)
+
+        # --- Path 2: collect PIL.Image objects ---
+        pil_images = [v for v in visuals if isinstance(v, Image.Image)]
+
+        if not pil_images:
+            print(
+                "[Qwen3_VL_MoPE_Concat] WARNING: no video path or PIL.Image found "
+                "in visuals — MoPE skipped for this sample."
+            )
+            return None
+
+        try:
+            T = self.mope_all_frames
+            n = len(pil_images)
+
+            # Uniform sampling; pad by repeating last frame if n < T
+            if n >= T:
+                indices = np.linspace(0, n - 1, T, dtype=int)
+            else:
+                indices = list(range(n)) + [n - 1] * (T - n)
+                indices = np.array(indices, dtype=int)
+
+            mean = torch.tensor(_IMAGENET_MEAN, dtype=torch.float32).view(3, 1, 1)
+            std = torch.tensor(_IMAGENET_STD, dtype=torch.float32).view(3, 1, 1)
+
+            frame_tensors = []
+            for idx in indices:
+                pil_frame = pil_images[int(idx)].convert("RGB").resize(
+                    (224, 224), Image.BILINEAR
+                )
+                arr = np.array(pil_frame, dtype=np.float32) / 255.0  # H x W x 3
+                t = torch.from_numpy(arr).permute(2, 0, 1)           # 3 x 224 x 224
+                t = (t - mean) / std
+                frame_tensors.append(t)
+
+            # [T, 3, 224, 224] -> [3, T, 224, 224] -> [1, 3, T, 224, 224]
+            frames = torch.stack(frame_tensors, dim=0)         # [T, 3, 224, 224]
+            frames = frames.permute(1, 0, 2, 3).unsqueeze(0)  # [1, 3, T, 224, 224]
+            return frames
+
+        except Exception as exc:
+            print(
+                f"[Qwen3_VL_MoPE_Concat] WARNING: _compute_mope_frames (PIL path) failed "
+                f"({type(exc).__name__}: {exc}). MoPE will be skipped for this sample."
+            )
+            return None

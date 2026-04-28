@@ -122,6 +122,18 @@ class MoPEArguments:
         metadata={"help": "Number of video frames passed to MoPEEncoder. "
                           "Must be consistent with data preprocessing."},
     )
+    mope_fusion_mode: str = field(
+        default="add",
+        metadata={"help": "MoPE fusion strategy. "
+                          "'add': E-02a — global avg pool → broadcast-add bias to image_embeds. "
+                          "'concat': E-02b — per-token projection, prepend to LLM input sequence."},
+    )
+    mope_concat_num_tokens: int = field(
+        default=784,
+        metadata={"help": "Number of MoPE patch tokens for concat fusion (mope_fusion_mode=concat). "
+                          "Used to prepend -100 labels so loss shape matches extended logits. "
+                          "Default 784 = VideoMAEv2 ViT-B, 8 frames, 224×224, tubelet_size=2."},
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -1,12 +1,22 @@
 #!/bin/bash
 # =============================================================================
-# E-02a: GUIDE + MoPE input-level add (unified 4B / 8B)
+# E-02b: GUIDE + MoPE token-concat fusion (unified 4B / 8B)
+#
+# Difference from E-02a: MoPE keeps all ~784 patch tokens and prepends them
+# to the LLM input sequence so each text/image token can attend to every MoPE
+# token via self-attention (D-07, Option C).
 #
 # Usage:
-#   MODEL_SIZE=4b bash train_e02a_mope_add.sh   # default
-#   MODEL_SIZE=8b bash train_e02a_mope_add.sh
+#   MODEL_SIZE=4b bash train_e02b_mope_concat.sh   # default
+#   MODEL_SIZE=8b bash train_e02b_mope_concat.sh
 #
 # Supported MODEL_SIZE values: 4b  8b
+#
+# Key differences from E-02a:
+#   - --mope_fusion_mode concat       (prepend 784 tokens, not broadcast add)
+#   - batch_size 1  / grad_accum 8    (same effective batch=48 as E-02a 2×4×6)
+#   - gradient_checkpointing True     (longer sequences need memory savings)
+#   - output_dir → e02b_mope_concat_{size}
 # =============================================================================
 set -e
 
@@ -20,7 +30,6 @@ MODEL_SIZE=${MODEL_SIZE:-4b}
 # ---------------------------------------------------------------------------
 MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 MASTER_PORT=${MASTER_PORT:-$(shuf -i 20001-29999 -n 1)}
-# Single-node training only; multi-node not supported.
 NPROC_PER_NODE=${NPROC_PER_NODE:-6}
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5}
 
@@ -44,18 +53,19 @@ MOPE_CODE_PATH=${MOPE_CODE_PATH:-${SPACE_ROOT}/src/vendor/mope}
 # Per-size configuration
 # ---------------------------------------------------------------------------
 if [ "${MODEL_SIZE}" = "4b" ]; then
-    batch_size=2
-    grad_accum_steps=4
-    DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${SPACE_ROOT}/configs/zero2.json}
-    output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/output/train/e02a_mope_add_4b}"
-    run_name="space_e02a_mope_add_4b_lr1e-5"
-elif [ "${MODEL_SIZE}" = "8b" ]; then
-    batch_size=2
+    batch_size=1
     grad_accum_steps=8
-    # 8B requires ZeRO-3 to fit on 8x H800 GPUs
+    DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${SPACE_ROOT}/configs/zero2.json}
+    output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/output/train/e02b_mope_concat_4b}"
+    run_name="space_e02b_mope_concat_4b_lr1e-5"
+elif [ "${MODEL_SIZE}" = "8b" ]; then
+    batch_size=1
+    grad_accum_steps=16
+    # 8B requires ZeRO-3 to fit on 8×H800 GPUs; concat adds ~784 tokens per sample.
     DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${SPACE_ROOT}/configs/zero3.json}
-    output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/output/train/e02a_mope_add_8b}"
-    run_name="space_e02a_mope_add_8b_lr1e-5"
+    output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/output/train/e02b_mope_concat_8b}"
+    run_name="space_e02b_mope_concat_8b_lr1e-5"
+    echo "WARNING: 8B E-02b is experimental — monitor VRAM usage carefully." >&2
 else
     echo "ERROR: Unknown MODEL_SIZE='${MODEL_SIZE}'. Must be '4b' or '8b'." >&2
     exit 1
@@ -91,6 +101,11 @@ fi
 # Hyperparameters
 # ---------------------------------------------------------------------------
 lr=1e-5
+
+# MoPE concat token count: VideoMAEv2 ViT-B, 8 frames, 224×224, tubelet_size=2
+# = (8/2) × (224/16)^2 = 4 × 196 = 784 patch tokens.
+# Must match mope_all_frames below.
+MOPE_CONCAT_NUM_TOKENS=${MOPE_CONCAT_NUM_TOKENS:-784}
 
 # ---------------------------------------------------------------------------
 # Entry point: our fork of the training framework
@@ -128,7 +143,7 @@ args="
     --lr_scheduler_type cosine \
     --logging_steps 1 \
     --model_max_length 12800 \
-    --gradient_checkpointing False \
+    --gradient_checkpointing True \
     --dataloader_num_workers 16 \
     --run_name ${run_name} \
     --report_to none \
@@ -142,7 +157,8 @@ args="
     --geometry_encoder_type vggt \
     --geometry_encoder_path ${VGGT_PATH} \
     --use_mope True \
-    --mope_fusion_mode add \
+    --mope_fusion_mode concat \
+    --mope_concat_num_tokens ${MOPE_CONCAT_NUM_TOKENS} \
     --mope_checkpoint_path ${MOPE_CKPT_PATH} \
     --mope_encoder_path ${MOPE_CODE_PATH} \
     --mope_all_frames 8 \
@@ -151,11 +167,12 @@ args="
 # ---------------------------------------------------------------------------
 # Launch
 # ---------------------------------------------------------------------------
-LOG_FILE="${LOG_DIR}/e02a_mope_add_${MODEL_SIZE}_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="${LOG_DIR}/e02b_mope_concat_${MODEL_SIZE}_$(date +%Y%m%d_%H%M%S).log"
 
-echo "=== E-02a Training (MODEL_SIZE=${MODEL_SIZE}) ==="
+echo "=== E-02b Training (MODEL_SIZE=${MODEL_SIZE}) ==="
 echo "Output : ${output_dir}"
 echo "Log    : ${LOG_FILE}"
+echo "Fusion : concat, N_mope=${MOPE_CONCAT_NUM_TOKENS}, batch=${batch_size}, accum=${grad_accum_steps}"
 
 python -m torch.distributed.run --nproc_per_node=${NPROC_PER_NODE} \
          --master_addr=${MASTER_ADDR} \

@@ -115,10 +115,16 @@ class MoPEDatasetWrapper(Dataset):
 
 
 class MoPECollatorWrapper:
-    """Wraps DataCollatorForSupervisedDataset to stack raw_frames into mope_frames."""
+    """Wraps DataCollatorForSupervisedDataset to stack raw_frames into mope_frames.
 
-    def __init__(self, base_collator):
+    For E-02b concat fusion (mope_num_tokens > 0): prepends mope_num_tokens
+    -100 entries to each labels row so that the loss shape matches the extended
+    logit sequence produced by _patch_model_for_mope_concat.
+    """
+
+    def __init__(self, base_collator, mope_num_tokens: int = 0):
         self.base = base_collator
+        self.mope_num_tokens = mope_num_tokens
 
     def __call__(self, instances):
         batch = self.base(instances)
@@ -127,4 +133,10 @@ class MoPECollatorWrapper:
             batch["mope_frames"] = torch.stack(
                 [inst["raw_frames"] for inst in instances]
             )
+        # E-02b: extend labels to match T+N_mope logit sequence length.
+        if self.mope_num_tokens > 0 and "labels" in batch:
+            pad = batch["labels"].new_full(
+                (batch["labels"].shape[0], self.mope_num_tokens), -100
+            )
+            batch["labels"] = torch.cat([pad, batch["labels"]], dim=1)
         return batch
