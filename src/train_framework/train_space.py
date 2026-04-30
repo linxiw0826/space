@@ -509,7 +509,41 @@ def train(attn_implementation="flash_attention_2"):
         )
         training_args.remove_unused_columns = False
 
-    trainer = Trainer(
+    # [DIAG] Subclass to print actual loss.item() for first 5 micro-batches.
+    # Captures the true scalar loss before any aggregation / nan-filtering.
+    class _DiagTrainer(Trainer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._diag_calls = 0
+
+        def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+            _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            lbl = inputs.get("labels", None)
+            if self._diag_calls < 5 and _rank == 0:
+                _n_valid = (lbl != -100).sum().item() if lbl is not None else -1
+                print(
+                    f"[DIAG TRAINER] call#{self._diag_calls + 1}: "
+                    f"labels={tuple(lbl.shape) if lbl is not None else None} "
+                    f"valid={_n_valid}",
+                    flush=True,
+                )
+            _super_kwargs = {} if num_items_in_batch is None else {"num_items_in_batch": num_items_in_batch}
+            _result = super().compute_loss(model, inputs, return_outputs=True, **_super_kwargs)
+            _loss, _outputs = _result
+            if self._diag_calls < 5 and _rank == 0:
+                self._diag_calls += 1
+                print(
+                    f"[DIAG TRAINER] call#{self._diag_calls}: "
+                    f"loss={_loss.item():.8f} "
+                    f"loss_isnan={_loss.isnan().item()} "
+                    f"logits_shape={tuple(_outputs.logits.shape) if hasattr(_outputs, 'logits') else None}",
+                    flush=True,
+                )
+            else:
+                self._diag_calls += 1
+            return (_loss, _outputs) if return_outputs else _loss
+
+    trainer = _DiagTrainer(
         model=model, processing_class=tokenizer, args=training_args, **data_module
     )
 
