@@ -188,6 +188,15 @@ def _patch_model_for_mope_concat(model) -> None:
         # Compute MoPE token embeddings.
         mope_feats = _mope_encoder(mope_frames)      # [B, N_mope, 768]
         mope_embeds = _mope_projector(mope_feats)    # [B, N_mope, llm_dim]
+        _n_nan = torch.isnan(mope_embeds).sum().item()
+        if _n_nan > 0:
+            print(
+                f"[MoPE E02b WARNING] mope_embeds has {_n_nan} NaN values at call#{_diag_state['calls']}, "
+                f"mope_frames stats: min={mope_frames.min().item():.4f} max={mope_frames.max().item():.4f} "
+                f"frames_nan={torch.isnan(mope_frames).sum().item()}",
+                flush=True,
+            )
+            mope_embeds = torch.nan_to_num(mope_embeds, nan=0.0)
         N_mope = mope_embeds.shape[1]
 
         def _lm_pre_hook(module, args, kwargs):

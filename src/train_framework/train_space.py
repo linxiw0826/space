@@ -533,6 +533,14 @@ def train(attn_implementation="flash_attention_2"):
             _super_kwargs = {} if num_items_in_batch is None else {"num_items_in_batch": num_items_in_batch}
             _result = super().compute_loss(model, inputs, return_outputs=True, **_super_kwargs)
             _loss, _outputs = _result
+            if torch.isnan(_loss).any() or torch.isinf(_loss).any():
+                if _rank == 0:
+                    print(
+                        f"[DIAG TRAINER] NaN/Inf loss at call#{self._diag_calls + 1}, "
+                        f"replacing with zero to protect Adam states",
+                        flush=True,
+                    )
+                _loss = torch.nan_to_num(_loss, nan=0.0, posinf=0.0, neginf=0.0)
             if self._diag_calls < 20 and _rank == 0:
                 self._diag_calls += 1
                 _logits_shape = None
