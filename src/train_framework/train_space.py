@@ -469,6 +469,28 @@ def train(attn_implementation="flash_attention_2"):
             )
 
     # ------------------------------------------------------------------
+    # E-02b: Register nan_to_num gradient hooks on ALL trainable params.
+    # With 784 prepended tokens and tune_mm_llm=True, LLM attention/MLP
+    # backward can overflow bf16 to Inf.  clip_grad_norm_ then computes
+    # Inf×0 = NaN (IEEE 754), and AdamW propagates that as 0×NaN = NaN
+    # even at lr=0, corrupting weights before step 2.
+    # Zeroing Inf/NaN before the optimizer sees them prevents this.
+    # ------------------------------------------------------------------
+    if mope_args.use_mope and mope_args.mope_fusion_mode == "concat":
+        _n_hooked = 0
+        for _p in model.parameters():
+            if _p.requires_grad:
+                _p.register_hook(
+                    lambda g: torch.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0)
+                    if g is not None else g
+                )
+                _n_hooked += 1
+        rank0_print(
+            f"[Space Sensing] E-02b: registered nan_to_num grad hooks on "
+            f"{_n_hooked} trainable tensors (prevents bf16 Inf → AdamW NaN)."
+        )
+
+    # ------------------------------------------------------------------
     # Patch forward to inject MoPE (after parameter freeze to avoid
     # accidentally making patch-internal references trainable).
     # ------------------------------------------------------------------
