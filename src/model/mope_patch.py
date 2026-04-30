@@ -119,17 +119,24 @@ def _patch_model_for_mope(model) -> None:
 
 
 def _patch_model_for_mope_concat(model) -> None:
-    """E-02b: prepend MoPE patch tokens to the LLM input sequence via layer hooks.
+    """E-02b: prepend MoPE patch tokens to the LLM input sequence (Qwen3VLTextModel level).
 
-    Registers a forward_pre_hook on EVERY decoder layer.  At layer 0 the hook
-    prepends mope_embeds to hidden_states.  At all layers the hook extends
-    attention_mask (4-D or 2-D) and position_embeddings / position_ids to match
-    the extended sequence length, so RoPE and attention patterns are correct.
+    Wraps ``inner_model.forward()`` (Qwen3VLModel) so that on each prefill call a
+    ``forward_pre_hook`` is temporarily registered on ``inner_model.language_model``
+    (Qwen3VLTextModel).  The hook runs just before Qwen3VLTextModel.forward() and
+    prepends N_mope learned tokens to ``inputs_embeds``, extending the sequence
+    from [B, L, D] to [B, N_mope+L, D].  Matching extensions are applied to
+    ``position_ids``, ``attention_mask`` (2-D only), and ``visual_pos_masks``
+    so that RoPE and causal attention over the extended sequence are correct.
 
-    Injection condition: pixel_values must be present in the inner-model forward
-    call (prefill only).  Decode steps that arrive without pixel_values are
-    passed through unchanged; the MoPE tokens are already stored in the KV cache
-    from the prefill step.
+    Injection condition: ``pixel_values`` must be present in the outer kwargs
+    (prefill only).  Decode steps without ``pixel_values`` are passed through
+    unchanged; MoPE tokens are already in the KV cache from the prefill step.
+
+    ``self.language_model(...)`` in Qwen3VLModel.forward() (line ~1888) passes
+    all inputs as keyword arguments, so the hook reliably finds ``inputs_embeds``
+    in ``kwargs``.  A positional-arg fallback is also provided (``args[0]``) for
+    defensive robustness.
 
     Training correctness: the training data collator must prepend N_mope -100
     entries to each labels row so that loss computation over the extended logit
@@ -137,6 +144,9 @@ def _patch_model_for_mope_concat(model) -> None:
     """
     inner_model = model.model
     original_forward = inner_model.forward
+
+    # Mutable counter for diagnostic throttle (shared across hook closures).
+    _diag_state = {"calls": 0}
 
     def patched_forward(self, *args, mope_frames=None, **kwargs):
         _mope_encoder = getattr(self, '_mope_encoder', None)
@@ -154,6 +164,24 @@ def _patch_model_for_mope_concat(model) -> None:
             and pixel_values is not None
         )
 
+        # ---------------------------------------------------------------
+        # [MoPE E02b DEBUG] Diagnostic print — fires on the first 3 calls
+        # to confirm whether the injection condition is met and mope_frames
+        # is reaching patched_forward.  Auto-silences after 3 prints.
+        # ---------------------------------------------------------------
+        if _diag_state["calls"] < 3:
+            _diag_state["calls"] += 1
+            pv_shape = pixel_values.shape if pixel_values is not None else None
+            mf_shape = mope_frames.shape if mope_frames is not None else None
+            enc_ok = _mope_encoder is not None
+            proj_ok = _mope_projector is not None
+            print(
+                f"[MoPE E02b DEBUG] call#{_diag_state['calls']}: "
+                f"should_inject={should_inject}, "
+                f"encoder_ok={enc_ok}, projector_ok={proj_ok}, "
+                f"mope_frames={mf_shape}, pixel_values={pv_shape}"
+            )
+
         if not should_inject:
             return original_forward(*args, **kwargs)
 
@@ -163,12 +191,37 @@ def _patch_model_for_mope_concat(model) -> None:
         N_mope = mope_embeds.shape[1]
 
         def _lm_pre_hook(module, args, kwargs):
-            # Prepend MoPE tokens to inputs_embeds: [B, L, D] → [B, N+L, D]
+            # ------------------------------------------------------------------
+            # Locate inputs_embeds: normally in kwargs (Qwen3VLModel.forward()
+            # calls self.language_model(inputs_embeds=..., ...) at ~line 1888
+            # using keyword args).  Positional-arg fallback handles any edge case
+            # where the 3-D tensor ends up in args[0].
+            # ------------------------------------------------------------------
             inputs_embeds = kwargs.get('inputs_embeds', None)
+            _from_args = False
+            if inputs_embeds is None and len(args) > 0:
+                _a0 = args[0]
+                if hasattr(_a0, 'dim') and _a0.dim() == 3:
+                    inputs_embeds = _a0
+                    _from_args = True
+
+            if _diag_state["calls"] <= 3:
+                ie_shape = inputs_embeds.shape if inputs_embeds is not None else None
+                print(
+                    f"[MoPE E02b DEBUG]   _lm_pre_hook fired: "
+                    f"inputs_embeds={ie_shape} (from_args={_from_args}), "
+                    f"N_mope={N_mope}, "
+                    f"kwargs_keys={list(kwargs.keys())[:8]}"
+                )
+
             if inputs_embeds is not None:
-                kwargs['inputs_embeds'] = torch.cat(
+                new_embeds = torch.cat(
                     [mope_embeds.to(inputs_embeds.dtype), inputs_embeds], dim=1
                 )
+                if _from_args:
+                    args = (new_embeds,) + args[1:]
+                else:
+                    kwargs['inputs_embeds'] = new_embeds
 
             # Extend position_ids (last dim): [..., L] → [..., N+L] (prepend zeros).
             # RoPE at position 0 is identity (cos=1, sin=0), preserving Q/K values.
@@ -182,7 +235,7 @@ def _patch_model_for_mope_concat(model) -> None:
 
             # Extend 2-D attention_mask [B, L] → [B, N+L]: prepend ones for MoPE.
             attn_mask = kwargs.get('attention_mask', None)
-            if attn_mask is not None and attn_mask.dim() == 2:
+            if attn_mask is not None and hasattr(attn_mask, 'dim') and attn_mask.dim() == 2:
                 ones = attn_mask.new_ones(attn_mask.shape[0], N_mope)
                 kwargs['attention_mask'] = torch.cat([ones, attn_mask], dim=1)
 
