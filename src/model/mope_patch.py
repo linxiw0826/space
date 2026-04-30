@@ -188,15 +188,25 @@ def _patch_model_for_mope_concat(model) -> None:
         # Compute MoPE token embeddings.
         mope_feats = _mope_encoder(mope_frames)      # [B, N_mope, 768]
         mope_embeds = _mope_projector(mope_feats)    # [B, N_mope, llm_dim]
-        _n_nan = torch.isnan(mope_embeds).sum().item()
-        if _n_nan > 0:
+
+        # Guard: NaN/Inf in mope_embeds (e.g. after bf16 optimizer corrupts projector weights).
+        if not mope_embeds.isfinite().all():
             print(
-                f"[MoPE E02b WARNING] mope_embeds has {_n_nan} NaN values at call#{_diag_state['calls']}, "
-                f"mope_frames stats: min={mope_frames.min().item():.4f} max={mope_frames.max().item():.4f} "
-                f"frames_nan={torch.isnan(mope_frames).sum().item()}",
+                f"[MoPE E02b WARNING] mope_embeds non-finite at call#{_diag_state['calls']}, "
+                f"count={( ~mope_embeds.isfinite()).sum().item()} — zeroing to skip this batch",
                 flush=True,
             )
-            mope_embeds = torch.nan_to_num(mope_embeds, nan=0.0)
+            mope_embeds = torch.zeros_like(mope_embeds)
+
+        # Clamp gradient flowing back to projector to prevent bf16 overflow.
+        # 784 prepended tokens accumulate gradients from all subsequent positions;
+        # without clamping the per-element gradient can exceed bf16 max (65504).
+        if mope_embeds.requires_grad:
+            mope_embeds.register_hook(
+                lambda g: torch.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0).clamp_(-1.0, 1.0)
+                if g is not None else g
+            )
+
         N_mope = mope_embeds.shape[1]
 
         def _lm_pre_hook(module, args, kwargs):
