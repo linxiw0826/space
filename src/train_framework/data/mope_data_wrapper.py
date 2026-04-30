@@ -134,7 +134,7 @@ class MoPECollatorWrapper:
                 [inst["raw_frames"] for inst in instances]
             )
         # E-02b: extend labels to match T+N_mope logit sequence length.
-        if self.mope_num_tokens > 0 and "labels" in batch:
+        if self.mope_num_tokens > 0 and "labels" in batch and "mope_frames" in batch:
             pad = batch["labels"].new_full(
                 (batch["labels"].shape[0], self.mope_num_tokens), -100
             )

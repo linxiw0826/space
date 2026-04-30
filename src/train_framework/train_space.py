@@ -498,7 +498,8 @@ def train(attn_implementation="flash_attention_2"):
         model=model, processing_class=tokenizer, args=training_args, **data_module
     )
 
-    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
+    checkpoints = list(pathlib.Path(training_args.output_dir).glob("checkpoint-*"))
+    if checkpoints and not training_args.overwrite_output_dir:
         logging.info("checkpoint found, resume training")
         trainer.train(resume_from_checkpoint=True)
     else:
