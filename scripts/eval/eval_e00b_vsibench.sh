@@ -35,11 +35,11 @@ MODEL_SIZE=${MODEL_SIZE:-4b}
 
 case "${MODEL_SIZE}" in
     4b)
-        DEFAULT_CKPT_PATH="/home/nvme03/wlx/Space_sensing/output/train/guide_reproduced/4b"
+        DEFAULT_CKPT_PATH="/home/nvme03/wlx/Space_sensing/models/guide_reproduced/4b"
         DEFAULT_EXP_NAME="e00b_mope_zeroshot_4b"
         ;;
     8b)
-        DEFAULT_CKPT_PATH="/home/nvme03/wlx/Space_sensing/output/train/guide_reproduced/8b"
+        DEFAULT_CKPT_PATH="/home/nvme03/wlx/Space_sensing/models/guide_reproduced/8b"
         DEFAULT_EXP_NAME="e00b_mope_zeroshot_8b"
         ;;
     *)
