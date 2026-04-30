@@ -509,8 +509,8 @@ def train(attn_implementation="flash_attention_2"):
         )
         training_args.remove_unused_columns = False
 
-    # [DIAG] Subclass to print actual loss.item() for first 5 micro-batches.
-    # Captures the true scalar loss before any aggregation / nan-filtering.
+    # [DIAG] Subclass to print actual loss.item() for first 20 micro-batches.
+    # Covers ~5 optimizer steps (grad_accum=4) to capture the step-1→step-2 transition.
     class _DiagTrainer(Trainer):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
@@ -519,24 +519,30 @@ def train(attn_implementation="flash_attention_2"):
         def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
             _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
             lbl = inputs.get("labels", None)
-            if self._diag_calls < 5 and _rank == 0:
+            has_mope = "mope_frames" in inputs
+            has_pv   = inputs.get("pixel_values", None) is not None
+            if self._diag_calls < 20 and _rank == 0:
                 _n_valid = (lbl != -100).sum().item() if lbl is not None else -1
                 print(
                     f"[DIAG TRAINER] call#{self._diag_calls + 1}: "
                     f"labels={tuple(lbl.shape) if lbl is not None else None} "
-                    f"valid={_n_valid}",
+                    f"valid={_n_valid} "
+                    f"mope_frames={has_mope} pixel_values={has_pv}",
                     flush=True,
                 )
             _super_kwargs = {} if num_items_in_batch is None else {"num_items_in_batch": num_items_in_batch}
             _result = super().compute_loss(model, inputs, return_outputs=True, **_super_kwargs)
             _loss, _outputs = _result
-            if self._diag_calls < 5 and _rank == 0:
+            if self._diag_calls < 20 and _rank == 0:
                 self._diag_calls += 1
+                _logits_shape = None
+                if hasattr(_outputs, 'logits') and _outputs.logits is not None:
+                    _logits_shape = tuple(_outputs.logits.shape)
                 print(
                     f"[DIAG TRAINER] call#{self._diag_calls}: "
                     f"loss={_loss.item():.8f} "
                     f"loss_isnan={_loss.isnan().item()} "
-                    f"logits_shape={tuple(_outputs.logits.shape) if hasattr(_outputs, 'logits') else None}",
+                    f"logits={_logits_shape}",
                     flush=True,
                 )
             else:
