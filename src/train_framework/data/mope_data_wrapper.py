@@ -125,6 +125,7 @@ class MoPECollatorWrapper:
     def __init__(self, base_collator, mope_num_tokens: int = 0):
         self.base = base_collator
         self.mope_num_tokens = mope_num_tokens
+        self._diag_calls = 0
 
     def __call__(self, instances):
         batch = self.base(instances)
@@ -133,6 +134,21 @@ class MoPECollatorWrapper:
             batch["mope_frames"] = torch.stack(
                 [inst["raw_frames"] for inst in instances]
             )
+        # [DIAG] Print label statistics for the first 5 batches.
+        if self._diag_calls < 5 and "labels" in batch:
+            self._diag_calls += 1
+            lbl = batch["labels"]
+            n_valid = (lbl != -100).sum().item()
+            n_total = lbl.numel()
+            has_mope = "mope_frames" in batch
+            print(
+                f"[MoPE COLLATOR DIAG] batch#{self._diag_calls}: "
+                f"labels shape={tuple(lbl.shape)}, "
+                f"valid(non-(-100))={n_valid}/{n_total}, "
+                f"mope_frames_present={has_mope}, "
+                f"input_ids shape={tuple(batch.get('input_ids', lbl).shape)}"
+            )
+
         # E-02b: extend labels to match T+N_mope logit sequence length.
         if self.mope_num_tokens > 0 and "labels" in batch and "mope_frames" in batch:
             pad = batch["labels"].new_full(

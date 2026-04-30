@@ -453,6 +453,21 @@ def train(attn_implementation="flash_attention_2"):
             if lm is not None and hasattr(lm, "print_trainable_parameters"):
                 lm.print_trainable_parameters()
 
+            # [DIAG] Trainable parameter breakdown.
+            total_p = sum(p.numel() for p in model.parameters())
+            trainable_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            _lm_mod = getattr(model, "language_model", None) or getattr(model.model, "language_model", None)
+            lm_trainable = sum(p.numel() for p in _lm_mod.parameters() if p.requires_grad) if _lm_mod else -1
+            lm_total = sum(p.numel() for p in _lm_mod.parameters()) if _lm_mod else -1
+            proj_trainable = -1
+            if mope_args.use_mope and hasattr(model.model, "_mope_projector"):
+                proj_trainable = sum(p.numel() for p in model.model._mope_projector.parameters() if p.requires_grad)
+            print(
+                f"[Space Sensing DIAG] Trainable params: {trainable_p:,} / {total_p:,}\n"
+                f"  LLM: {lm_trainable:,} / {lm_total:,} trainable\n"
+                f"  MoPE projector: {proj_trainable:,} trainable"
+            )
+
     # ------------------------------------------------------------------
     # Patch forward to inject MoPE (after parameter freeze to avoid
     # accidentally making patch-internal references trainable).
