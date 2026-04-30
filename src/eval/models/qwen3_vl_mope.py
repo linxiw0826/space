@@ -19,6 +19,7 @@ from typing import List, Optional, Union
 
 import numpy as np
 import torch
+import torch.nn as nn
 from PIL import Image
 
 # ---------------------------------------------------------------------------
@@ -396,3 +397,68 @@ class Qwen3_VL_MoPE_Concat(Qwen3_VL_MoPE):
                 f"({type(exc).__name__}: {exc}). MoPE will be skipped for this sample."
             )
             return None
+
+
+@register_model("qwen3_vl_mope_zeroshot")
+class Qwen3_VL_MoPE_ZeroShot(Qwen3_VL_MoPE_Concat):
+    """E-00b inference model: GUIDE checkpoint + MoPE concat, zero-shot (no training).
+
+    Loads a GUIDE checkpoint (no MoPE weights) and inserts a randomly-initialised
+    MoPEProjectorConcat.  Unlike Qwen3_VL_MoPE_Concat, this class:
+      - Never calls _load_mope_weights_from_pretrained (GUIDE checkpoint has no MoPE keys).
+      - Always calls _patch_model_for_mope_concat regardless of weight-loading outcome.
+      - Initialises projector.proj.weight with normal(std=0.02) instead of zeros, so
+        MoPE tokens carry real (random) content and the experiment is not equivalent to
+        E-00 (which has no MoPE tokens at all).
+
+    Purpose: ablation to test whether the GUIDE LLM can zero-shot utilise randomly-
+    projected MoPE features.  Expected result: E-00b ≈ E-00 or slightly worse, proving
+    that training is necessary to exploit MoPE signals.
+
+    Registers model type ``qwen3_vl_mope_zeroshot`` via LMMS_EVAL_PLUGINS.
+
+    Interface:
+        __init__(pretrained, ..., mope_all_frames=8)
+        generate_until(requests) -> List[str]   [inherited from Qwen3_VL_MoPE_Concat]
+        _compute_mope_frames(visuals) -> Optional[Tensor]  [inherited from Qwen3_VL_MoPE_Concat]
+    """
+
+    def __init__(
+        self,
+        pretrained: str = "Qwen/Qwen3-VL-4B-Instruct",
+        mope_all_frames: int = 8,
+        **kwargs,
+    ) -> None:
+        # Call Qwen3_VL_MY.__init__ directly — bypasses both Qwen3_VL_MoPE and
+        # Qwen3_VL_MoPE_Concat __init__ to avoid any MoPE weight loading logic.
+        Qwen3_VL_MY.__init__(self, pretrained=pretrained, **kwargs)
+        self.mope_all_frames = mope_all_frames
+
+        inner = self._model.model
+        llm_dim = self._model.config.text_config.hidden_size
+
+        from model.mope_encoder import MoPEEncoder
+        from model.mope_projector import MoPEProjectorConcat
+
+        encoder = MoPEEncoder(checkpoint_path=None, all_frames=self.mope_all_frames)
+        projector = MoPEProjectorConcat(mope_dim=768, llm_dim=llm_dim)
+
+        # Override zero-init from MoPEProjectorConcat: use normal(std=0.02) for weight
+        # so MoPE tokens carry real content. Bias stays zero (already set by constructor).
+        # Zero-init would make all MoPE tokens identically zero, collapsing E-00b into E-00.
+        nn.init.normal_(projector.proj.weight, std=0.02)
+
+        inner.add_module("_mope_encoder", encoder)
+        inner.add_module("_mope_projector", projector)
+
+        # Move to model device and dtype (typically cuda:N, bfloat16)
+        ref_param = next(self._model.parameters())
+        inner._mope_encoder.to(device=ref_param.device, dtype=ref_param.dtype)
+        inner._mope_projector.to(device=ref_param.device, dtype=ref_param.dtype)
+
+        # Always apply the concat patch — independent of any weight loading.
+        _patch_model_for_mope_concat(self._model)
+        print(
+            f"[Qwen3_VL_MoPE_ZeroShot] MoPE concat patch applied (random-init projector, no training). "
+            f"mope_all_frames={self.mope_all_frames}, llm_dim={llm_dim}"
+        )
