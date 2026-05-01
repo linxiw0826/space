@@ -282,3 +282,193 @@ def _patch_model_for_mope_concat(model) -> None:
 
     inner_model.forward = types.MethodType(patched_forward, inner_model)
     print("[Space Sensing] Patched inner_model.forward() with MoPE concat injection (E-02b).")
+
+
+def _patch_model_for_mope_crossattn(model) -> None:
+    """E-02c: per-shard cross-attention fusion at the get_image_features call site.
+
+    Injection point is identical to E-02a (_patch_model_for_mope): wraps
+    ``inner_model.forward()`` and temporarily replaces ``self.get_image_features``
+    inside that call so each image-feature shard is updated before geometry fusion.
+
+    The only difference from E-02a is the fusion operation applied to each shard:
+    - E-02a: MoPEProjector(mope_feats) → [B, 1, llm_dim] → broadcast-add bias
+    - E-02c: MoPEProjectorCrossAttn(mope_feats[b:b+1], e.unsqueeze(0)) per shard
+             → [1, N_img_i, llm_dim] → squeeze → replace shard
+
+    MoPEProjectorCrossAttn.forward signature:
+        (mope_features: [B, N_mope, mope_dim], image_embeds: [B, N_img, llm_dim])
+        -> [B, N_img, llm_dim]
+
+    Sidecar support: identical to E-02a — if ``mope_frames`` kwarg is None the
+    patch reads ``self._pending_mope_frames`` from the inner model instance.
+    """
+    inner_model = model.model
+    original_forward = inner_model.forward
+
+    def patched_forward(self, *args, mope_frames=None, **kwargs):
+        _mope_encoder = getattr(self, '_mope_encoder', None)
+        _mope_projector = getattr(self, '_mope_projector', None)
+
+        if mope_frames is None:
+            mope_frames = getattr(self, '_pending_mope_frames', None)
+
+        if _mope_encoder is not None and mope_frames is not None:
+            original_get_image_features = self.get_image_features
+
+            def _mope_get_image_features(pixel_values, grid_thw):
+                image_embeds_list, deepstack = original_get_image_features(pixel_values, grid_thw)
+                mope_feats = _mope_encoder(mope_frames)   # [B, N_mope, 768]
+                B_mope = mope_feats.shape[0]
+                n_total = len(image_embeds_list)
+                assert n_total % B_mope == 0, (
+                    f"MoPE crossattn: image_embeds_list length ({n_total}) not divisible by "
+                    f"batch size ({B_mope})."
+                )
+                imgs_per_sample = n_total // B_mope
+                new_embeds = []
+                for b in range(B_mope):
+                    mf = mope_feats[b:b+1]   # [1, N_mope, 768]
+                    for e in image_embeds_list[b * imgs_per_sample:(b + 1) * imgs_per_sample]:
+                        new_e = _mope_projector(mf, e.unsqueeze(0)).squeeze(0)   # [N_img_i, llm_dim]
+                        new_embeds.append(new_e)
+                return new_embeds, deepstack
+
+            self.get_image_features = _mope_get_image_features
+
+        try:
+            output = original_forward(*args, **kwargs)
+        finally:
+            if _mope_encoder is not None and mope_frames is not None:
+                self.get_image_features = original_get_image_features
+
+        return output
+
+    inner_model.forward = types.MethodType(patched_forward, inner_model)
+    print("[Space Sensing] Patched inner_model.forward() with MoPE cross-attention injection (E-02c).")
+
+
+def _patch_model_for_mope_qformer(model) -> None:
+    """E-02d: prepend Q-Former-compressed MoPE tokens (32) to the LLM input sequence.
+
+    Injection point is identical to E-02b (_patch_model_for_mope_concat): wraps
+    ``inner_model.forward()`` and registers a ``forward_pre_hook`` on
+    ``inner_model.language_model`` that prepends MoPE token embeddings to
+    ``inputs_embeds`` and extends ``position_ids``, ``attention_mask``, and
+    ``visual_pos_masks`` accordingly.
+
+    The only difference from E-02b is the projector output shape:
+    - E-02b: MoPEProjectorConcat(mope_feats) → [B, 784, llm_dim]  (N_mope=784)
+    - E-02d: MoPEProjectorQFormer(mope_feats) → [B, 32, llm_dim]   (num_queries=32)
+
+    No NaN/Inf guard or gradient clamp hook is applied: Q-Former outputs only 32
+    tokens (vs. 784 in E-02b), so gradient accumulation pressure is substantially
+    lower, and the out_proj zero-initialization provides the same stable start.
+
+    Injection condition: ``pixel_values`` must be present (prefill only); decode
+    steps are passed through unchanged because MoPE tokens are already in the KV cache.
+    """
+    inner_model = model.model
+    original_forward = inner_model.forward
+
+    _diag_state = {"calls": 0}
+
+    def patched_forward(self, *args, mope_frames=None, **kwargs):
+        _mope_encoder = getattr(self, '_mope_encoder', None)
+        _mope_projector = getattr(self, '_mope_projector', None)
+
+        if mope_frames is None:
+            mope_frames = getattr(self, '_pending_mope_frames', None)
+
+        pixel_values = kwargs.get('pixel_values', None)
+        should_inject = (
+            _mope_encoder is not None
+            and _mope_projector is not None
+            and mope_frames is not None
+            and pixel_values is not None
+        )
+
+        if _diag_state["calls"] < 3:
+            _diag_state["calls"] += 1
+            pv_shape = pixel_values.shape if pixel_values is not None else None
+            mf_shape = mope_frames.shape if mope_frames is not None else None
+            enc_ok = _mope_encoder is not None
+            proj_ok = _mope_projector is not None
+            print(
+                f"[MoPE E02d DEBUG] call#{_diag_state['calls']}: "
+                f"should_inject={should_inject}, "
+                f"encoder_ok={enc_ok}, projector_ok={proj_ok}, "
+                f"mope_frames={mf_shape}, pixel_values={pv_shape}"
+            )
+
+        if not should_inject:
+            return original_forward(*args, **kwargs)
+
+        mope_feats = _mope_encoder(mope_frames)      # [B, N_mope, 768]
+        mope_embeds = _mope_projector(mope_feats)    # [B, 32, llm_dim]
+
+        N_mope = mope_embeds.shape[1]
+
+        def _lm_pre_hook(module, args, kwargs):
+            inputs_embeds = kwargs.get('inputs_embeds', None)
+            _from_args = False
+            if inputs_embeds is None and len(args) > 0:
+                _a0 = args[0]
+                if hasattr(_a0, 'dim') and _a0.dim() == 3:
+                    inputs_embeds = _a0
+                    _from_args = True
+
+            if _diag_state["calls"] <= 3:
+                ie_shape = inputs_embeds.shape if inputs_embeds is not None else None
+                print(
+                    f"[MoPE E02d DEBUG]   _lm_pre_hook fired: "
+                    f"inputs_embeds={ie_shape} (from_args={_from_args}), "
+                    f"N_mope={N_mope}, "
+                    f"kwargs_keys={list(kwargs.keys())[:8]}"
+                )
+
+            if inputs_embeds is not None:
+                new_embeds = torch.cat(
+                    [mope_embeds.to(inputs_embeds.dtype), inputs_embeds], dim=1
+                )
+                if _from_args:
+                    args = (new_embeds,) + args[1:]
+                else:
+                    kwargs['inputs_embeds'] = new_embeds
+
+            pos_ids = kwargs.get('position_ids', None)
+            if pos_ids is not None:
+                z = torch.zeros(
+                    *pos_ids.shape[:-1], N_mope,
+                    dtype=pos_ids.dtype, device=pos_ids.device,
+                )
+                kwargs['position_ids'] = torch.cat([z, pos_ids], dim=-1)
+
+            attn_mask = kwargs.get('attention_mask', None)
+            if attn_mask is not None and hasattr(attn_mask, 'dim') and attn_mask.dim() == 2:
+                ones = attn_mask.new_ones(attn_mask.shape[0], N_mope)
+                kwargs['attention_mask'] = torch.cat([ones, attn_mask], dim=1)
+
+            vis_mask = kwargs.get('visual_pos_masks', None)
+            if vis_mask is not None:
+                false_prefix = vis_mask.new_zeros(
+                    vis_mask.shape[0], N_mope, dtype=torch.bool
+                )
+                kwargs['visual_pos_masks'] = torch.cat([false_prefix, vis_mask], dim=1)
+
+            return args, kwargs
+
+        lm = getattr(self, 'language_model', None)
+        if lm is None:
+            return original_forward(*args, **kwargs)
+
+        handle = lm.register_forward_pre_hook(_lm_pre_hook, with_kwargs=True, prepend=True)
+        try:
+            output = original_forward(*args, **kwargs)
+        finally:
+            handle.remove()
+
+        return output
+
+    inner_model.forward = types.MethodType(patched_forward, inner_model)
+    print("[Space Sensing] Patched inner_model.forward() with MoPE Q-Former injection (E-02d).")

@@ -1,21 +1,23 @@
 #!/bin/bash
 # =============================================================================
-# E-00b: GUIDE + MoPE cross-attention fusion, projector only (unified 4B / 8B)
+# E-02c: GUIDE + MoPE cross-attention fusion (unified 4B / 8B)
 #
-# LLM-frozen control experiment for E-02c (cross-attention fusion).
-# Only MoPEProjectorCrossAttn (~50M params) is trained on VSI-590K.
-# Trainable: MoPEProjectorCrossAttn only (~50M), LLM frozen.
+# Difference from E-02a: MoPE tokens are fused via cross-attention instead of
+# broadcast add. Sequence length is unchanged (no prepended tokens), and no
+# label padding is required.
 #
 # Usage:
-#   MODEL_SIZE=4b bash train_e00b_mope_projector_only.sh   # default
-#   MODEL_SIZE=8b bash train_e00b_mope_projector_only.sh
+#   MODEL_SIZE=4b bash train_e02c_mope_crossattn.sh   # default
+#   MODEL_SIZE=8b bash train_e02c_mope_crossattn.sh
 #
 # Supported MODEL_SIZE values: 4b  8b
 #
-# Key differences from E-02c:
-#   - --tune_mm_llm False             (LLM frozen; only MoPEProjectorCrossAttn trains)
-#   - GUIDE_CKPT_PATH → output/train/guide_reproduced/{4b,8b}
-#   - output_dir → e00b_mope_projector_only_{size}
+# Key differences from E-02a:
+#   - --mope_fusion_mode crossattn      (cross-attn, no broadcast add)
+#   - sequence length unchanged         (no prepended MoPE tokens)
+#   - no label padding required
+#   - Trainable: LLM + MoPEProjectorCrossAttn
+#   - output_dir → e02c_mope_crossattn_{size}
 # =============================================================================
 set -e
 
@@ -29,6 +31,7 @@ MODEL_SIZE=${MODEL_SIZE:-4b}
 # ---------------------------------------------------------------------------
 MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 MASTER_PORT=${MASTER_PORT:-$(shuf -i 20001-29999 -n 1)}
+# Single-node training only; multi-node not supported.
 NPROC_PER_NODE=${NPROC_PER_NODE:-6}
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5}
 
@@ -40,6 +43,7 @@ GUIDE_ROOT="${SPACE_ROOT}/src"
 MOPE_ROOT="${SPACE_ROOT}/src/vendor/mope"
 
 VGGT_PATH=${VGGT_PATH:-/home/nvme01/wlx/Space_sensing/models/VGGT-1B}
+GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-/home/nvme03/wlx/Space_sensing/models/guide_reproduced/4b}
 
 # MoPE checkpoint (ep199, vitb_1 full training run)
 MOPE_CKPT_PATH=${MOPE_CKPT_PATH:-/home/nvme04/mope-jepa/output/mope_jepa_wisa7k_vitb_1/checkpoint-199.pth}
@@ -54,18 +58,15 @@ if [ "${MODEL_SIZE}" = "4b" ]; then
     batch_size=2
     grad_accum_steps=4
     DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${SPACE_ROOT}/configs/zero2.json}
-    GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-/home/nvme03/wlx/Space_sensing/output/train/guide_reproduced/4b}
-    output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/output/train/e00b_mope_projector_only_4b}"
-    run_name="space_e00b_mope_projector_only_4b_lr1e-5"
+    output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/output/train/e02c_mope_crossattn_4b}"
+    run_name="space_e02c_mope_crossattn_4b_lr1e-5"
 elif [ "${MODEL_SIZE}" = "8b" ]; then
-    batch_size=1
-    grad_accum_steps=16
-    # 8B requires ZeRO-3 to fit on 8×H800 GPUs.
+    batch_size=2
+    grad_accum_steps=8
+    # 8B requires ZeRO-3 to fit on 8x H800 GPUs
     DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${SPACE_ROOT}/configs/zero3.json}
-    GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-/home/nvme03/wlx/Space_sensing/output/train/guide_reproduced/8b}
-    output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/output/train/e00b_mope_projector_only_8b}"
-    run_name="space_e00b_mope_projector_only_8b_lr1e-5"
-    echo "WARNING: 8B E-00b is experimental — monitor VRAM usage carefully." >&2
+    output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/output/train/e02c_mope_crossattn_8b}"
+    run_name="space_e02c_mope_crossattn_8b_lr1e-5"
 else
     echo "ERROR: Unknown MODEL_SIZE='${MODEL_SIZE}'. Must be '4b' or '8b'." >&2
     exit 1
@@ -117,7 +118,7 @@ args="
     --data_flatten False \
     --tune_mm_vision False \
     --tune_mm_mlp False \
-    --tune_mm_llm False \
+    --tune_mm_llm True \
     --optim adamw_torch \
     --bf16 \
     --output_dir ${output_dir} \
@@ -161,13 +162,11 @@ args="
 # ---------------------------------------------------------------------------
 # Launch
 # ---------------------------------------------------------------------------
-LOG_FILE="${LOG_DIR}/e00b_mope_projector_only_${MODEL_SIZE}_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="${LOG_DIR}/e02c_mope_crossattn_${MODEL_SIZE}_$(date +%Y%m%d_%H%M%S).log"
 
-echo "=== E-00b Training (MODEL_SIZE=${MODEL_SIZE}) ==="
+echo "=== E-02c Training (MODEL_SIZE=${MODEL_SIZE}) ==="
 echo "Output : ${output_dir}"
 echo "Log    : ${LOG_FILE}"
-echo "Fusion : crossattn, batch=${batch_size}, accum=${grad_accum_steps}"
-echo "Trainable: MoPEProjector only (~50M), LLM frozen"
 
 python -m torch.distributed.run --nproc_per_node=${NPROC_PER_NODE} \
          --master_addr=${MASTER_ADDR} \

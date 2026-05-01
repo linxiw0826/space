@@ -102,3 +102,118 @@ class MoPEProjectorConcat(nn.Module):
         x = self.norm(mope_features)   # [B, N_patches, mope_dim]
         x = self.proj(x)               # [B, N_patches, llm_dim]
         return x
+
+
+class MoPEProjectorCrossAttn(nn.Module):
+    """E-02c single-head single-layer cross-attention projector.
+
+    Fuses MoPE features into each image token via residual cross-attention.
+    MoPE tokens are keys/values; image tokens are queries.
+
+    Args:
+        mope_dim: MoPE feature dimension (default: 768, ViT-B).
+        llm_dim:  LLM hidden dimension (default: 3584, Qwen3-VL-4B).
+
+    Forward:
+        mope_features: [B, N_mope, mope_dim]  — MoPE encoder output (N_mope=784)
+        image_embeds:  [B, N_img,  llm_dim]   — one image-embed shard
+        returns:       [B, N_img,  llm_dim]   — residual-updated image_embeds
+    """
+
+    def __init__(self, mope_dim: int = 768, llm_dim: int = 3584):
+        super().__init__()
+        self.mope_dim = mope_dim
+        self.llm_dim = llm_dim
+
+        self.norm = nn.LayerNorm(mope_dim)
+        self.k_proj = nn.Linear(mope_dim, llm_dim)
+        self.v_proj = nn.Linear(mope_dim, llm_dim)
+
+        # Zero-init: out_proj weight and bias both zero so MoPE contribution
+        # is strictly zero at training start, preserving GUIDE's geometric
+        # priors as the baseline starting point.
+        self.out_proj = nn.Linear(llm_dim, llm_dim, bias=True)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def forward(
+        self,
+        mope_features: torch.Tensor,
+        image_embeds: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply single-head cross-attention and residual-add to image_embeds.
+
+        Args:
+            mope_features: Float tensor [B, N_mope, mope_dim].
+            image_embeds:  Float tensor [B, N_img, llm_dim].
+
+        Returns:
+            updated_embeds: Float tensor [B, N_img, llm_dim].
+        """
+        x = self.norm(mope_features)                                   # [B, N_mope, mope_dim]
+        K = self.k_proj(x)                                             # [B, N_mope, llm_dim]
+        V = self.v_proj(x)                                             # [B, N_mope, llm_dim]
+        Q = image_embeds                                               # [B, N_img,  llm_dim]
+
+        scale = Q.shape[-1] ** -0.5
+        attn = torch.softmax(Q @ K.transpose(-2, -1) * scale, dim=-1) # [B, N_img, N_mope]
+        out = attn @ V                                                 # [B, N_img, llm_dim]
+        out = self.out_proj(out)                                       # [B, N_img, llm_dim]
+        return image_embeds + out.to(image_embeds.dtype)
+
+
+class MoPEProjectorQFormer(nn.Module):
+    """E-02d Q-Former projector — compresses 784 MoPE tokens to num_queries tokens.
+
+    Uses num_queries learnable query vectors as Q in single-head cross-attention
+    against MoPE features. Output tokens are concatenated to the LLM input sequence.
+
+    Args:
+        mope_dim:    MoPE feature dimension (default: 768, ViT-B).
+        llm_dim:     LLM hidden dimension (default: 3584, Qwen3-VL-4B).
+        num_queries: Number of compressed output tokens (default: 32).
+
+    Forward:
+        mope_features: [B, N_mope, mope_dim]   — MoPE encoder output (N_mope=784)
+        returns:       [B, num_queries, llm_dim] — compressed tokens for LLM concat
+    """
+
+    def __init__(self, mope_dim: int = 768, llm_dim: int = 3584, num_queries: int = 32):
+        super().__init__()
+        self.mope_dim = mope_dim
+        self.llm_dim = llm_dim
+        self.num_queries = num_queries
+
+        self.norm = nn.LayerNorm(mope_dim)
+        self.k_proj = nn.Linear(mope_dim, llm_dim)
+        self.v_proj = nn.Linear(mope_dim, llm_dim)
+
+        # Zero-init: queries start at zero and out_proj maps to zero so the
+        # 32 prepended tokens are zero vectors at training start, introducing
+        # no perturbation to the LLM until the model begins to learn.
+        self.out_proj = nn.Linear(llm_dim, llm_dim, bias=True)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
+        self.queries = nn.Parameter(torch.zeros(1, num_queries, llm_dim))
+
+    def forward(self, mope_features: torch.Tensor) -> torch.Tensor:
+        """Compress MoPE features to num_queries tokens via learned cross-attention.
+
+        Args:
+            mope_features: Float tensor [B, N_mope, mope_dim].
+
+        Returns:
+            compressed: Float tensor [B, num_queries, llm_dim] for LLM sequence concat.
+        """
+        B = mope_features.shape[0]
+        x = self.norm(mope_features)                                   # [B, N_mope, mope_dim]
+        K = self.k_proj(x)                                             # [B, N_mope, llm_dim]
+        V = self.v_proj(x)                                             # [B, N_mope, llm_dim]
+        Q = self.queries.expand(B, -1, -1)                             # [B, num_queries, llm_dim]
+
+        scale = Q.shape[-1] ** -0.5
+        attn = torch.softmax(Q @ K.transpose(-2, -1) * scale, dim=-1) # [B, num_queries, N_mope]
+        out = attn @ V                                                 # [B, num_queries, llm_dim]
+        out = self.out_proj(out)                                       # [B, num_queries, llm_dim]
+        return out

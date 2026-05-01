@@ -126,13 +126,21 @@ class MoPEArguments:
         default="add",
         metadata={"help": "MoPE fusion strategy. "
                           "'add': E-02a — global avg pool → broadcast-add bias to image_embeds. "
-                          "'concat': E-02b — per-token projection, prepend to LLM input sequence."},
+                          "'concat': E-02b — per-token projection, prepend to LLM input sequence. "
+                          "'crossattn': E-02c — single-head cross-attention, image tokens as Q, MoPE as K/V, residual add, sequence length unchanged. "
+                          "'qformer': E-02d — Q-Former with learnable queries, output concat to LLM sequence."},
     )
     mope_concat_num_tokens: int = field(
         default=784,
         metadata={"help": "Number of MoPE patch tokens for concat fusion (mope_fusion_mode=concat). "
                           "Used to prepend -100 labels so loss shape matches extended logits. "
                           "Default 784 = VideoMAEv2 ViT-B, 8 frames, 224×224, tubelet_size=2."},
+    )
+    mope_qformer_num_queries: int = field(
+        default=32,
+        metadata={"help": "Number of learnable queries for Q-Former fusion (mope_fusion_mode=qformer). "
+                          "Output shape: [B, mope_qformer_num_queries, llm_dim]. "
+                          "Default 32."},
     )
 
 

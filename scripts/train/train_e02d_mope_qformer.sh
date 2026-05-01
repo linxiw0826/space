@@ -1,21 +1,21 @@
 #!/bin/bash
 # =============================================================================
-# E-00b: GUIDE + MoPE cross-attention fusion, projector only (unified 4B / 8B)
+# E-02d: GUIDE + MoPE Q-Former fusion (unified 4B / 8B)
 #
-# LLM-frozen control experiment for E-02c (cross-attention fusion).
-# Only MoPEProjectorCrossAttn (~50M params) is trained on VSI-590K.
-# Trainable: MoPEProjectorCrossAttn only (~50M), LLM frozen.
+# Difference from E-02b: instead of prepending all ~784 patch tokens, a
+# Q-Former compresses MoPE features down to 32 learned query tokens before
+# prepending to the LLM input sequence (vs 784 in E-02b).
 #
 # Usage:
-#   MODEL_SIZE=4b bash train_e00b_mope_projector_only.sh   # default
-#   MODEL_SIZE=8b bash train_e00b_mope_projector_only.sh
+#   MODEL_SIZE=4b bash train_e02d_mope_qformer.sh   # default
+#   MODEL_SIZE=8b bash train_e02d_mope_qformer.sh
 #
 # Supported MODEL_SIZE values: 4b  8b
 #
-# Key differences from E-02c:
-#   - --tune_mm_llm False             (LLM frozen; only MoPEProjectorCrossAttn trains)
-#   - GUIDE_CKPT_PATH → output/train/guide_reproduced/{4b,8b}
-#   - output_dir → e00b_mope_projector_only_{size}
+# Key differences from E-02b:
+#   - --mope_fusion_mode qformer        (Q-Former compression, not raw concat)
+#   - --mope_qformer_num_queries 32     (prepend 32 tokens vs 784 in E-02b)
+#   - output_dir → e02d_mope_qformer_{size}
 # =============================================================================
 set -e
 
@@ -40,6 +40,7 @@ GUIDE_ROOT="${SPACE_ROOT}/src"
 MOPE_ROOT="${SPACE_ROOT}/src/vendor/mope"
 
 VGGT_PATH=${VGGT_PATH:-/home/nvme01/wlx/Space_sensing/models/VGGT-1B}
+GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-/home/nvme03/wlx/Space_sensing/models/guide_reproduced/4b}
 
 # MoPE checkpoint (ep199, vitb_1 full training run)
 MOPE_CKPT_PATH=${MOPE_CKPT_PATH:-/home/nvme04/mope-jepa/output/mope_jepa_wisa7k_vitb_1/checkpoint-199.pth}
@@ -54,18 +55,16 @@ if [ "${MODEL_SIZE}" = "4b" ]; then
     batch_size=2
     grad_accum_steps=4
     DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${SPACE_ROOT}/configs/zero2.json}
-    GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-/home/nvme03/wlx/Space_sensing/output/train/guide_reproduced/4b}
-    output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/output/train/e00b_mope_projector_only_4b}"
-    run_name="space_e00b_mope_projector_only_4b_lr1e-5"
+    output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/output/train/e02d_mope_qformer_4b}"
+    run_name="space_e02d_mope_qformer_4b_lr1e-5"
 elif [ "${MODEL_SIZE}" = "8b" ]; then
     batch_size=1
     grad_accum_steps=16
     # 8B requires ZeRO-3 to fit on 8×H800 GPUs.
     DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${SPACE_ROOT}/configs/zero3.json}
-    GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-/home/nvme03/wlx/Space_sensing/output/train/guide_reproduced/8b}
-    output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/output/train/e00b_mope_projector_only_8b}"
-    run_name="space_e00b_mope_projector_only_8b_lr1e-5"
-    echo "WARNING: 8B E-00b is experimental — monitor VRAM usage carefully." >&2
+    output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/output/train/e02d_mope_qformer_8b}"
+    run_name="space_e02d_mope_qformer_8b_lr1e-5"
+    echo "WARNING: 8B E-02d is experimental — monitor VRAM usage carefully." >&2
 else
     echo "ERROR: Unknown MODEL_SIZE='${MODEL_SIZE}'. Must be '4b' or '8b'." >&2
     exit 1
@@ -102,6 +101,10 @@ fi
 # ---------------------------------------------------------------------------
 lr=1e-5
 
+# Q-Former query count: 32 learned queries compress the full MoPE patch tokens
+# (784 in E-02b) down to a fixed 32-token summary prepended to the LLM sequence.
+MOPE_QFORMER_NUM_QUERIES=${MOPE_QFORMER_NUM_QUERIES:-32}
+
 # ---------------------------------------------------------------------------
 # Entry point: our fork of the training framework
 # ---------------------------------------------------------------------------
@@ -117,7 +120,7 @@ args="
     --data_flatten False \
     --tune_mm_vision False \
     --tune_mm_mlp False \
-    --tune_mm_llm False \
+    --tune_mm_llm True \
     --optim adamw_torch \
     --bf16 \
     --output_dir ${output_dir} \
@@ -152,7 +155,8 @@ args="
     --geometry_encoder_type vggt \
     --geometry_encoder_path ${VGGT_PATH} \
     --use_mope True \
-    --mope_fusion_mode crossattn \
+    --mope_fusion_mode qformer \
+    --mope_qformer_num_queries ${MOPE_QFORMER_NUM_QUERIES} \
     --mope_checkpoint_path ${MOPE_CKPT_PATH} \
     --mope_encoder_path ${MOPE_CODE_PATH} \
     --mope_all_frames 8 \
@@ -161,13 +165,12 @@ args="
 # ---------------------------------------------------------------------------
 # Launch
 # ---------------------------------------------------------------------------
-LOG_FILE="${LOG_DIR}/e00b_mope_projector_only_${MODEL_SIZE}_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="${LOG_DIR}/e02d_mope_qformer_${MODEL_SIZE}_$(date +%Y%m%d_%H%M%S).log"
 
-echo "=== E-00b Training (MODEL_SIZE=${MODEL_SIZE}) ==="
+echo "=== E-02d Training (MODEL_SIZE=${MODEL_SIZE}) ==="
 echo "Output : ${output_dir}"
 echo "Log    : ${LOG_FILE}"
-echo "Fusion : crossattn, batch=${batch_size}, accum=${grad_accum_steps}"
-echo "Trainable: MoPEProjector only (~50M), LLM frozen"
+echo "Fusion : qformer, N_queries=${MOPE_QFORMER_NUM_QUERIES}, batch=${batch_size}, accum=${grad_accum_steps}"
 
 python -m torch.distributed.run --nproc_per_node=${NPROC_PER_NODE} \
          --master_addr=${MASTER_ADDR} \

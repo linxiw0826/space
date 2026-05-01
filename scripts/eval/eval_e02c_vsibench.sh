@@ -1,13 +1,13 @@
 #!/bin/bash
 # =============================================================================
-# Evaluate E-00b (projector only, cross-attention architecture) on VSIBench
+# Evaluate E-02c (MoPE cross-attention fusion) checkpoint on VSIBench
 # Model type: qwen3_vl_mope_crossattn
 #
 # Usage:
-#   bash eval_e00b_vsibench.sh [CKPT_PATH] [EXP_NAME]
+#   bash eval_e02c_vsibench.sh [CKPT_PATH] [EXP_NAME]
 #
 # Arguments (optional — derived from MODEL_SIZE when omitted):
-#   CKPT_PATH  — path to the E-00b checkpoint directory to evaluate
+#   CKPT_PATH  — path to the E-02c checkpoint directory to evaluate
 #   EXP_NAME   — short name for this evaluation run, used for output dir
 #
 # Env vars (all optional, have defaults):
@@ -30,17 +30,18 @@ SPACE_ROOT=${SPACE_ROOT:-"/home/nvme03/wlx/Space_sensing/projects/space"}
 
 # ---------------------------------------------------------------------------
 # MODEL_SIZE switch: 4b / 8b
+# Sets default CKPT_PATH and EXP_NAME based on model size.
 # ---------------------------------------------------------------------------
 MODEL_SIZE=${MODEL_SIZE:-4b}
 
 case "${MODEL_SIZE}" in
     4b)
-        DEFAULT_CKPT_PATH="/home/nvme03/wlx/Space_sensing/output/train/e00b_mope_projector_only_4b"
-        DEFAULT_EXP_NAME="e00b_mope_projector_only_4b"
+        DEFAULT_CKPT_PATH="/home/nvme03/wlx/Space_sensing/output/train/e02c_mope_crossattn_4b"
+        DEFAULT_EXP_NAME="e02c_mope_crossattn_4b"
         ;;
     8b)
-        DEFAULT_CKPT_PATH="/home/nvme03/wlx/Space_sensing/output/train/e00b_mope_projector_only_8b"
-        DEFAULT_EXP_NAME="e00b_mope_projector_only_8b"
+        DEFAULT_CKPT_PATH="/home/nvme03/wlx/Space_sensing/output/train/e02c_mope_crossattn_8b"
+        DEFAULT_EXP_NAME="e02c_mope_crossattn_8b"
         ;;
     *)
         echo "ERROR: MODEL_SIZE must be '4b' or '8b', got '${MODEL_SIZE}'"
@@ -70,7 +71,7 @@ mkdir -p "${OUTPUT_PATH}"
 # Log file — independent log directory, tee'd to stdout
 LOG_DIR=${LOG_DIR:-/home/nvme03/wlx/Space_sensing/logs/eval}
 mkdir -p "${LOG_DIR}"
-LOG_FILE="${LOG_DIR}/e00b_vsibench_${MODEL_SIZE}_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="${LOG_DIR}/e02c_vsibench_${MODEL_SIZE}_$(date +%Y%m%d_%H%M%S).log"
 
 # GPU configuration
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5}
@@ -84,6 +85,7 @@ MAIN_PORT=${MAIN_PORT:-$(shuf -i 20001-29999 -n 1)}
 # ---------------------------------------------------------------------------
 export LMMS_EVAL_PLUGINS="src.eval"
 export PYTHONPATH="${GUIDE_LMMS_EVAL}:${GUIDE_TRAIN_ROOT}:${SPACE_ROOT}:${PYTHONPATH}"
+# Note: mope (src/vendor/mope) is added to sys.path by mope_encoder.py at import time.
 
 # ---------------------------------------------------------------------------
 # Disable NCCL NVLS (known to cause hangs with multi-GPU lmms-eval)
@@ -98,7 +100,7 @@ MODEL_ARGS="pretrained=${CKPT_PATH},max_pixels=268324,min_pixels=8192,attn_imple
 # ---------------------------------------------------------------------------
 # Status output
 # ---------------------------------------------------------------------------
-echo "=== VSIBench Evaluation (E-00b MoPE projector only) ==="
+echo "=== VSIBench Evaluation (E-02c MoPE cross-attention fusion) ==="
 echo "Model size : ${MODEL_SIZE}"
 echo "Checkpoint : ${CKPT_PATH}"
 echo "Experiment : ${EXP_NAME}"
@@ -108,7 +110,7 @@ echo "Video root : ${VSIBENCH_VIDEO_ROOT}"
 echo "JSONL      : ${VSIBENCH_JSONL}"
 echo "Plugin     : ${LMMS_EVAL_PLUGINS}"
 echo "Processes  : ${NUM_PROCESSES}  Port: ${MAIN_PORT}"
-echo "======================================================="
+echo "================================================================"
 
 # ---------------------------------------------------------------------------
 # Run evaluation

@@ -135,7 +135,12 @@ def set_model(model_args, model):
 # MoPE integration helpers (new)
 # ---------------------------------------------------------------------------
 
-from model.mope_patch import _patch_model_for_mope, _patch_model_for_mope_concat  # noqa: E402
+from model.mope_patch import (  # noqa: E402
+    _patch_model_for_mope,
+    _patch_model_for_mope_concat,
+    _patch_model_for_mope_crossattn,
+    _patch_model_for_mope_qformer,
+)
 
 
 def _attach_mope_to_model(model, mope_args: MoPEArguments):
@@ -181,6 +186,16 @@ def _attach_mope_to_model(model, mope_args: MoPEArguments):
     if mope_args.mope_fusion_mode == "concat":
         from model.mope_projector import MoPEProjectorConcat
         projector = MoPEProjectorConcat(mope_dim=768, llm_dim=llm_dim)
+    elif mope_args.mope_fusion_mode == "crossattn":
+        from model.mope_projector import MoPEProjectorCrossAttn
+        projector = MoPEProjectorCrossAttn(mope_dim=768, llm_dim=llm_dim)
+    elif mope_args.mope_fusion_mode == "qformer":
+        from model.mope_projector import MoPEProjectorQFormer
+        projector = MoPEProjectorQFormer(
+            mope_dim=768,
+            llm_dim=llm_dim,
+            num_queries=mope_args.mope_qformer_num_queries,
+        )
     else:
         projector = MoPEProjector(mope_dim=768, llm_dim=llm_dim)
     inner_model.add_module("_mope_projector", projector)
@@ -497,6 +512,10 @@ def train(attn_implementation="flash_attention_2"):
     if mope_args.use_mope:
         if mope_args.mope_fusion_mode == "concat":
             _patch_model_for_mope_concat(model)
+        elif mope_args.mope_fusion_mode == "crossattn":
+            _patch_model_for_mope_crossattn(model)
+        elif mope_args.mope_fusion_mode == "qformer":
+            _patch_model_for_mope_qformer(model)
         else:
             _patch_model_for_mope(model)
 
@@ -516,11 +535,12 @@ def train(attn_implementation="flash_attention_2"):
         )
         # For concat fusion, prepend N_mope -100 labels so loss shape matches
         # the extended logit sequence produced by _patch_model_for_mope_concat.
-        n_mope_tokens = (
-            mope_args.mope_concat_num_tokens
-            if mope_args.mope_fusion_mode == "concat"
-            else 0
-        )
+        if mope_args.mope_fusion_mode == "concat":
+            n_mope_tokens = mope_args.mope_concat_num_tokens
+        elif mope_args.mope_fusion_mode == "qformer":
+            n_mope_tokens = mope_args.mope_qformer_num_queries
+        else:
+            n_mope_tokens = 0
         data_module["data_collator"] = MoPECollatorWrapper(
             data_module["data_collator"],
             mope_num_tokens=n_mope_tokens,

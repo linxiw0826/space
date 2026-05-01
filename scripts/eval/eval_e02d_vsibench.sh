@@ -1,13 +1,13 @@
 #!/bin/bash
 # =============================================================================
-# Evaluate E-00b (projector only, cross-attention architecture) on VSIBench
-# Model type: qwen3_vl_mope_crossattn
+# Evaluate E-02d (MoPE Q-Former fusion) checkpoint on VSIBench
+# Model type: qwen3_vl_mope_qformer
 #
 # Usage:
-#   bash eval_e00b_vsibench.sh [CKPT_PATH] [EXP_NAME]
+#   bash eval_e02d_vsibench.sh [CKPT_PATH] [EXP_NAME]
 #
 # Arguments (optional — derived from MODEL_SIZE when omitted):
-#   CKPT_PATH  — path to the E-00b checkpoint directory to evaluate
+#   CKPT_PATH  — path to the E-02d checkpoint directory to evaluate
 #   EXP_NAME   — short name for this evaluation run, used for output dir
 #
 # Env vars (all optional, have defaults):
@@ -35,12 +35,12 @@ MODEL_SIZE=${MODEL_SIZE:-4b}
 
 case "${MODEL_SIZE}" in
     4b)
-        DEFAULT_CKPT_PATH="/home/nvme03/wlx/Space_sensing/output/train/e00b_mope_projector_only_4b"
-        DEFAULT_EXP_NAME="e00b_mope_projector_only_4b"
+        DEFAULT_CKPT_PATH="/home/nvme03/wlx/Space_sensing/output/train/e02d_mope_qformer_4b"
+        DEFAULT_EXP_NAME="e02d_mope_qformer_4b"
         ;;
     8b)
-        DEFAULT_CKPT_PATH="/home/nvme03/wlx/Space_sensing/output/train/e00b_mope_projector_only_8b"
-        DEFAULT_EXP_NAME="e00b_mope_projector_only_8b"
+        DEFAULT_CKPT_PATH="/home/nvme03/wlx/Space_sensing/output/train/e02d_mope_qformer_8b"
+        DEFAULT_EXP_NAME="e02d_mope_qformer_8b"
         ;;
     *)
         echo "ERROR: MODEL_SIZE must be '4b' or '8b', got '${MODEL_SIZE}'"
@@ -70,7 +70,7 @@ mkdir -p "${OUTPUT_PATH}"
 # Log file — independent log directory, tee'd to stdout
 LOG_DIR=${LOG_DIR:-/home/nvme03/wlx/Space_sensing/logs/eval}
 mkdir -p "${LOG_DIR}"
-LOG_FILE="${LOG_DIR}/e00b_vsibench_${MODEL_SIZE}_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="${LOG_DIR}/e02d_vsibench_${MODEL_SIZE}_$(date +%Y%m%d_%H%M%S).log"
 
 # GPU configuration
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5}
@@ -78,7 +78,7 @@ NUM_PROCESSES=${NUM_PROCESSES:-6}
 MAIN_PORT=${MAIN_PORT:-$(shuf -i 20001-29999 -n 1)}
 
 # ---------------------------------------------------------------------------
-# LMMS_EVAL_PLUGINS: register qwen3_vl_mope_crossattn model type.
+# LMMS_EVAL_PLUGINS: register qwen3_vl_mope_qformer model type.
 # SPACE_ROOT is added to PYTHONPATH so that "src.eval" is importable as a
 # Python package (src/eval/__init__.py + src/eval/models/__init__.py).
 # ---------------------------------------------------------------------------
@@ -91,14 +91,14 @@ export PYTHONPATH="${GUIDE_LMMS_EVAL}:${GUIDE_TRAIN_ROOT}:${SPACE_ROOT}:${PYTHON
 export NCCL_NVLS_ENABLE=0
 
 # ---------------------------------------------------------------------------
-# Model args — MoPE cross-attention model (qwen3_vl_mope_crossattn), mope_all_frames=8
+# Model args — MoPE Q-Former model (qwen3_vl_mope_qformer), mope_all_frames=8
 # ---------------------------------------------------------------------------
 MODEL_ARGS="pretrained=${CKPT_PATH},max_pixels=268324,min_pixels=8192,attn_implementation=flash_attention_2,mope_all_frames=8"
 
 # ---------------------------------------------------------------------------
 # Status output
 # ---------------------------------------------------------------------------
-echo "=== VSIBench Evaluation (E-00b MoPE projector only) ==="
+echo "=== VSIBench Evaluation (E-02d MoPE Q-Former fusion) ==="
 echo "Model size : ${MODEL_SIZE}"
 echo "Checkpoint : ${CKPT_PATH}"
 echo "Experiment : ${EXP_NAME}"
@@ -108,7 +108,7 @@ echo "Video root : ${VSIBENCH_VIDEO_ROOT}"
 echo "JSONL      : ${VSIBENCH_JSONL}"
 echo "Plugin     : ${LMMS_EVAL_PLUGINS}"
 echo "Processes  : ${NUM_PROCESSES}  Port: ${MAIN_PORT}"
-echo "======================================================="
+echo "========================================================="
 
 # ---------------------------------------------------------------------------
 # Run evaluation
@@ -121,7 +121,7 @@ accelerate launch \
     --num_processes=${NUM_PROCESSES} \
     --main_process_port ${MAIN_PORT} \
     -m lmms_eval \
-    --model qwen3_vl_mope_crossattn \
+    --model qwen3_vl_mope_qformer \
     --model_args "${MODEL_ARGS}" \
     --tasks vsibench \
     --batch_size 1 \

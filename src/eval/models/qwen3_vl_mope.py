@@ -38,7 +38,12 @@ if str(_SRC_ROOT) not in sys.path:
 # ---------------------------------------------------------------------------
 from lmms_eval.api.registry import register_model  # noqa: E402
 from lmms_eval.models.simple.qwen3_vl_my import Qwen3_VL_MY  # noqa: E402
-from model.mope_patch import _patch_model_for_mope, _patch_model_for_mope_concat  # noqa: E402
+from model.mope_patch import (  # noqa: E402
+    _patch_model_for_mope,
+    _patch_model_for_mope_concat,
+    _patch_model_for_mope_crossattn,
+    _patch_model_for_mope_qformer,
+)
 
 
 def _load_mope_weights_from_pretrained(inner_model, pretrained_path: str) -> bool:
@@ -462,3 +467,136 @@ class Qwen3_VL_MoPE_ZeroShot(Qwen3_VL_MoPE_Concat):
             f"[Qwen3_VL_MoPE_ZeroShot] MoPE concat patch applied (random-init projector, no training). "
             f"mope_all_frames={self.mope_all_frames}, llm_dim={llm_dim}"
         )
+
+
+@register_model("qwen3_vl_mope_crossattn")
+class Qwen3_VL_MoPE_CrossAttn(Qwen3_VL_MoPE):
+    """E-02c inference model: Qwen3-VL + MoPE cross-attention fusion for lmms-eval.
+
+    Identical to Qwen3_VL_MoPE (E-02a) except:
+      - Uses MoPEProjectorCrossAttn (per-shard cross-attention, no avg pool).
+      - Applies _patch_model_for_mope_crossattn (fuses MoPE into image shards
+        via residual cross-attention at the get_image_features call site).
+
+    Sequence length is unchanged (cross-attention overwrites each image shard
+    in-place rather than prepending new tokens).
+
+    Registers model type ``qwen3_vl_mope_crossattn`` via LMMS_EVAL_PLUGINS.
+
+    Interface:
+        __init__(pretrained, ..., mope_all_frames=8)
+        generate_until(requests) -> List[str]   [inherited from Qwen3_VL_MoPE]
+        _compute_mope_frames(visuals) -> Optional[Tensor]  [inherited from Qwen3_VL_MoPE_Concat]
+    """
+
+    def __init__(
+        self,
+        pretrained: str = "Qwen/Qwen3-VL-4B-Instruct",
+        mope_all_frames: int = 8,
+        **kwargs,
+    ) -> None:
+        # Call Qwen3_VL_MY.__init__ directly to skip the E-02a MoPE setup
+        # in Qwen3_VL_MoPE.__init__.
+        Qwen3_VL_MY.__init__(self, pretrained=pretrained, **kwargs)
+        self.mope_all_frames = mope_all_frames
+
+        inner = self._model.model
+        llm_dim = self._model.config.text_config.hidden_size
+
+        from model.mope_encoder import MoPEEncoder
+        from model.mope_projector import MoPEProjectorCrossAttn
+
+        encoder = MoPEEncoder(checkpoint_path=None, all_frames=self.mope_all_frames)
+        projector = MoPEProjectorCrossAttn(mope_dim=768, llm_dim=llm_dim)
+
+        inner.add_module("_mope_encoder", encoder)
+        inner.add_module("_mope_projector", projector)
+
+        success = _load_mope_weights_from_pretrained(inner, pretrained)
+
+        ref_param = next(self._model.parameters())
+        inner._mope_encoder.to(device=ref_param.device, dtype=ref_param.dtype)
+        inner._mope_projector.to(device=ref_param.device, dtype=ref_param.dtype)
+
+        if success:
+            _patch_model_for_mope_crossattn(self._model)
+            print(
+                f"[Qwen3_VL_MoPE_CrossAttn] MoPE cross-attn patch applied. "
+                f"mope_all_frames={self.mope_all_frames}, llm_dim={llm_dim}"
+            )
+        else:
+            print(
+                "[Qwen3_VL_MoPE_CrossAttn] WARNING: MoPE weights could not be loaded "
+                "— running as standard GUIDE model."
+            )
+
+    # _compute_mope_frames: inherit from Qwen3_VL_MoPE_Concat for PIL.Image list support.
+    _compute_mope_frames = Qwen3_VL_MoPE_Concat._compute_mope_frames
+
+    # generate_until: inherit from Qwen3_VL_MoPE (sidecar _pending_mope_frames injection).
+    # No override needed — Qwen3_VL_MoPE.generate_until already uses the correct pattern.
+
+
+@register_model("qwen3_vl_mope_qformer")
+class Qwen3_VL_MoPE_QFormer(Qwen3_VL_MoPE_Concat):
+    """E-02d inference model: Qwen3-VL + MoPE Q-Former fusion for lmms-eval.
+
+    Identical to Qwen3_VL_MoPE_Concat (E-02b) except:
+      - Uses MoPEProjectorQFormer (compresses 784 MoPE tokens to num_queries=32
+        tokens via learned cross-attention queries).
+      - Applies _patch_model_for_mope_qformer (prepend 32 tokens to LLM sequence,
+        vs. 784 tokens in E-02b).
+
+    Registers model type ``qwen3_vl_mope_qformer`` via LMMS_EVAL_PLUGINS.
+
+    Interface:
+        __init__(pretrained, ..., mope_all_frames=8, mope_num_queries=32)
+        generate_until(requests) -> List[str]   [inherited from Qwen3_VL_MoPE_Concat]
+        _compute_mope_frames(visuals) -> Optional[Tensor]  [inherited from Qwen3_VL_MoPE_Concat]
+    """
+
+    def __init__(
+        self,
+        pretrained: str = "Qwen/Qwen3-VL-4B-Instruct",
+        mope_all_frames: int = 8,
+        mope_num_queries: int = 32,
+        **kwargs,
+    ) -> None:
+        # Call Qwen3_VL_MY.__init__ directly to skip the E-02b MoPE setup
+        # in Qwen3_VL_MoPE_Concat.__init__.
+        Qwen3_VL_MY.__init__(self, pretrained=pretrained, **kwargs)
+        self.mope_all_frames = mope_all_frames
+        self.mope_num_queries = mope_num_queries
+
+        inner = self._model.model
+        llm_dim = self._model.config.text_config.hidden_size
+
+        from model.mope_encoder import MoPEEncoder
+        from model.mope_projector import MoPEProjectorQFormer
+
+        encoder = MoPEEncoder(checkpoint_path=None, all_frames=self.mope_all_frames)
+        projector = MoPEProjectorQFormer(
+            mope_dim=768, llm_dim=llm_dim, num_queries=self.mope_num_queries
+        )
+
+        inner.add_module("_mope_encoder", encoder)
+        inner.add_module("_mope_projector", projector)
+
+        success = _load_mope_weights_from_pretrained(inner, pretrained)
+
+        ref_param = next(self._model.parameters())
+        inner._mope_encoder.to(device=ref_param.device, dtype=ref_param.dtype)
+        inner._mope_projector.to(device=ref_param.device, dtype=ref_param.dtype)
+
+        if success:
+            _patch_model_for_mope_qformer(self._model)
+            print(
+                f"[Qwen3_VL_MoPE_QFormer] MoPE Q-Former patch applied. "
+                f"mope_all_frames={self.mope_all_frames}, "
+                f"mope_num_queries={self.mope_num_queries}, llm_dim={llm_dim}"
+            )
+        else:
+            print(
+                "[Qwen3_VL_MoPE_QFormer] WARNING: MoPE weights could not be loaded "
+                "— running as standard GUIDE model."
+            )
