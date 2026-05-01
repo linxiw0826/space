@@ -1,12 +1,12 @@
 #!/bin/bash
 # =============================================================================
-# Evaluate E-00b (GUIDE zero-shot + MoPE concat, no training) on VSIBench
+# Evaluate E-00b (projector only checkpoint) on VSIBench
 #
 # Usage:
 #   bash eval_e00b_vsibench.sh [CKPT_PATH] [EXP_NAME]
 #
 # Arguments (optional — derived from MODEL_SIZE when omitted):
-#   CKPT_PATH  — path to the GUIDE reproduced checkpoint directory to evaluate
+#   CKPT_PATH  — path to the E-00b checkpoint directory to evaluate
 #   EXP_NAME   — short name for this evaluation run, used for output dir
 #
 # Env vars (all optional, have defaults):
@@ -29,18 +29,17 @@ SPACE_ROOT=${SPACE_ROOT:-"/home/nvme03/wlx/Space_sensing/projects/space"}
 
 # ---------------------------------------------------------------------------
 # MODEL_SIZE switch: 4b / 8b
-# Sets default CKPT_PATH and EXP_NAME based on model size.
 # ---------------------------------------------------------------------------
 MODEL_SIZE=${MODEL_SIZE:-4b}
 
 case "${MODEL_SIZE}" in
     4b)
-        DEFAULT_CKPT_PATH="/home/nvme03/wlx/Space_sensing/models/guide_reproduced/4b"
-        DEFAULT_EXP_NAME="e00b_mope_zeroshot_4b"
+        DEFAULT_CKPT_PATH="/home/nvme03/wlx/Space_sensing/output/train/e00b_mope_projector_only_4b"
+        DEFAULT_EXP_NAME="e00b_mope_projector_only_4b"
         ;;
     8b)
-        DEFAULT_CKPT_PATH="/home/nvme03/wlx/Space_sensing/models/guide_reproduced/8b"
-        DEFAULT_EXP_NAME="e00b_mope_zeroshot_8b"
+        DEFAULT_CKPT_PATH="/home/nvme03/wlx/Space_sensing/output/train/e00b_mope_projector_only_8b"
+        DEFAULT_EXP_NAME="e00b_mope_projector_only_8b"
         ;;
     *)
         echo "ERROR: MODEL_SIZE must be '4b' or '8b', got '${MODEL_SIZE}'"
@@ -78,13 +77,12 @@ NUM_PROCESSES=${NUM_PROCESSES:-6}
 MAIN_PORT=${MAIN_PORT:-$(shuf -i 20001-29999 -n 1)}
 
 # ---------------------------------------------------------------------------
-# LMMS_EVAL_PLUGINS: register qwen3_vl_mope_zeroshot model type.
+# LMMS_EVAL_PLUGINS: register qwen3_vl_mope_concat model type.
 # SPACE_ROOT is added to PYTHONPATH so that "src.eval" is importable as a
 # Python package (src/eval/__init__.py + src/eval/models/__init__.py).
 # ---------------------------------------------------------------------------
 export LMMS_EVAL_PLUGINS="src.eval"
 export PYTHONPATH="${GUIDE_LMMS_EVAL}:${GUIDE_TRAIN_ROOT}:${SPACE_ROOT}:${PYTHONPATH}"
-# Note: mope (src/vendor/mope) is added to sys.path by mope_encoder.py at import time.
 
 # ---------------------------------------------------------------------------
 # Disable NCCL NVLS (known to cause hangs with multi-GPU lmms-eval)
@@ -92,14 +90,14 @@ export PYTHONPATH="${GUIDE_LMMS_EVAL}:${GUIDE_TRAIN_ROOT}:${SPACE_ROOT}:${PYTHON
 export NCCL_NVLS_ENABLE=0
 
 # ---------------------------------------------------------------------------
-# Model args — zero-shot MoPE concat model (qwen3_vl_mope_zeroshot), mope_all_frames=8
+# Model args — MoPE concat model (qwen3_vl_mope_concat), mope_all_frames=8
 # ---------------------------------------------------------------------------
 MODEL_ARGS="pretrained=${CKPT_PATH},max_pixels=268324,min_pixels=8192,attn_implementation=flash_attention_2,mope_all_frames=8"
 
 # ---------------------------------------------------------------------------
 # Status output
 # ---------------------------------------------------------------------------
-echo "=== VSIBench Evaluation — E-00b Zero-Shot + MoPE Concat (no training) ==="
+echo "=== VSIBench Evaluation (E-00b MoPE projector only) ==="
 echo "Model size : ${MODEL_SIZE}"
 echo "Checkpoint : ${CKPT_PATH}"
 echo "Experiment : ${EXP_NAME}"
@@ -109,7 +107,7 @@ echo "Video root : ${VSIBENCH_VIDEO_ROOT}"
 echo "JSONL      : ${VSIBENCH_JSONL}"
 echo "Plugin     : ${LMMS_EVAL_PLUGINS}"
 echo "Processes  : ${NUM_PROCESSES}  Port: ${MAIN_PORT}"
-echo "========================================================================"
+echo "======================================================="
 
 # ---------------------------------------------------------------------------
 # Run evaluation
@@ -122,7 +120,7 @@ accelerate launch \
     --num_processes=${NUM_PROCESSES} \
     --main_process_port ${MAIN_PORT} \
     -m lmms_eval \
-    --model qwen3_vl_mope_zeroshot \
+    --model qwen3_vl_mope_concat \
     --model_args "${MODEL_ARGS}" \
     --tasks vsibench \
     --batch_size 1 \

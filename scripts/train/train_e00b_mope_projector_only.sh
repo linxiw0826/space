@@ -1,22 +1,21 @@
 #!/bin/bash
 # =============================================================================
-# E-02b: GUIDE + MoPE token-concat fusion (unified 4B / 8B)
+# E-00b: GUIDE + MoPE token-concat fusion, projector only (unified 4B / 8B)
 #
-# Difference from E-02a: MoPE keeps all ~784 patch tokens and prepends them
-# to the LLM input sequence so each text/image token can attend to every MoPE
-# token via self-attention (D-07, Option C).
+# Difference from E-02b: tune_mm_llm=False — LLM is fully frozen.
+# Only MoPEProjector (~50M params) is trained on VSI-590K.
+# Trainable: MoPEProjector only (~50M), LLM frozen.
 #
 # Usage:
-#   MODEL_SIZE=4b bash train_e02b_mope_concat.sh   # default
-#   MODEL_SIZE=8b bash train_e02b_mope_concat.sh
+#   MODEL_SIZE=4b bash train_e00b_mope_projector_only.sh   # default
+#   MODEL_SIZE=8b bash train_e00b_mope_projector_only.sh
 #
 # Supported MODEL_SIZE values: 4b  8b
 #
-# Key differences from E-02a:
-#   - --mope_fusion_mode concat       (prepend 784 tokens, not broadcast add)
-#   - batch_size 2  / grad_accum 4    (same effective batch=48 as E-02a 2×4×6)
-#   - gradient_checkpointing False    (H20 96GB has headroom; avoids recompute overhead)
-#   - output_dir → e02b_mope_concat_{size}
+# Key differences from E-02b:
+#   - --tune_mm_llm False             (LLM frozen; only MoPEProjector trains)
+#   - GUIDE_CKPT_PATH → models/guide_reproduced/{4b,8b}  (correct path)
+#   - output_dir → e00b_mope_projector_only_{size}
 # =============================================================================
 set -e
 
@@ -41,7 +40,6 @@ GUIDE_ROOT="${SPACE_ROOT}/src"
 MOPE_ROOT="${SPACE_ROOT}/src/vendor/mope"
 
 VGGT_PATH=${VGGT_PATH:-/home/nvme01/wlx/Space_sensing/models/VGGT-1B}
-GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-/home/nvme03/wlx/Space_sensing/models/guide_reproduced/4b}
 
 # MoPE checkpoint (ep199, vitb_1 full training run)
 MOPE_CKPT_PATH=${MOPE_CKPT_PATH:-/home/nvme04/mope-jepa/output/mope_jepa_wisa7k_vitb_1/checkpoint-199.pth}
@@ -56,16 +54,18 @@ if [ "${MODEL_SIZE}" = "4b" ]; then
     batch_size=2
     grad_accum_steps=4
     DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${SPACE_ROOT}/configs/zero2.json}
-    output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/output/train/e02b_mope_concat_4b}"
-    run_name="space_e02b_mope_concat_4b_lr1e-5"
+    GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-/home/nvme03/wlx/Space_sensing/models/guide_reproduced/4b}
+    output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/output/train/e00b_mope_projector_only_4b}"
+    run_name="space_e00b_mope_projector_only_4b_lr1e-5"
 elif [ "${MODEL_SIZE}" = "8b" ]; then
     batch_size=1
     grad_accum_steps=16
     # 8B requires ZeRO-3 to fit on 8×H800 GPUs; concat adds ~784 tokens per sample.
     DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${SPACE_ROOT}/configs/zero3.json}
-    output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/output/train/e02b_mope_concat_8b}"
-    run_name="space_e02b_mope_concat_8b_lr1e-5"
-    echo "WARNING: 8B E-02b is experimental — monitor VRAM usage carefully." >&2
+    GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-/home/nvme03/wlx/Space_sensing/models/guide_reproduced/8b}
+    output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/output/train/e00b_mope_projector_only_8b}"
+    run_name="space_e00b_mope_projector_only_8b_lr1e-5"
+    echo "WARNING: 8B E-00b is experimental — monitor VRAM usage carefully." >&2
 else
     echo "ERROR: Unknown MODEL_SIZE='${MODEL_SIZE}'. Must be '4b' or '8b'." >&2
     exit 1
@@ -122,7 +122,7 @@ args="
     --data_flatten False \
     --tune_mm_vision False \
     --tune_mm_mlp False \
-    --tune_mm_llm True \
+    --tune_mm_llm False \
     --optim adamw_torch \
     --bf16 \
     --output_dir ${output_dir} \
@@ -167,12 +167,13 @@ args="
 # ---------------------------------------------------------------------------
 # Launch
 # ---------------------------------------------------------------------------
-LOG_FILE="${LOG_DIR}/e02b_mope_concat_${MODEL_SIZE}_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="${LOG_DIR}/e00b_mope_projector_only_${MODEL_SIZE}_$(date +%Y%m%d_%H%M%S).log"
 
-echo "=== E-02b Training (MODEL_SIZE=${MODEL_SIZE}) ==="
+echo "=== E-00b Training (MODEL_SIZE=${MODEL_SIZE}) ==="
 echo "Output : ${output_dir}"
 echo "Log    : ${LOG_FILE}"
 echo "Fusion : concat, N_mope=${MOPE_CONCAT_NUM_TOKENS}, batch=${batch_size}, accum=${grad_accum_steps}"
+echo "Trainable: MoPEProjector only (~50M), LLM frozen"
 
 python -m torch.distributed.run --nproc_per_node=${NPROC_PER_NODE} \
          --master_addr=${MASTER_ADDR} \
