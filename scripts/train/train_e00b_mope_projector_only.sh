@@ -14,7 +14,7 @@
 #
 # Key differences from E-02b:
 #   - --tune_mm_llm False             (LLM frozen; only MoPEProjector trains)
-#   - GUIDE_CKPT_PATH → models/guide_reproduced/{4b,8b}  (correct path)
+#   - GUIDE_CKPT_PATH → output/train/guide_reproduced/{4b,8b}
 #   - output_dir → e00b_mope_projector_only_{size}
 # =============================================================================
 set -e
@@ -54,7 +54,7 @@ if [ "${MODEL_SIZE}" = "4b" ]; then
     batch_size=2
     grad_accum_steps=4
     DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${SPACE_ROOT}/configs/zero2.json}
-    GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-/home/nvme03/wlx/Space_sensing/models/guide_reproduced/4b}
+    GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-/home/nvme03/wlx/Space_sensing/output/train/guide_reproduced/4b}
     output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/output/train/e00b_mope_projector_only_4b}"
     run_name="space_e00b_mope_projector_only_4b_lr1e-5"
 elif [ "${MODEL_SIZE}" = "8b" ]; then
@@ -62,7 +62,7 @@ elif [ "${MODEL_SIZE}" = "8b" ]; then
     grad_accum_steps=16
     # 8B requires ZeRO-3 to fit on 8×H800 GPUs; concat adds ~784 tokens per sample.
     DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${SPACE_ROOT}/configs/zero3.json}
-    GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-/home/nvme03/wlx/Space_sensing/models/guide_reproduced/8b}
+    GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-/home/nvme03/wlx/Space_sensing/output/train/guide_reproduced/8b}
     output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/output/train/e00b_mope_projector_only_8b}"
     run_name="space_e00b_mope_projector_only_8b_lr1e-5"
     echo "WARNING: 8B E-00b is experimental — monitor VRAM usage carefully." >&2
