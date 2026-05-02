@@ -195,7 +195,8 @@ class MoPEProjectorQFormer(nn.Module):
         nn.init.zeros_(self.out_proj.weight)
         nn.init.zeros_(self.out_proj.bias)
 
-        self.queries = nn.Parameter(torch.zeros(1, num_queries, llm_dim))
+        self.queries = nn.Parameter(torch.empty(1, num_queries, llm_dim))
+        nn.init.normal_(self.queries, std=0.02)
 
     def forward(self, mope_features: torch.Tensor) -> torch.Tensor:
         """Compress MoPE features to num_queries tokens via learned cross-attention.
