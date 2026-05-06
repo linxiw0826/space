@@ -157,7 +157,8 @@ args="
     --mope_checkpoint_path ${MOPE_CKPT_PATH} \
     --mope_encoder_path ${MOPE_CODE_PATH} \
     --mope_all_frames 8 \
-    --group_by_modality_length True"
+    --group_by_modality_length True \
+    ${RESUME_FROM_CHECKPOINT:+--resume_from_checkpoint ${RESUME_FROM_CHECKPOINT}}"
 
 # ---------------------------------------------------------------------------
 # Launch

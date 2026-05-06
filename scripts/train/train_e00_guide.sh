@@ -116,7 +116,8 @@ args="
     --geometry_encoder_type vggt \
     --geometry_encoder_path ${VGGT_PATH} \
     --use_mope False \
-    --group_by_modality_length True"
+    --group_by_modality_length True \
+    ${RESUME_FROM_CHECKPOINT:+--resume_from_checkpoint ${RESUME_FROM_CHECKPOINT}}"
 
 echo "=== E-00: GUIDE 4B SR ==="
 echo "  base model : ${QWEN3_VL_4B_PATH}"

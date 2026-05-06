@@ -135,7 +135,8 @@ args="
     --geometry_encoder_type vggt \
     --geometry_encoder_path ${VGGT_PATH} \
     --use_mope False \
-    --group_by_modality_length True"
+    --group_by_modality_length True \
+    ${RESUME_FROM_CHECKPOINT:+--resume_from_checkpoint ${RESUME_FROM_CHECKPOINT}}"
 
 echo "MODEL_SIZE=${MODEL_SIZE}  batch_size=${batch_size}  grad_accum=${grad_accum_steps}  deepspeed=${DEEPSPEED_CONFIG}"
 echo "output_dir=${output_dir}"
