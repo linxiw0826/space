@@ -57,6 +57,7 @@ if [ "${MODEL_SIZE}" = "4b" ]; then
     GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-/home/nvme03/wlx/Space_sensing/output/train/guide_reproduced/4b}
     output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/output/train/e00b_mope_projector_only_4b}"
     run_name="space_e00b_mope_projector_only_4b_lr1e-5"
+    RESUME_FROM_CHECKPOINT=${RESUME_FROM_CHECKPOINT:-/home/nvme03/wlx/Space_sensing/output/train/e00b_mope_projector_only_4b/checkpoint-4000}
 elif [ "${MODEL_SIZE}" = "8b" ]; then
     batch_size=1
     grad_accum_steps=16
