@@ -52,7 +52,7 @@ MOPE_CODE_PATH=${MOPE_CODE_PATH:-${SPACE_ROOT}/src/vendor/mope}
 # ---------------------------------------------------------------------------
 if [ "${MODEL_SIZE}" = "4b" ]; then
     batch_size=2
-    grad_accum_steps=4
+    grad_accum_steps=5
     DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${SPACE_ROOT}/configs/zero2.json}
     GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-/home/nvme03/wlx/Space_sensing/output/train/guide_reproduced/4b}
     output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/output/train/e00b_mope_projector_only_4b}"
