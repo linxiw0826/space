@@ -43,7 +43,6 @@ GUIDE_ROOT="${SPACE_ROOT}/src"
 MOPE_ROOT="${SPACE_ROOT}/src/vendor/mope"
 
 VGGT_PATH=${VGGT_PATH:-/home/nvme01/wlx/Space_sensing/models/VGGT-1B}
-GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-/home/nvme03/wlx/Space_sensing/output/train/guide_reproduced/4b}
 
 # MoPE checkpoint (ep199, vitb_1 full training run)
 MOPE_CKPT_PATH=${MOPE_CKPT_PATH:-/home/nvme04/mope-jepa/output/mope_jepa_wisa7k_vitb_1/checkpoint-199.pth}
@@ -58,6 +57,7 @@ if [ "${MODEL_SIZE}" = "4b" ]; then
     batch_size=2
     grad_accum_steps=4
     DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${SPACE_ROOT}/configs/zero2.json}
+    GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-/home/nvme03/wlx/Space_sensing/output/train/guide_reproduced/4b}
     output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/output/train/e02c_mope_crossattn_4b}"
     run_name="space_e02c_mope_crossattn_4b_lr1e-5"
 elif [ "${MODEL_SIZE}" = "8b" ]; then
@@ -65,6 +65,7 @@ elif [ "${MODEL_SIZE}" = "8b" ]; then
     grad_accum_steps=8
     # 8B requires ZeRO-3 to fit on 8x H800 GPUs
     DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${SPACE_ROOT}/configs/zero3.json}
+    GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-/home/nvme03/wlx/Space_sensing/output/train/guide_reproduced/8b}
     output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/output/train/e02c_mope_crossattn_8b}"
     run_name="space_e02c_mope_crossattn_8b_lr1e-5"
 else
