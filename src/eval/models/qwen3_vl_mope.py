@@ -355,7 +355,7 @@ class Qwen3_VL_MoPE_Concat(Qwen3_VL_MoPE):
         # --- Path 1: video file present — delegate to parent ---
         for v in visuals:
             if isinstance(v, str) and v.lower().endswith(_VIDEO_EXTENSIONS):
-                return super()._compute_mope_frames(visuals)
+                return Qwen3_VL_MoPE._compute_mope_frames(self, visuals)
 
         # --- Path 2: collect PIL.Image objects ---
         pil_images = [v for v in visuals if isinstance(v, Image.Image)]
