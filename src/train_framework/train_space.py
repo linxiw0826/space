@@ -210,6 +210,54 @@ def _attach_mope_to_model(model, mope_args: MoPEArguments):
     )
 
 
+def _load_mope_weights_from_checkpoint(inner_model, ckpt_dir: str) -> bool:
+    """Load _mope_encoder / _mope_projector weights from a Stage 1 checkpoint.
+
+    Checkpoint keys are formatted as ``model._mope_encoder.*`` and
+    ``model._mope_projector.*``.  When loading into *inner_model* (the
+    Qwen3VLModel / Qwen2_5_VLModel) the ``model.`` prefix must be stripped.
+
+    Supports both safetensors (including sharded) and pytorch_model*.bin.
+    Returns True if at least one MoPE tensor was loaded, False otherwise.
+    """
+    ckpt_path = Path(ckpt_dir)
+    state_dict: dict = {}
+
+    # Try safetensors first (preferred, used by HF save_pretrained).
+    try:
+        from safetensors.torch import load_file as _st_load_file
+
+        shards = sorted(ckpt_path.glob("*.safetensors"))
+        for shard in shards:
+            shard_data = _st_load_file(str(shard))
+            for k, v in shard_data.items():
+                if k.startswith("model._mope_encoder.") or k.startswith("model._mope_projector."):
+                    state_dict[k[len("model."):]] = v
+    except ImportError:
+        pass
+
+    # Fall back to PyTorch .bin files.
+    if not state_dict:
+        bin_files = sorted(ckpt_path.glob("pytorch_model*.bin"))
+        for bin_file in bin_files:
+            bin_data = torch.load(str(bin_file), map_location="cpu", weights_only=True)
+            for k, v in bin_data.items():
+                if k.startswith("model._mope_encoder.") or k.startswith("model._mope_projector."):
+                    state_dict[k[len("model."):]] = v
+
+    if not state_dict:
+        rank0_print(
+            f"[Space Sensing] WARNING: no MoPE keys found in checkpoint at {ckpt_path}"
+        )
+        return False
+
+    msg = inner_model.load_state_dict(state_dict, strict=False)
+    rank0_print(
+        f"[Space Sensing] Loaded {len(state_dict)} MoPE tensors from checkpoint "
+        f"at {ckpt_path}.  Missing keys (expected): {msg.missing_keys}"
+    )
+    return True
+
 
 # ---------------------------------------------------------------------------
 # Main training function
@@ -417,6 +465,20 @@ def train(attn_implementation="flash_attention_2"):
 
         _attach_mope_to_model(model, mope_args)
 
+        # Phase 2 two-stage: load pre-trained projector weights from Stage 1 checkpoint.
+        if mope_args.freeze_mope_projector:
+            _loaded = _load_mope_weights_from_checkpoint(
+                model.model, model_args.model_name_or_path
+            )
+            if not _loaded:
+                raise RuntimeError(
+                    f"--freeze_mope_projector is set but no MoPE weights found in "
+                    f"checkpoint at {model_args.model_name_or_path}. "
+                    f"Ensure the checkpoint was produced by a Stage 1 experiment "
+                    f"(E-00b / E-00c)."
+                )
+            rank0_print("[Space Sensing] Stage 2: loaded pre-trained projector weights from Stage 1 checkpoint.")
+
     # ------------------------------------------------------------------
     # Trainability setup (verbatim from GUIDE, with MoPE projector unfreeze)
     # ------------------------------------------------------------------
@@ -437,12 +499,14 @@ def train(attn_implementation="flash_attention_2"):
         )
         model = get_peft_model(model, lora_config)
 
-        # Re-enable MoPEProjector after LoRA wrapping froze everything.
+        # Re-enable MoPEProjector after LoRA wrapping froze everything
+        # (unless freeze_mope_projector is set for two-stage training).
         if mope_args.use_mope:
             projector = model.model._mope_projector
             for p in projector.parameters():
-                p.requires_grad = True
-            rank0_print("[Space Sensing] MoPEProjector re-enabled after LoRA freeze.")
+                p.requires_grad = not mope_args.freeze_mope_projector
+            _proj_status = "frozen (two-stage)" if mope_args.freeze_mope_projector else "re-enabled"
+            rank0_print(f"[Space Sensing] MoPEProjector {_proj_status} after LoRA freeze.")
     else:
         set_model(model_args, model)
 
@@ -451,10 +515,12 @@ def train(attn_implementation="flash_attention_2"):
             # Encoder: ensure all params are frozen.
             for p in model.model._mope_encoder.parameters():
                 p.requires_grad = False
-            # Projector: ensure all params are trainable.
+            # Projector: trainable by default, frozen when freeze_mope_projector is set
+            # (Phase 2 two-stage: projector pre-trained in Stage 1, LLM trains in Stage 2).
             for p in model.model._mope_projector.parameters():
-                p.requires_grad = True
-            rank0_print("[Space Sensing] MoPEEncoder frozen, MoPEProjector trainable.")
+                p.requires_grad = not mope_args.freeze_mope_projector
+            _proj_status = "frozen (two-stage)" if mope_args.freeze_mope_projector else "trainable"
+            rank0_print(f"[Space Sensing] MoPEEncoder frozen, MoPEProjector {_proj_status}.")
 
         is_rank0 = (
             (not torch.distributed.is_available())

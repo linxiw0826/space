@@ -142,6 +142,12 @@ class MoPEArguments:
                           "Output shape: [B, mope_qformer_num_queries, llm_dim]. "
                           "Default 32."},
     )
+    freeze_mope_projector: bool = field(
+        default=False,
+        metadata={"help": "Freeze MoPE projector weights during training. Used in Phase 2 two-stage "
+                          "experiments (E-03a, E-03b) where projector was pre-trained in Stage 1 "
+                          "(E-00b / E-00c) and LLM is trained in Stage 2."},
+    )
 
 
 # ---------------------------------------------------------------------------
