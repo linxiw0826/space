@@ -32,7 +32,7 @@ MODEL_SIZE=${MODEL_SIZE:-4b}
 MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 MASTER_PORT=${MASTER_PORT:-$(shuf -i 20001-29999 -n 1)}
 # Single-node training only; multi-node not supported.
-NPROC_PER_NODE=${NPROC_PER_NODE:-9}
+NPROC_PER_NODE=${NPROC_PER_NODE:-8}
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 
 # ---------------------------------------------------------------------------
@@ -61,6 +61,7 @@ if [ "${MODEL_SIZE}" = "4b" ]; then
     output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/output/train/e03a_mope_crossattn_two_stage_4b}"
     run_name="space_e03a_mope_crossattn_two_stage_4b_lr1e-5"
     RESUME_FROM_CHECKPOINT=${RESUME_FROM_CHECKPOINT:-/home/nvme03/wlx/Space_sensing/output/train/e03a_mope_crossattn_two_stage_4b/checkpoint-4000}
+    [ ! -d "${RESUME_FROM_CHECKPOINT}" ] && RESUME_FROM_CHECKPOINT=""
 elif [ "${MODEL_SIZE}" = "8b" ]; then
     batch_size=1
     grad_accum_steps=16

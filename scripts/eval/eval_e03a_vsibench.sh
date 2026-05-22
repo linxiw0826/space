@@ -74,8 +74,8 @@ mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/e03a_vsibench_${MODEL_SIZE}_$(date +%Y%m%d_%H%M%S).log"
 
 # GPU configuration
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5}
-NUM_PROCESSES=${NUM_PROCESSES:-6}
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
+NUM_PROCESSES=${NUM_PROCESSES:-8}
 MAIN_PORT=${MAIN_PORT:-$(shuf -i 20001-29999 -n 1)}
 
 # ---------------------------------------------------------------------------
