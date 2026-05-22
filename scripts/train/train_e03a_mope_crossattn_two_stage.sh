@@ -2,8 +2,9 @@
 # =============================================================================
 # E-03a: GUIDE + MoPE cross-attention fusion, two-stage training (unified 4B / 8B)
 #
-# Stage 2 of two-stage training: freeze MoPEProjectorCrossAttn, train LLM only.
-# Starting checkpoint is E-00b (projector-only, Stage 1 trained).
+# Stage 2 of two-stage training: warm-start joint training (projector + LLM both
+# trainable from E-00b checkpoint). Starting checkpoint is E-00b (projector-only,
+# Stage 1 trained).
 #
 # Usage:
 #   MODEL_SIZE=4b bash train_e03a_mope_crossattn_two_stage.sh   # default
@@ -14,7 +15,7 @@
 # Key differences from E-02c:
 #   - GUIDE_CKPT_PATH → E-00b projector-only checkpoint (Stage 1)
 #   - --tune_mm_llm True              (LLM trains in Stage 2)
-#   - --freeze_mope_projector True    (projector frozen in Stage 2)
+#   - projector + LLM both trainable  (warm-start joint training, D-10)
 #   - --mope_fusion_mode crossattn    (same architecture as E-00b/E-02c)
 #   - output_dir → e03a_mope_crossattn_two_stage_{size}
 # =============================================================================
@@ -121,7 +122,6 @@ args="
     --tune_mm_vision False \
     --tune_mm_mlp False \
     --tune_mm_llm True \
-    --freeze_mope_projector True \
     --optim adamw_torch \
     --bf16 \
     --output_dir ${output_dir} \
@@ -172,7 +172,7 @@ echo "=== E-03a Training (MODEL_SIZE=${MODEL_SIZE}) ==="
 echo "Output : ${output_dir}"
 echo "Log    : ${LOG_FILE}"
 echo "Fusion : crossattn, batch=${batch_size}, accum=${grad_accum_steps}"
-echo "Trainable: LLM only, MoPEProjectorCrossAttn frozen (Stage 2 of two-stage)"
+echo "Trainable: LLM + MoPEProjectorCrossAttn (warm-start joint, D-10)"
 
 python -m torch.distributed.run --nproc_per_node=${NPROC_PER_NODE} \
          --master_addr=${MASTER_ADDR} \

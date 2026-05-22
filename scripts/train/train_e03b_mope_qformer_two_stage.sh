@@ -2,8 +2,9 @@
 # =============================================================================
 # E-03b: GUIDE + MoPE Q-Former fusion, two-stage training (unified 4B / 8B)
 #
-# Stage 2 of two-stage training: freeze MoPEProjectorQFormer, train LLM only.
-# Starting checkpoint is E-00c (Q-Former projector-only, Stage 1 trained).
+# Stage 2 of two-stage training: warm-start joint training (projector + LLM both
+# trainable from E-00c checkpoint). Starting checkpoint is E-00c (Q-Former
+# projector-only, Stage 1 trained).
 #
 # Usage:
 #   MODEL_SIZE=4b bash train_e03b_mope_qformer_two_stage.sh   # default
@@ -14,7 +15,7 @@
 # Key differences from E-02d:
 #   - GUIDE_CKPT_PATH → E-00c Q-Former projector-only checkpoint (Stage 1)
 #   - --tune_mm_llm True              (LLM trains in Stage 2)
-#   - --freeze_mope_projector True    (projector frozen in Stage 2)
+#   - projector + LLM both trainable  (warm-start joint training, D-10)
 #   - --mope_fusion_mode qformer      (same architecture as E-00c/E-02d)
 #   - --mope_qformer_num_queries 32
 #   - output_dir → e03b_mope_qformer_two_stage_{size}
@@ -125,7 +126,6 @@ args="
     --tune_mm_vision False \
     --tune_mm_mlp False \
     --tune_mm_llm True \
-    --freeze_mope_projector True \
     --optim adamw_torch \
     --bf16 \
     --output_dir ${output_dir} \
@@ -177,7 +177,7 @@ echo "=== E-03b Training (MODEL_SIZE=${MODEL_SIZE}) ==="
 echo "Output : ${output_dir}"
 echo "Log    : ${LOG_FILE}"
 echo "Fusion : qformer, N_queries=32, batch=${batch_size}, accum=${grad_accum_steps}"
-echo "Trainable: LLM only, MoPEProjectorQFormer frozen (Stage 2 of two-stage)"
+echo "Trainable: LLM + MoPEProjectorQFormer (warm-start joint, D-10)"
 
 python -m torch.distributed.run --nproc_per_node=${NPROC_PER_NODE} \
          --master_addr=${MASTER_ADDR} \
