@@ -29,8 +29,8 @@ MODEL_SIZE=${MODEL_SIZE:-4b}
 # ---------------------------------------------------------------------------
 MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 MASTER_PORT=${MASTER_PORT:-$(shuf -i 20001-29999 -n 1)}
-NPROC_PER_NODE=${NPROC_PER_NODE:-5}
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1,2,3,4,5}
+NPROC_PER_NODE=${NPROC_PER_NODE:-6}
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5}
 
 # ---------------------------------------------------------------------------
 # Path configuration (override via env vars as needed)
@@ -52,7 +52,7 @@ MOPE_CODE_PATH=${MOPE_CODE_PATH:-${SPACE_ROOT}/src/vendor/mope}
 # ---------------------------------------------------------------------------
 if [ "${MODEL_SIZE}" = "4b" ]; then
     batch_size=2
-    grad_accum_steps=5
+    grad_accum_steps=4
     DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${SPACE_ROOT}/configs/zero2.json}
     GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-/home/nvme03/wlx/Space_sensing/output/train/guide_reproduced/4b}
     output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/output/train/e00c_mope_qformer_projector_only_4b}"
