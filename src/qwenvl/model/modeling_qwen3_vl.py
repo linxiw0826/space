@@ -331,6 +331,15 @@ class Qwen3VLTextRotaryEmbedding(nn.Module):
             freqs_t[..., idx] = freqs[dim, ..., idx]
         return freqs_t
 
+    @staticmethod
+    def compute_default_rope_parameters(config, device=None, **kwargs):
+        base = getattr(config, "rope_theta", 10000.0)
+        head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+        dim = int(head_dim)
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64, device=device).float() / dim))
+        attention_scaling = 1.0
+        return inv_freq, attention_scaling
+
     @torch.no_grad()
     @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
     def forward(self, x, position_ids):
