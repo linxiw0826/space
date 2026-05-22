@@ -213,7 +213,7 @@ def _get_train_sampler(self, train_dataset: Optional[Dataset] = None) -> Optiona
     if train_dataset is None or not has_length(train_dataset):
         return None
 
-    if self.args.group_by_length:
+    if getattr(self.args, "group_by_length", False):
         lengths = train_dataset.lengths
         return LengthGroupedSampler(
             # self.args.train_batch_size * self.args.gradient_accumulation_steps, # TODO: seems that we should not have gradient_accumulation_steps
@@ -222,7 +222,7 @@ def _get_train_sampler(self, train_dataset: Optional[Dataset] = None) -> Optiona
             world_size=self.args.world_size * self.args.gradient_accumulation_steps,  # TODO: seems that this may work?
             lengths=lengths,
         )
-    elif self.args.group_by_modality_length:
+    elif getattr(self.args, "group_by_modality_length", False):
         lengths = train_dataset.modality_lengths
         return LengthGroupedSampler(
             # self.args.train_batch_size * self.args.gradient_accumulation_steps, # TODO: seems that we should not have gradient_accumulation_steps
