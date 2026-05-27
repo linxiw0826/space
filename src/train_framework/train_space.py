@@ -70,6 +70,7 @@ from transformers import (
 from qwenvl.model.modeling_qwen3_vl import Qwen3VLForConditionalGeneration
 from qwenvl.data.data_processor import make_supervised_data_module
 from transformers import AutoProcessor, Trainer, AutoConfig
+from transformers.trainer_utils import get_last_checkpoint
 
 # ---------------------------------------------------------------------------
 # Imports from Space Sensing (new)
@@ -671,10 +672,17 @@ def train(attn_implementation="flash_attention_2"):
         model=model, processing_class=tokenizer, args=training_args, **data_module
     )
 
-    checkpoints = list(pathlib.Path(training_args.output_dir).glob("checkpoint-*"))
-    if checkpoints and not training_args.overwrite_output_dir:
-        logging.info("checkpoint found, resume training")
-        trainer.train(resume_from_checkpoint=True)
+    # Respect the CLI-provided --resume_from_checkpoint. Only auto-detect a
+    # checkpoint when it was not explicitly passed, and only accept a *complete*
+    # checkpoint (must contain trainer_state.json); otherwise train from scratch.
+    resume_ckpt = training_args.resume_from_checkpoint
+    if not resume_ckpt and not training_args.overwrite_output_dir:
+        last_ckpt = get_last_checkpoint(training_args.output_dir)
+        if last_ckpt is not None and os.path.isfile(os.path.join(last_ckpt, "trainer_state.json")):
+            resume_ckpt = last_ckpt
+            logging.info(f"checkpoint found, resume training from {resume_ckpt}")
+    if resume_ckpt:
+        trainer.train(resume_from_checkpoint=resume_ckpt)
     else:
         trainer.train()
     trainer.save_state()
