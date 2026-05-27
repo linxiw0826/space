@@ -672,13 +672,41 @@ def train(attn_implementation="flash_attention_2"):
         model=model, processing_class=tokenizer, args=training_args, **data_module
     )
 
-    # Respect the CLI-provided --resume_from_checkpoint. Only auto-detect a
-    # checkpoint when it was not explicitly passed, and only accept a *complete*
-    # checkpoint (must contain trainer_state.json); otherwise train from scratch.
+    def _is_complete_checkpoint(ckpt_dir):
+        # An auto-detected checkpoint is only safe to resume from if it is fully
+        # written. trainer_state.json is the HF Trainer marker (missing if the
+        # previous save was interrupted). For DeepSpeed runs the optimizer/model
+        # shards live under <ckpt>/<tag>/ where <tag> is the content of the
+        # `latest` file; if `latest` points at a missing global_stepN/ dir the
+        # DeepSpeed resume would fail, so treat it as incomplete. Non-DeepSpeed
+        # checkpoints have no `latest` file and are judged by trainer_state.json
+        # alone.
+        if not os.path.isfile(os.path.join(ckpt_dir, "trainer_state.json")):
+            return False
+        latest_file = os.path.join(ckpt_dir, "latest")
+        if os.path.isfile(latest_file):
+            try:
+                with open(latest_file) as f:
+                    tag = f.read().strip()
+            except (OSError, ValueError) as e:
+                # A save race (file removed mid-read), permission or decode error
+                # means we can't trust the checkpoint; fall back to from-scratch.
+                logging.warning(f"failed to read {latest_file} ({e}); treating checkpoint as incomplete")
+                return False
+            # An empty tag would make os.path.join(ckpt_dir, tag) collapse to
+            # ckpt_dir/ (always a dir), masking a half-written `latest`.
+            if not tag or not os.path.isdir(os.path.join(ckpt_dir, tag)):
+                return False
+        return True
+
+    # Respect the CLI-provided --resume_from_checkpoint (used as-is, no
+    # completeness check). Only auto-detect a checkpoint when it was not
+    # explicitly passed, and only accept a *complete* checkpoint; otherwise
+    # train from scratch.
     resume_ckpt = training_args.resume_from_checkpoint
     if not resume_ckpt and not training_args.overwrite_output_dir:
         last_ckpt = get_last_checkpoint(training_args.output_dir)
-        if last_ckpt is not None and os.path.isfile(os.path.join(last_ckpt, "trainer_state.json")):
+        if last_ckpt is not None and _is_complete_checkpoint(last_ckpt):
             resume_ckpt = last_ckpt
             logging.info(f"checkpoint found, resume training from {resume_ckpt}")
     if resume_ckpt:
