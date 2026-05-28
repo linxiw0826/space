@@ -22,6 +22,7 @@
 #   NUM_PROCESSES        — number of accelerate processes (default: 6)
 # =============================================================================
 set -e
+source "$(dirname "${BASH_SOURCE[0]}")/../env/activate.sh"
 
 # ---------------------------------------------------------------------------
 # Project root — can be overridden via env var
@@ -35,11 +36,11 @@ MODEL_SIZE=${MODEL_SIZE:-4b}
 
 case "${MODEL_SIZE}" in
     4b)
-        DEFAULT_CKPT_PATH="/home/nvme03/wlx/Space_sensing/output/train/e00b_mope_projector_only_4b"
+        DEFAULT_CKPT_PATH="${SPACE_OUTPUT_ROOT}/train/e00b_mope_projector_only_4b"
         DEFAULT_EXP_NAME="e00b_mope_projector_only_4b"
         ;;
     8b)
-        DEFAULT_CKPT_PATH="/home/nvme03/wlx/Space_sensing/output/train/e00b_mope_projector_only_8b"
+        DEFAULT_CKPT_PATH="${SPACE_OUTPUT_ROOT}/train/e00b_mope_projector_only_8b"
         DEFAULT_EXP_NAME="e00b_mope_projector_only_8b"
         ;;
     *)
@@ -63,12 +64,12 @@ VSIBENCH_VIDEO_ROOT=${VSIBENCH_VIDEO_ROOT:-/home/nvme01/wlx/Space_sensing/data/V
 VSIBENCH_JSONL=${VSIBENCH_JSONL:-/home/nvme01/wlx/Space_sensing/data/VSIBench/test.jsonl}
 
 # Results output
-RESULTS_DIR=${RESULTS_DIR:-/home/nvme03/wlx/Space_sensing/output/eval/vsibench}
+RESULTS_DIR=${RESULTS_DIR:-${SPACE_OUTPUT_ROOT}/eval/vsibench}
 OUTPUT_PATH="${RESULTS_DIR}/${EXP_NAME}"
 mkdir -p "${OUTPUT_PATH}"
 
 # Log file — independent log directory, tee'd to stdout
-LOG_DIR=${LOG_DIR:-/home/nvme03/wlx/Space_sensing/logs/eval}
+LOG_DIR=${LOG_DIR:-${SPACE_LOG_ROOT}/eval}
 mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/e00b_vsibench_${MODEL_SIZE}_$(date +%Y%m%d_%H%M%S).log"
 

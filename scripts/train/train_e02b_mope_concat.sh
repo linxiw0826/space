@@ -19,6 +19,7 @@
 #   - output_dir → e02b_mope_concat_{size}
 # =============================================================================
 set -e
+source "$(dirname "${BASH_SOURCE[0]}")/../env/activate.sh"
 
 # ---------------------------------------------------------------------------
 # Model size switch (4b default)
@@ -41,7 +42,7 @@ GUIDE_ROOT="${SPACE_ROOT}/src"
 MOPE_ROOT="${SPACE_ROOT}/src/vendor/mope"
 
 VGGT_PATH=${VGGT_PATH:-/home/nvme01/wlx/Space_sensing/models/VGGT-1B}
-GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-/home/nvme03/wlx/Space_sensing/models/guide_reproduced/4b}
+GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-${SPACE_OUTPUT_ROOT}/train/guide_reproduced/4b}
 
 # MoPE checkpoint (ep199, vitb_1 full training run)
 MOPE_CKPT_PATH=${MOPE_CKPT_PATH:-/home/nvme04/mope-jepa/output/mope_jepa_wisa7k_vitb_1/checkpoint-199.pth}
@@ -56,14 +57,14 @@ if [ "${MODEL_SIZE}" = "4b" ]; then
     batch_size=2
     grad_accum_steps=4
     DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${SPACE_ROOT}/configs/zero2.json}
-    output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/output/train/e02b_mope_concat_4b}"
+    output_dir="${OUTPUT_DIR:-${SPACE_OUTPUT_ROOT}/train/e02b_mope_concat_4b}"
     run_name="space_e02b_mope_concat_4b_lr1e-5"
 elif [ "${MODEL_SIZE}" = "8b" ]; then
     batch_size=1
     grad_accum_steps=16
     # 8B requires ZeRO-3 to fit on 8×H800 GPUs; concat adds ~784 tokens per sample.
     DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${SPACE_ROOT}/configs/zero3.json}
-    output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/output/train/e02b_mope_concat_8b}"
+    output_dir="${OUTPUT_DIR:-${SPACE_OUTPUT_ROOT}/train/e02b_mope_concat_8b}"
     run_name="space_e02b_mope_concat_8b_lr1e-5"
     echo "WARNING: 8B E-02b is experimental — monitor VRAM usage carefully." >&2
 else
@@ -74,7 +75,7 @@ fi
 # ---------------------------------------------------------------------------
 # Log directory
 # ---------------------------------------------------------------------------
-LOG_DIR=${LOG_DIR:-/home/nvme03/wlx/Space_sensing/logs/train}
+LOG_DIR=${LOG_DIR:-${SPACE_LOG_ROOT}/train}
 mkdir -p "${LOG_DIR}"
 mkdir -p "${output_dir}"
 

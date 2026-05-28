@@ -10,6 +10,7 @@
 # Log directory can be overridden via LOG_DIR env var.
 # =============================================================================
 set -e
+source "$(dirname "${BASH_SOURCE[0]}")/../env/activate.sh"
 
 # ---------------------------------------------------------------------------
 # Distributed training env
@@ -33,7 +34,7 @@ MOPE_ROOT="${SPACE_ROOT}/src/vendor/mope"
 MODEL_SIZE=${MODEL_SIZE:-4b}
 
 VGGT_PATH=${VGGT_PATH:-/home/nvme01/wlx/Space_sensing/models/VGGT-1B}
-GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-/home/nvme03/wlx/Space_sensing/output/train/guide_reproduced/4b}
+GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-${SPACE_OUTPUT_ROOT}/train/guide_reproduced/4b}
 
 CONFIGS_DIR="${SPACE_ROOT}/configs"
 
@@ -42,13 +43,13 @@ if [ "${MODEL_SIZE}" = "8b" ]; then
     batch_size=2
     grad_accum_steps=8
     DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${CONFIGS_DIR}/zero3.json}
-    output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/output/train/e01_guide_8b}"
+    output_dir="${OUTPUT_DIR:-${SPACE_OUTPUT_ROOT}/train/e01_guide_8b}"
     run_name="space_e01_guide_8b_lr1e-5"
 elif [ "${MODEL_SIZE}" = "4b" ]; then
     batch_size=2
     grad_accum_steps=4
     DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${CONFIGS_DIR}/zero2.json}
-    output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/output/train/e01_guide_4b}"
+    output_dir="${OUTPUT_DIR:-${SPACE_OUTPUT_ROOT}/train/e01_guide_4b}"
     run_name="space_e01_guide_4b_lr1e-5"
 else
     echo "ERROR: MODEL_SIZE must be '4b' or '8b', got '${MODEL_SIZE}'" >&2
@@ -84,7 +85,7 @@ lr=1e-5
 # ---------------------------------------------------------------------------
 mkdir -p "${output_dir}"
 
-LOG_DIR=${LOG_DIR:-/home/nvme03/wlx/Space_sensing/logs/train}
+LOG_DIR=${LOG_DIR:-${SPACE_LOG_ROOT}/train}
 mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/e01_guide_${MODEL_SIZE}_$(date +%Y%m%d_%H%M%S).log"
 

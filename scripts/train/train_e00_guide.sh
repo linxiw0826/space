@@ -10,6 +10,7 @@
 # 关键路径可通过 env var 覆盖（见下方 PATH CONFIG 节）。
 # =============================================================================
 set -e
+source "$(dirname "${BASH_SOURCE[0]}")/../env/activate.sh"
 
 # ---------------------------------------------------------------------------
 # Distributed training env
@@ -37,7 +38,7 @@ export LLAVA_HOUND_64K_ANN=${LLAVA_HOUND_64K_ANN:-/home/nvme01/wlx/Space_sensing
 export GUIDE_DATA_ROOT=${GUIDE_DATA_ROOT:-/home/nvme01/wlx/Space_sensing/data/guide_repro/media}
 
 # 输出路径 (nvme03，空间更大)
-output_dir=${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/output/train/guide_reproduced/4b}
+output_dir=${OUTPUT_DIR:-${SPACE_OUTPUT_ROOT}/train/guide_reproduced/4b}
 
 # ---------------------------------------------------------------------------
 # Hyperparameters
@@ -65,7 +66,7 @@ fi
 # ---------------------------------------------------------------------------
 mkdir -p "${output_dir}"
 
-LOG_DIR=${LOG_DIR:-/home/nvme03/wlx/Space_sensing/logs/train}
+LOG_DIR=${LOG_DIR:-${SPACE_LOG_ROOT}/train}
 mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/e00_guide_4b_$(date +%Y%m%d_%H%M%S).log"
 

@@ -20,6 +20,7 @@
 #   - output_dir → e02c_mope_crossattn_{size}
 # =============================================================================
 set -e
+source "$(dirname "${BASH_SOURCE[0]}")/../env/activate.sh"
 
 # ---------------------------------------------------------------------------
 # Model size switch (4b default)
@@ -57,16 +58,16 @@ if [ "${MODEL_SIZE}" = "4b" ]; then
     batch_size=2
     grad_accum_steps=4
     DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${SPACE_ROOT}/configs/zero2.json}
-    GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-/home/nvme03/wlx/Space_sensing/output/train/guide_reproduced/4b}
-    output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/output/train/e02c_mope_crossattn_4b}"
+    GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-${SPACE_OUTPUT_ROOT}/train/guide_reproduced/4b}
+    output_dir="${OUTPUT_DIR:-${SPACE_OUTPUT_ROOT}/train/e02c_mope_crossattn_4b}"
     run_name="space_e02c_mope_crossattn_4b_lr1e-5"
 elif [ "${MODEL_SIZE}" = "8b" ]; then
     batch_size=2
     grad_accum_steps=8
     # 8B requires ZeRO-3 to fit on 8x H800 GPUs
     DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${SPACE_ROOT}/configs/zero3.json}
-    GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-/home/nvme03/wlx/Space_sensing/output/train/guide_reproduced/8b}
-    output_dir="${OUTPUT_DIR:-/home/nvme03/wlx/Space_sensing/output/train/e02c_mope_crossattn_8b}"
+    GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-${SPACE_OUTPUT_ROOT}/train/guide_reproduced/8b}
+    output_dir="${OUTPUT_DIR:-${SPACE_OUTPUT_ROOT}/train/e02c_mope_crossattn_8b}"
     run_name="space_e02c_mope_crossattn_8b_lr1e-5"
 else
     echo "ERROR: Unknown MODEL_SIZE='${MODEL_SIZE}'. Must be '4b' or '8b'." >&2
@@ -76,7 +77,7 @@ fi
 # ---------------------------------------------------------------------------
 # Log directory
 # ---------------------------------------------------------------------------
-LOG_DIR=${LOG_DIR:-/home/nvme03/wlx/Space_sensing/logs/train}
+LOG_DIR=${LOG_DIR:-${SPACE_LOG_ROOT}/train}
 mkdir -p "${LOG_DIR}"
 mkdir -p "${output_dir}"
 

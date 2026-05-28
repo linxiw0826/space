@@ -14,10 +14,15 @@
 # =============================================================================
 
 # =============================================================================
+# Per-server profile (sets SPACE_ROOT, SPACE_LOG_ROOT, etc.)
+# =============================================================================
+source "$(dirname "${BASH_SOURCE[0]}")/../env/activate.sh"
+
+# =============================================================================
 # Log setup: stdout + stderr → terminal AND log file simultaneously
 # =============================================================================
 
-LOG_DIR="/home/nvme03/wlx/Space_sensing/projects/space/logs"
+LOG_DIR="${SPACE_LOG_ROOT}/preprocess"
 mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/preprocess_$(date +%Y%m%d_%H%M%S).log"
 
@@ -39,7 +44,7 @@ NUM_SAMPLES=0
 NUM_FRAMES=8
 
 # Absolute path to the Python preprocessing script
-PYTHON_SCRIPT="/home/nvme03/wlx/Space_sensing/projects/space/src/preprocess/preprocess_vsi590k.py"
+PYTHON_SCRIPT="${SPACE_ROOT}/src/preprocess/preprocess_vsi590k.py"
 
 # =============================================================================
 # Validate required variables
