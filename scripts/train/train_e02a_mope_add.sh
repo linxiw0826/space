@@ -53,7 +53,7 @@ if [ "${MODEL_SIZE}" = "4b" ]; then
 elif [ "${MODEL_SIZE}" = "8b" ]; then
     batch_size=2
     grad_accum_steps=8
-    # 8B requires ZeRO-3 to fit on 8x H800 GPUs
+    # 8B requires ZeRO-3 to fit on 8x H20 GPUs
     DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${SPACE_ROOT}/configs/zero3.json}
     output_dir="${OUTPUT_DIR:-${SPACE_OUTPUT_ROOT}/train/e02a_mope_add_8b}"
     run_name="space_e02a_mope_add_8b_lr1e-5"

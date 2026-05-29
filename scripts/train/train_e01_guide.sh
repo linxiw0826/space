@@ -39,7 +39,7 @@ GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-${SPACE_OUTPUT_ROOT}/train/guide_reproduced/4
 CONFIGS_DIR="${SPACE_ROOT}/configs"
 
 if [ "${MODEL_SIZE}" = "8b" ]; then
-    # 8B: larger model requires ZeRO-3 to fit on 8×H800
+    # 8B: larger model requires ZeRO-3 to fit on 8×H20
     batch_size=2
     grad_accum_steps=8
     DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${CONFIGS_DIR}/zero3.json}

@@ -61,7 +61,7 @@ if [ "${MODEL_SIZE}" = "4b" ]; then
 elif [ "${MODEL_SIZE}" = "8b" ]; then
     batch_size=1
     grad_accum_steps=16
-    # 8B requires ZeRO-3 to fit on 8×H800 GPUs.
+    # 8B requires ZeRO-3 to fit on 8×H20 GPUs.
     DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${SPACE_ROOT}/configs/zero3.json}
     GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-${SPACE_OUTPUT_ROOT}/train/guide_reproduced/8b}
     output_dir="${OUTPUT_DIR:-${SPACE_OUTPUT_ROOT}/train/e02d_mope_qformer_8b}"

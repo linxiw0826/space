@@ -2,7 +2,7 @@
 # =============================================================================
 # E-00: GUIDE 4B SR 复现训练
 # 从 Qwen3-VL-4B-Instruct 开始，用 spar_234k + llava_hound_64k 训练。
-# 产出：models/guide_reproduced/4b/  (~9h / 8×H800)
+# 产出：models/guide_reproduced/4b/  (~9h / 8×H20)
 #
 # Usage:
 #   bash train_e00_guide.sh

@@ -62,7 +62,7 @@ if [ "${MODEL_SIZE}" = "4b" ]; then
 elif [ "${MODEL_SIZE}" = "8b" ]; then
     batch_size=1
     grad_accum_steps=16
-    # 8B requires ZeRO-3 to fit on 8×H800 GPUs; concat adds ~784 tokens per sample.
+    # 8B requires ZeRO-3 to fit on 8×H20 GPUs; concat adds ~784 tokens per sample.
     DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${SPACE_ROOT}/configs/zero3.json}
     output_dir="${OUTPUT_DIR:-${SPACE_OUTPUT_ROOT}/train/e02b_mope_concat_8b}"
     run_name="space_e02b_mope_concat_8b_lr1e-5"
