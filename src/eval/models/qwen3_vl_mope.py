@@ -541,6 +541,110 @@ class Qwen3_VL_MoPE_CrossAttn(Qwen3_VL_MoPE):
     # No override needed — Qwen3_VL_MoPE.generate_until already uses the correct pattern.
 
 
+@register_model("qwen3_vl_mope_router")
+class Qwen3_VL_MoPE_Router(Qwen3_VL_MoPE_CrossAttn):
+    """E-10 (Router v1) inference model: Qwen3-VL + MoPE cross-attention with a
+    learned content-driven scalar gate g modulating the MoPE residual.
+
+    Identical to Qwen3_VL_MoPE_CrossAttn (E-03a) except that the projector is
+    instantiated with ``use_gate=True``.  This is a SEPARATE model type rather
+    than a flag on the crossattn class so that:
+      - the gate weights have a matching projector to load into (avoids the
+        ``load_state_dict(strict=False)`` silently dropping the gate weights and
+        the model running with an untrained / wrong-shaped gate); and
+      - we assert below that the gate weights were actually loaded from the
+        E-10 checkpoint, so a missing-gate situation fails loudly instead of
+        silently degrading to ungated routing.
+
+    The content-driven gate is automatically active at inference: the patched
+    forward sees ``input_ids`` and pools the question text to condition g
+    (see mope_patch._patch_model_for_mope_crossattn / _compute_pooled_text).
+
+    Registers model type ``qwen3_vl_mope_router`` via LMMS_EVAL_PLUGINS.
+
+    Interface:
+        __init__(pretrained, ..., mope_all_frames=8, mope_gate_mode="learned")
+        generate_until(requests) -> List[str]   [inherited from Qwen3_VL_MoPE]
+        _compute_mope_frames(visuals) -> Optional[Tensor]  [inherited]
+    """
+
+    def __init__(
+        self,
+        pretrained: str = "Qwen/Qwen3-VL-4B-Instruct",
+        mope_all_frames: int = 8,
+        mope_gate_mode: str = "learned",
+        **kwargs,
+    ) -> None:
+        # Call Qwen3_VL_MY.__init__ directly to skip the ungated crossattn MoPE
+        # setup in Qwen3_VL_MoPE_CrossAttn.__init__.
+        Qwen3_VL_MY.__init__(self, pretrained=pretrained, **kwargs)
+        self.mope_all_frames = mope_all_frames
+        self.mope_gate_mode = mope_gate_mode
+
+        inner = self._model.model
+        llm_dim = self._model.config.text_config.hidden_size
+
+        from model.mope_encoder import MoPEEncoder
+        from model.mope_projector import MoPEProjectorCrossAttn
+
+        encoder = MoPEEncoder(checkpoint_path=None, all_frames=self.mope_all_frames)
+        # E-10: gated projector — must match the checkpoint so gate weights load.
+        projector = MoPEProjectorCrossAttn(
+            mope_dim=768,
+            llm_dim=llm_dim,
+            use_gate=True,
+            gate_mode=self.mope_gate_mode,
+        )
+
+        inner.add_module("_mope_encoder", encoder)
+        inner.add_module("_mope_projector", projector)
+
+        success = _load_mope_weights_from_pretrained(inner, pretrained)
+
+        # Assert the gate weights were actually loaded — guards against the
+        # strict=False silent-drop failure mode described above.
+        if success:
+            gate_loaded = any(
+                k.startswith("_mope_projector.gate_mlp.")
+                for k, _ in inner.state_dict().items()
+            ) and any(
+                p.abs().sum().item() != 0.0
+                for n, p in inner._mope_projector.named_parameters()
+                if n.startswith("gate_mlp.")
+            )
+            if not gate_loaded:
+                raise RuntimeError(
+                    "[Qwen3_VL_MoPE_Router] gate_mlp weights are absent or all-zero "
+                    "after loading from "
+                    f"'{pretrained}'. The model type 'qwen3_vl_mope_router' REQUIRES a "
+                    "checkpoint that contains trained gate_mlp weights, i.e. an E-10 "
+                    "(gated/router) checkpoint. The provided checkpoint appears to be a "
+                    "non-gated (e.g. E-03a) checkpoint. Refusing to run, because the "
+                    "gate would fall back to its init value (g≈sigmoid(init_bias)≈0.98) "
+                    "and produce misleading routing numbers. Use an E-10 checkpoint, or "
+                    "evaluate the non-gated checkpoint with its matching model type."
+                )
+
+        ref_param = next(self._model.parameters())
+        inner._mope_encoder.to(device=ref_param.device, dtype=ref_param.dtype)
+        inner._mope_projector.to(device=ref_param.device, dtype=ref_param.dtype)
+
+        if success:
+            _patch_model_for_mope_crossattn(self._model)
+            print(
+                f"[Qwen3_VL_MoPE_Router] MoPE cross-attn + content-driven gate patch applied. "
+                f"mope_all_frames={self.mope_all_frames}, gate_mode={self.mope_gate_mode}, "
+                f"llm_dim={llm_dim}"
+            )
+        else:
+            print(
+                "[Qwen3_VL_MoPE_Router] WARNING: MoPE weights could not be loaded "
+                "— running as standard GUIDE model."
+            )
+
+    # _compute_mope_frames + generate_until inherited from Qwen3_VL_MoPE_CrossAttn.
+
+
 @register_model("qwen3_vl_mope_qformer")
 class Qwen3_VL_MoPE_QFormer(Qwen3_VL_MoPE_Concat):
     """E-02d inference model: Qwen3-VL + MoPE Q-Former fusion for lmms-eval.

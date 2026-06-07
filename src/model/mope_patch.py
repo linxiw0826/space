@@ -24,6 +24,66 @@ import types
 import torch  # noqa: F401 — required by callers that may not import torch independently
 
 
+def _compute_pooled_text(inner_model, args, kwargs):
+    """Pool the question-text token embeddings for the E-10 content-driven gate.
+
+    Extracts ``input_ids`` from the inner-model forward call (kwarg or first
+    positional arg), embeds it via ``get_input_embeddings()``, masks out the
+    visual placeholder tokens (image_token_id / video_token_id), and mean-pools
+    the remaining (text) positions per sample.
+
+    Args:
+        inner_model: the Qwen3VLModel instance (has .config and
+                     .get_input_embeddings()).
+        args:        positional args passed to the patched inner forward.
+        kwargs:      keyword args passed to the patched inner forward.
+
+    Returns:
+        pooled_text: Float tensor [B, llm_dim], or None if input_ids is
+                     unavailable (safe fallback → gate degrades to g=1).
+    """
+    # ------------------------------------------------------------------
+    # Locate input_ids: normally kwarg, fallback to first positional arg.
+    # (Qwen3VLModel.forward signature: forward(input_ids, attention_mask, ...))
+    # ------------------------------------------------------------------
+    input_ids = kwargs.get('input_ids', None)
+    if input_ids is None and len(args) > 0:
+        a0 = args[0]
+        if hasattr(a0, 'dim') and a0.dtype in (torch.long, torch.int, torch.int64, torch.int32):
+            input_ids = a0
+    if input_ids is None:
+        return None  # safe fallback — no text condition available → g=1
+
+    try:
+        embed_fn = inner_model.get_input_embeddings()
+        text_embeds = embed_fn(input_ids)                       # [B, L, llm_dim]
+
+        cfg = getattr(inner_model, 'config', None)
+        image_token_id = getattr(cfg, 'image_token_id', None)
+        video_token_id = getattr(cfg, 'video_token_id', None)
+
+        # Build a boolean mask of NON-visual (i.e. text) positions.
+        text_mask = torch.ones_like(input_ids, dtype=torch.bool)   # [B, L]
+        if image_token_id is not None:
+            text_mask &= (input_ids != image_token_id)
+        if video_token_id is not None:
+            text_mask &= (input_ids != video_token_id)
+
+        mask = text_mask.unsqueeze(-1).to(text_embeds.dtype)        # [B, L, 1]
+        denom = mask.sum(dim=1).clamp_min(1.0)                      # [B, 1]
+        pooled = (text_embeds * mask).sum(dim=1) / denom           # [B, llm_dim]
+
+        # Safety: if a sample had zero text tokens (all visual), its pooled row
+        # is meaningless; fall back to g=1 for the whole batch only when EVERY
+        # sample is degenerate. Otherwise per-sample pooled is fine (denom>=1).
+        if not text_mask.any():
+            return None
+        return pooled
+    except Exception as exc:  # robust fallback — never break the forward pass
+        print(f"[MoPE Router] _compute_pooled_text failed ({type(exc).__name__}: {exc}); gate -> g=1.")
+        return None
+
+
 def _patch_model_for_mope(model) -> None:
     """Monkey-patch inner_model.forward() to inject MoPE embeddings at inference and training.
 
@@ -316,6 +376,23 @@ def _patch_model_for_mope_crossattn(model) -> None:
         if _mope_encoder is not None and mope_frames is not None:
             original_get_image_features = self.get_image_features
 
+            # ---------------------------------------------------------------
+            # E-10 (Router v1) content-driven gate condition.
+            # Only computed when the projector actually uses a gate, so the
+            # ungated E-02c/E-03a path is byte-for-byte unchanged.
+            #
+            # pooled_text = mean over NON-image / NON-video token positions of
+            #   the text embeddings get_input_embeddings()(input_ids).  The
+            #   visual placeholder tokens MUST be masked out (they have not yet
+            #   been scattered with visual features at get_image_features time —
+            #   pooling them in would dilute the question-text condition).
+            # Shape: [B, llm_dim].  Falls back to None (g=1) if input_ids is
+            #   unavailable or a sample has no usable text positions.
+            # ---------------------------------------------------------------
+            pooled_text = None
+            if getattr(_mope_projector, 'use_gate', False):
+                pooled_text = _compute_pooled_text(self, args, kwargs)
+
             def _mope_get_image_features(pixel_values, grid_thw):
                 image_embeds_list, deepstack = original_get_image_features(pixel_values, grid_thw)
                 mope_feats = _mope_encoder(mope_frames)   # [B, N_mope, 768]
@@ -326,11 +403,22 @@ def _patch_model_for_mope_crossattn(model) -> None:
                     f"batch size ({B_mope})."
                 )
                 imgs_per_sample = n_total // B_mope
+                _use_gate = getattr(_mope_projector, 'use_gate', False)
                 new_embeds = []
                 for b in range(B_mope):
                     mf = mope_feats[b:b+1]   # [1, N_mope, 768]
+                    # Per-sample text condition for the gate, aligned to shard b.
+                    cond_b = None
+                    if _use_gate and pooled_text is not None:
+                        cond_b = pooled_text[b:b+1]   # [1, llm_dim]
                     for e in image_embeds_list[b * imgs_per_sample:(b + 1) * imgs_per_sample]:
-                        new_e = _mope_projector(mf, e.unsqueeze(0)).squeeze(0)   # [N_img_i, llm_dim]
+                        if _use_gate:
+                            new_e = _mope_projector(
+                                mf, e.unsqueeze(0), cond_text=cond_b
+                            ).squeeze(0)            # [N_img_i, llm_dim]
+                        else:
+                            # Ungated E-02c/E-03a path — identical to before.
+                            new_e = _mope_projector(mf, e.unsqueeze(0)).squeeze(0)
                         new_embeds.append(new_e)
                 return new_embeds, deepstack
 

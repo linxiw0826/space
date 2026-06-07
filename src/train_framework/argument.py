@@ -148,6 +148,22 @@ class MoPEArguments:
                           "experiments (E-03a, E-03b) where projector was pre-trained in Stage 1 "
                           "(E-00b / E-00c) and LLM is trained in Stage 2."},
     )
+    mope_use_gate: bool = field(
+        default=False,
+        metadata={"help": "E-10 (Router v1): enable the learned content-driven scalar gate g that "
+                          "modulates the MoPE cross-attention residual (image_embeds + g*out). "
+                          "Only applies when mope_fusion_mode=crossattn. Default False keeps "
+                          "E-02c/E-03a behavior byte-for-byte unchanged. The gate submodule lives "
+                          "inside MoPEProjectorCrossAttn and is trainable whenever the projector is "
+                          "(managed by --freeze_mope_projector; no separate parameter group needed)."},
+    )
+    mope_gate_mode: str = field(
+        default="learned",
+        metadata={"help": "E-10 gate mode (only used when mope_use_gate=True). "
+                          "'learned': g = sigmoid(MLP(pooled_question_text)) — content-driven main "
+                          "path (D-15 b). 'oracle_task': true static/dynamic task-label hard gate "
+                          "(E-10-oracle routing upper bound, D-15 a) — NOT implemented in this step."},
+    )
 
 
 # ---------------------------------------------------------------------------

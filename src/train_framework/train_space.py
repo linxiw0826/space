@@ -189,7 +189,19 @@ def _attach_mope_to_model(model, mope_args: MoPEArguments):
         projector = MoPEProjectorConcat(mope_dim=768, llm_dim=llm_dim)
     elif mope_args.mope_fusion_mode == "crossattn":
         from model.mope_projector import MoPEProjectorCrossAttn
-        projector = MoPEProjectorCrossAttn(mope_dim=768, llm_dim=llm_dim)
+        # E-10 (Router v1): when --mope_use_gate is set, instantiate the projector
+        # with the learned content-driven gate. The gate submodule lives inside the
+        # projector, so it is covered by `for p in projector.parameters(): requires_grad
+        # = True` below and by --freeze_mope_projector handling later, giving correct
+        # trainability in both 2-stage stages with no extra parameter group.
+        # PENDING[D-15]: gate_mode "oracle_task" (真值静/动标签硬门控 = E-10-oracle
+        # 路由上界, D-15 a) 留第二步; 本任务只实现 learned 主路径.
+        projector = MoPEProjectorCrossAttn(
+            mope_dim=768,
+            llm_dim=llm_dim,
+            use_gate=mope_args.mope_use_gate,
+            gate_mode=mope_args.mope_gate_mode,
+        )
     elif mope_args.mope_fusion_mode == "qformer":
         from model.mope_projector import MoPEProjectorQFormer
         projector = MoPEProjectorQFormer(
