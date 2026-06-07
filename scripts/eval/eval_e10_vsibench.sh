@@ -104,9 +104,16 @@ export PYTHONPATH="${GUIDE_LMMS_EVAL}:${GUIDE_TRAIN_ROOT}:${SPACE_ROOT}:${PYTHON
 # Note: mope (src/vendor/mope) is added to sys.path by mope_encoder.py at import time.
 
 # ---------------------------------------------------------------------------
-# Disable NCCL NVLS (known to cause hangs with multi-GPU lmms-eval)
+# Disable NCCL NVLS (known to cause hangs with multi-GPU lmms-eval).
+# Also disable NCCL cuMem API (new server huirui: driver 570 / CUDA 12.8 /
+# NCCL 2.28.9 falsely reports "CUDA driver version is insufficient" during
+# multi-GPU NCCL init — see train_e10_router_v1.sh for full root-cause note).
+# eval currently dodges NCCL via NUM_PROCESSES=1 single-card; these are kept
+# as no-side-effect defaults for any future multi-card eval. ${VAR:-0} so an
+# explicit env override still wins.
 # ---------------------------------------------------------------------------
-export NCCL_NVLS_ENABLE=0
+export NCCL_NVLS_ENABLE=${NCCL_NVLS_ENABLE:-0}
+export NCCL_CUMEM_ENABLE=${NCCL_CUMEM_ENABLE:-0}
 
 # ---------------------------------------------------------------------------
 # Model args — MoPE router model (qwen3_vl_mope_router), mope_all_frames=8

@@ -55,6 +55,35 @@ NPROC_PER_NODE=${NPROC_PER_NODE:-4}
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
 
 # ---------------------------------------------------------------------------
+# NCCL runtime workarounds (new server huirui: driver 570 / CUDA 12.8,
+# torch 2.6.0+cu124, NCCL 2.28.9).
+#
+# 现象：单卡 CUDA 正常（模型能上卡），仅多卡 DeepSpeed `_broadcast_model`
+#       通信阶段崩：
+#   torch.distributed.DistBackendError: NCCL error ... unhandled cuda error
+#   ncclUnhandledCudaError: Cuda failure 'CUDA driver version is insufficient
+#                           for CUDA runtime version'
+#
+# 根因：NCCL>=2.18 默认走 cuMem API 分配通信 buffer；在驱动/runtime 版本边界
+#       场景常误报 "driver insufficient" 并使 NCCL init/broadcast 失败。单卡不
+#       走 NCCL 集合通信故无此问题。关闭 cuMem 是已知无副作用修复（不动环境/
+#       不降包），优先尝试。
+#   - NCCL_CUMEM_ENABLE=0  ← 关键修复
+#   - NCCL_NVLS_ENABLE=0   ← 与 eval 脚本一致（NVLS 在多卡 lmms-eval 曾致 hang）
+#   兜底（仅当只设 CUMEM 仍崩时，逐个取消注释加上；会牺牲 NVLink/IB/SHM 速度）：
+#   - export NCCL_P2P_DISABLE=1
+#   - export NCCL_IB_DISABLE=1
+#   - export NCCL_SHM_DISABLE=1
+#   排查时可临时打开详细日志定位：export NCCL_DEBUG=INFO
+#
+# 这些 export 对后续所有多卡训练（E-11/E-13/E-14）通用——复制本 block 即可。
+# 放在训练脚本环境区而非 activate.sh：activate.sh 同时被 eval 脚本 source，
+# eval 已用 NUM_PROCESSES=1 单卡绕开 NCCL，避免全局改动影响现有 eval 路径。
+# ---------------------------------------------------------------------------
+export NCCL_CUMEM_ENABLE=${NCCL_CUMEM_ENABLE:-0}
+export NCCL_NVLS_ENABLE=${NCCL_NVLS_ENABLE:-0}
+
+# ---------------------------------------------------------------------------
 # Path configuration (override via env vars as needed)
 # ---------------------------------------------------------------------------
 SPACE_ROOT=${SPACE_ROOT:-"/home/nvme03/wlx/Space_sensing/projects/space"}
