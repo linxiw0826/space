@@ -6,13 +6,18 @@ pure letter matching: fuzzy-extract the first option letter from the model outpu
 and exact-match it against the ground-truth letter. NO LLM judge / API call.
 
 Per-sample return structure mirrors vsibench_process_results (whole-doc copy +
-prediction + accuracy) so the verification-① per-question analysis pipeline can
-be reused as-is.
+prediction + accuracy), aligned with vsibench so the verification-① per-question
+analysis pipeline can read these samples. NOTE, however, that
+``src/analysis/oracle_route_headroom.py`` defaults to VSI's wrapper key
+(``vsibench_score``) and VSI's question_type families (MCA/NA). To reuse it on
+VLM4D, pass ``--score-key vlm4d_score``; VLM4D's single question_type
+("multiple-choice") is then handled as its own flat MCA-style family
+(see oracle_route_headroom.py改动 2).
 
 PENDING[D-11]: 论文2 评测范围基本定（VSI-Bench 锚点 + VLM4D 动态主场），D-11 形式上仍 OPEN。
 
-字段名/文件结构按 HF README 推断，下载后可能微调。所有依赖确切字段名处用
-模块级常量 + TODO[verify-after-download] 注释，集中可改。
+字段名/文件结构 VERIFIED 2026-06-06（数据已下载，标注 /data2/wlx/data/VLM4D/QA/real_mc.json
+是 JSON 数组，1371 条）。所有依赖确切字段名处用模块级常量集中可改。
 """
 
 import os
@@ -24,25 +29,21 @@ import yaml
 from loguru import logger as eval_logger
 
 # -----------------------------------------------------------------------------
-# 字段名常量（下载后若 README 推断与实际不符，只改这里）
-# TODO[verify-after-download]: 确认 VLM4D 实际字段名。
-#   README 推断: id / video / question_type / question / choices(dict A-D) / answer(letter)
+# 字段名常量
+# VERIFIED 2026-06-06: 真实标注 /data2/wlx/data/VLM4D/QA/real_mc.json（JSON 数组）。
+#   每条: id / question / choices(dict A-D) / answer(选项全文) / question_type / video
+#   - answer 是正确选项的全文（不是字母），需在 choices 里反查字母作 GT。
+#   - video 是完整 HF URL，本地路径 = root + URL 中 resolve/main/ 之后的部分。
+#   - question_type 恒为 "multiple-choice"（无运动语义子类），不再用于聚合分组。
 # -----------------------------------------------------------------------------
-FIELD_VIDEO = "video"            # 视频文件名或相对路径
+FIELD_VIDEO = "video"            # 完整 HF URL（resolve/main/ 之后为本地相对路径）
 FIELD_QUESTION = "question"      # 问题文本
-FIELD_QUESTION_TYPE = "question_type"  # 运动类别: translational/rotational/action/counting/false-positive
+FIELD_QUESTION_TYPE = "question_type"  # 恒为 "multiple-choice"，无语义子类
 FIELD_CHOICES = "choices"        # dict {"A": .., "B": .., "C": .., "D": ..}
-FIELD_ANSWER = "answer"          # ground-truth 选项字母, 如 "A"
+FIELD_ANSWER = "answer"          # ground-truth 选项全文（需反查 choices 得字母）
 
-# question_type 取值（仅用于日志/兜底；聚合按数据实际出现的类别动态分组）
-# TODO[verify-after-download]: 确认 question_type 取值集合。
-VLM4D_QUESTION_TYPES = [
-    "translational",
-    "rotational",
-    "action",
-    "counting",
-    "false-positive",
-]
+# VERIFIED 2026-06-06: question_type 实际只有一个取值 "multiple-choice"，
+# 按它分组聚合会退化成单桶，故已废弃按 question_type 的分组（改为按视频来源 source）。
 
 # MCA 打分：纯字母 exact_match（无 judge）
 METRICS_FOR_MCA = {
@@ -84,13 +85,46 @@ else:
     _video_cache_dir = os.path.join(base_cache_dir, _cache_name)
 
 
+def _video_rel_path(url):
+    """从完整 HF URL 取本地相对路径。
+    VERIFIED 2026-06-06: video 字段是完整 URL，如
+      https://huggingface.co/datasets/shijiezhou/VLM4D/resolve/main/videos_real/davis/aerobatics.mp4
+    本地相对路径 = resolve/main/ 之后的部分（videos_real/davis/aerobatics.mp4）。
+    若 URL 不含该子串，兜底用 basename。
+    """
+    url = str(url)
+    if "resolve/main/" in url:
+        return url.split("resolve/main/")[-1]
+    return os.path.basename(url)
+
+
 def vlm4d_doc_to_visual(doc):
     # 参照 vsibench_doc_to_visual: media_dir + 视频相对路径。
-    # TODO[verify-after-download]: 确认 doc[FIELD_VIDEO] 是文件名还是含子目录的相对路径。
-    video_path = os.path.join(_video_cache_dir, doc[FIELD_VIDEO])
+    # VERIFIED 2026-06-06: doc[FIELD_VIDEO] 是完整 HF URL，需先转成本地相对路径。
+    rel = _video_rel_path(doc[FIELD_VIDEO])
+    video_path = os.path.join(_video_cache_dir, rel)
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"video path: {video_path} does not exist.")
     return [video_path]
+
+
+def _answer_to_letter(doc):
+    """把 answer 全文映射为选项字母。
+    VERIFIED 2026-06-06: answer 是正确选项的全文，需在 choices(dict) 里反查
+    value（去空白）等于 answer（去空白）的那个 key 作为 GT 字母。
+    找不到则返回原 answer 字符串（兜底）并 warning。
+    """
+    choices = doc[FIELD_CHOICES]
+    answer = str(doc[FIELD_ANSWER]).strip()
+    if isinstance(choices, dict):
+        for k, v in choices.items():
+            if str(v).strip() == answer:
+                return k
+    eval_logger.warning(
+        f"Could not map answer to a choice letter (answer={doc.get(FIELD_ANSWER)!r}, "
+        f"choices={choices!r}); falling back to raw answer string."
+    )
+    return answer
 
 
 def _format_choices(choices):
@@ -147,6 +181,12 @@ def exact_match(pred, target):
     return 1.0 if pred.lower() == target.lower() else 0.0
 
 
+def vlm4d_doc_to_target(doc):
+    # 供 yaml 的 doc_to_target 用（!function 引用）。返回 GT 选项字母。
+    # VERIFIED 2026-06-06: answer 是全文，需反查 choices 得字母。
+    return _answer_to_letter(doc)
+
+
 def vlm4d_process_results(doc, results):
     """对齐 vsibench_process_results 的返回结构：
     整条 doc 拷贝 + prediction + accuracy(0/1)，以便复用验证①式逐题分析。
@@ -154,7 +194,11 @@ def vlm4d_process_results(doc, results):
     """
     doc["prediction"] = results[0]
     pred_letter = fuzzy_matching(doc["prediction"])
-    target_letter = str(doc[FIELD_ANSWER]).strip()
+    # VERIFIED 2026-06-06: answer 是全文，反查 choices 得 GT 字母。
+    target_letter = _answer_to_letter(doc)
+    # 派生 source 字段（视频文件所在目录名：real 区分 davis/ego4d/youtube-vos，
+    # synthetic 为 videos_synthetic），供 aggregate 做按来源的 breakdown。
+    doc["source"] = os.path.basename(os.path.dirname(_video_rel_path(doc[FIELD_VIDEO])))
     for key, value in METRICS_FOR_MCA.items():
         try:
             doc[key] = eval(value)(pred_letter, target_letter)
@@ -164,16 +208,18 @@ def vlm4d_process_results(doc, results):
 
 
 def vlm4d_aggregate_results(results):
-    # 同 vsibench aggregate 风格: 按 question_type 分组算 accuracy, 再算 overall。
+    # VERIFIED 2026-06-06: question_type 恒为 "multiple-choice"，按它分组会退化。
+    # 改为: overall 用全体样本均值（micro），并按视频来源 source 做 breakdown。
     results = pd.DataFrame(results)
 
     output = {}
-    for question_type, question_type_indexes in results.groupby(FIELD_QUESTION_TYPE).groups.items():
-        per_question_type = results.iloc[question_type_indexes]
-        for metric in METRICS_FOR_MCA.keys():
-            output[f"{question_type}_{metric}"] = per_question_type[metric].mean()
+    # overall = 全体样本 accuracy 均值（micro）。
+    output["overall"] = results["accuracy"].mean()
 
-    # overall = 各 question_type accuracy 的均值（与 vsibench overall 同风格：对子项取平均）。
-    output["overall"] = sum([_ for _ in output.values()]) / len(output) if output else 0.0
+    # 按视频来源 breakdown。
+    for source, source_indexes in results.groupby("source").groups.items():
+        per_source = results.iloc[source_indexes]
+        output[f"{source}_accuracy"] = per_source["accuracy"].mean()
+
     eval_logger.info(f"Evaluation results: {output}")
     return output

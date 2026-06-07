@@ -60,9 +60,10 @@ GUIDE_LMMS_EVAL=${GUIDE_LMMS_EVAL:-${SPACE_ROOT}/src/vendor/lmms-eval}
 GUIDE_TRAIN_ROOT=${SPACE_ROOT}/src
 
 # VLM4D data paths (defaults point at new server /data2/wlx/data/VLM4D)
-# TODO[verify-after-download]: 确认实际视频子目录 / 标注文件名。
+# VERIFIED 2026-06-06: 标注是 QA/real_mc.json（JSON 数组）。VLM4D_JSONL 默认指向它，
+#   下面的 sed 注入到 yaml 的 4 空格缩进 "    test:" 行（.json 路径无 sed 特殊字符，安全）。
 VLM4D_VIDEO_ROOT=${VLM4D_VIDEO_ROOT:-/data2/wlx/data/VLM4D}
-VLM4D_JSONL=${VLM4D_JSONL:-/data2/wlx/data/VLM4D/vlm4d_real_mc.jsonl}
+VLM4D_JSONL=${VLM4D_JSONL:-/data2/wlx/data/VLM4D/QA/real_mc.json}
 export VLM4D_VIDEO_ROOT  # utils.py 直接从 env 读 media_dir
 
 # Inject the annotation path into the task yaml's data_files.test line so that

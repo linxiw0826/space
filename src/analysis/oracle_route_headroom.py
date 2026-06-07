@@ -13,6 +13,25 @@ picks the better model on that exact question). Aggregating these gives the
 *sub-task-level oracle = 70.33%* (which can only pick a whole model per subtask).
 Hence the per-question oracle must be >= 70.33%.
 
+Reuse on VLM4D
+--------------
+This script defaults to VSI-Bench, but is parameterized so it can also run on
+VLM4D (a flat 4-way MC benchmark whose question_type is always
+"multiple-choice"):
+  * ``--score-key`` (default ``vsibench_score``) selects the per-sample wrapper
+    dict key. For VLM4D pass ``--score-key vlm4d_score``.
+  * Unknown question_types (i.e. not in VSI's MCA/NA lists) no longer raise.
+    They each form their own standalone family scored by the MCA convention
+    (read the doc's ``"accuracy"`` key, higher-is-better). VLM4D's single
+    "multiple-choice" question_type therefore becomes one flat family, so the
+    mean-of-subtask-means ``overall`` degenerates to a plain micro mean — matching
+    ``vlm4d_aggregate_results``'s overall convention. Example::
+
+        python -m src.analysis.oracle_route_headroom \
+            --e01 .../<date>_samples_vlm4d.jsonl \
+            --e03a .../<date>_samples_vlm4d.jsonl \
+            --score-key vlm4d_score
+
 Inputs
 ------
 Two ``{date}_samples_vsibench.jsonl`` files, one per model. These are produced
@@ -133,18 +152,30 @@ class ParseError(Exception):
 # Loading & scoring
 # ---------------------------------------------------------------------------
 def _question_family(question_type: str) -> str:
-    """Return 'MCA' or 'NA' for a question_type, else raise."""
+    """Classify a question_type into a scoring family.
+
+    Returns:
+      * 'MCA'  — known VSI multiple-choice/accuracy type.
+      * 'NA'   — known VSI numerical-answer (MRA) type.
+      * 'FLAT' — any unknown question_type (e.g. VLM4D's "multiple-choice").
+                 Scored by the MCA convention (read 'accuracy', higher-is-better)
+                 and treated as its own standalone subtask family. This is
+                 tolerant by design and never raises, so the same script can run
+                 on non-VSI benchmarks. VSI's question_types are all known, so
+                 VSI never reaches this branch and its behavior is unchanged.
+    """
     if question_type in MCA_QUESTION_TYPES:
         return "MCA"
     if question_type in NA_QUESTION_TYPES:
         return "NA"
-    raise ParseError(f"Unknown question_type: {question_type!r}")
+    return "FLAT"
 
 
 def _extract_score(score_dict: dict, question_type: str, doc_id, src: str) -> float:
-    """Pull the per-question score (accuracy for MCA, MRA for NA)."""
+    """Pull the per-question score (accuracy for MCA/FLAT, MRA for NA)."""
     family = _question_family(question_type)
-    key = MCA_SCORE_KEY if family == "MCA" else NA_SCORE_KEY
+    # FLAT (unknown) families use the MCA accuracy convention.
+    key = NA_SCORE_KEY if family == "NA" else MCA_SCORE_KEY
     if key not in score_dict:
         raise ParseError(
             f"[{src}] doc_id={doc_id} question_type={question_type!r} (family "
@@ -160,10 +191,14 @@ def _extract_score(score_dict: dict, question_type: str, doc_id, src: str) -> fl
         ) from e
 
 
-def load_samples(path: str, src: str) -> Dict[int, dict]:
-    """Parse a *_samples_vsibench.jsonl into {doc_id: record}.
+def load_samples(path: str, src: str, score_key: str = "vsibench_score") -> Dict[int, dict]:
+    """Parse a *_samples_<bench>.jsonl into {doc_id: record}.
 
     record = {"question_type": str, "score": float}
+
+    ``score_key`` is the per-sample wrapper dict key holding the whole-doc +
+    prediction + score dict (default ``vsibench_score`` for VSI; pass
+    ``vlm4d_score`` for VLM4D).
 
     Corrupt lines are warned-and-skipped; structural problems on otherwise
     valid lines raise ParseError (loud, not silent).
@@ -196,16 +231,16 @@ def load_samples(path: str, src: str) -> Dict[int, dict]:
                 continue
             doc_id = obj["doc_id"]
 
-            score_dict = obj.get("vsibench_score")
+            score_dict = obj.get(score_key)
             if not isinstance(score_dict, dict):
                 raise ParseError(
                     f"[{src}] line {lineno} doc_id={doc_id}: missing/invalid "
-                    f"'vsibench_score' dict (got {type(score_dict).__name__})"
+                    f"{score_key!r} dict (got {type(score_dict).__name__})"
                 )
             qtype = score_dict.get("question_type")
             if qtype is None:
                 raise ParseError(
-                    f"[{src}] line {lineno} doc_id={doc_id}: vsibench_score has "
+                    f"[{src}] line {lineno} doc_id={doc_id}: {score_key!r} has "
                     f"no 'question_type'"
                 )
 
@@ -482,6 +517,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Path to E-03a (qwen3_vl_mope_crossattn) {date}_samples_vsibench.jsonl",
     )
     p.add_argument(
+        "--score-key", default="vsibench_score",
+        help="Per-sample wrapper dict key holding the whole-doc + prediction + "
+             "score dict. Default 'vsibench_score' (VSI-Bench). For VLM4D pass "
+             "'vlm4d_score'; its single 'multiple-choice' question_type is then "
+             "auto-handled as one flat MCA-style family, so overall == micro mean.",
+    )
+    p.add_argument(
         "--out", default=None,
         help="Optional output path. Extension decides format: .json -> JSON, "
              "anything else (e.g. .md) -> markdown. If omitted, only stdout.",
@@ -492,8 +534,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     try:
-        e01 = load_samples(args.e01, "E-01")
-        e03a = load_samples(args.e03a, "E-03a")
+        e01 = load_samples(args.e01, "E-01", args.score_key)
+        e03a = load_samples(args.e03a, "E-03a", args.score_key)
         result = compute(e01, e03a)
     except ParseError as e:
         logger.error("FATAL: %s", e)

@@ -15,17 +15,17 @@
 dataset_path: json
 dataset_kwargs:
   data_files:
-    # TODO[verify-after-download]: 确认 VLM4D 实际标注文件名/路径。
-    #   下载后标注可能是 parquet 或不同文件名；real_mc / synthetic_mc 两个 split。
+    # VERIFIED 2026-06-06: 真实标注是 QA/real_mc.json（JSON 数组, 1371 条）。
+    #   dataset_path: json + JSON 数组文件, HF datasets loader 可直接加载数组, 无需改 loader。
     #   eval 脚本通过 sed/env 注入实际路径，或直接改这里的默认值。
-    test: /data2/wlx/data/VLM4D/vlm4d_real_mc.jsonl
+    test: /data2/wlx/data/VLM4D/QA/real_mc.json
 task: vlm4d
 test_split: test
 output_type: generate_until
 process_docs: !function utils.process_docs
 doc_to_visual: !function utils.vlm4d_doc_to_visual
 doc_to_text: !function utils.vlm4d_doc_to_text
-doc_to_target: "answer"  # TODO[verify-after-download]: 确认 ground-truth 字段名为 "answer"
+doc_to_target: !function utils.vlm4d_doc_to_target  # VERIFIED 2026-06-06: answer 是选项全文, 反查 choices 得字母
 generation_kwargs:
   # MCA：只需输出一个选项字母（+可能短理由），与 vsibench MCA 同风格取小值。
   max_new_tokens: 16
@@ -44,7 +44,8 @@ lmms_eval_specific_kwargs:
     pre_prompt: ""
     mca_post_prompt: "Answer with the option's letter from the given choices directly."
 metadata:
-  # VLM4D 视频根目录。utils.py 优先读 env VLM4D_VIDEO_ROOT，其次读这里的 media_dir。
-  # TODO[verify-after-download]: 确认视频子目录结构（视频可能在 real_mc/ synthetic_mc/ 子目录）。
+  # VLM4D 视频根目录（本地视频根）。utils.py 优先读 env VLM4D_VIDEO_ROOT，其次读这里的 media_dir。
+  # VERIFIED 2026-06-06: 视频在 videos_real/{davis,ego4d,youtube-vos}/*.mp4 和 videos_synthetic/*.mp4；
+  #   doc[video] 是完整 HF URL, utils 取 resolve/main/ 之后的相对路径 join 此根目录。
   media_dir: /data2/wlx/data/VLM4D
   version: 0.0

@@ -35,7 +35,7 @@ export VSIBENCH_JSONL="/home/nvme01/wlx/Space_sensing/data/VSIBench/test.jsonl"
 
 # --- Eval data (VLM4D) -------------------------------------------------------
 # PENDING[D-11]: 论文2 评测范围基本定（VLM4D 动态主场），D-11 形式上仍 OPEN。
-# TODO[verify-after-download]: 下载 HF shijiezhou/VLM4D 后确认视频子目录 / 标注文件名。
-#   两个 split: real_mc / synthetic_mc。VLM4D_JSONL 指向其一（默认 real_mc）。
+# VERIFIED 2026-06-06: 数据已下载。标注是 QA/real_mc.json（JSON 数组, 1371 条）。
+#   视频在 VLM4D_VIDEO_ROOT/videos_real/{davis,ego4d,youtube-vos}/ 和 videos_synthetic/。
 export VLM4D_VIDEO_ROOT="/home/nvme01/wlx/Space_sensing/data/VLM4D"
-export VLM4D_JSONL="/home/nvme01/wlx/Space_sensing/data/VLM4D/vlm4d_real_mc.jsonl"
+export VLM4D_JSONL="/home/nvme01/wlx/Space_sensing/data/VLM4D/QA/real_mc.json"
