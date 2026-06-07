@@ -42,12 +42,15 @@ with open(Path(__file__).parent / "vsibench.yaml", "r") as f:
             safe_data.append(line)
 _safe_yaml = yaml.safe_load("".join(safe_data))
 
-# media_dir: yaml metadata 里指定的本地视频根目录（优先）
+# media_dir: env VSIBENCH_VIDEO_ROOT 最优先，其次 yaml metadata，最后 HF 缓存兜底
 # 兜底：HF_HOME / dataset_kwargs.cache_dir
 _metadata = _safe_yaml.get("metadata", {})
 if isinstance(_metadata, list):
     _metadata = _metadata[0] if _metadata else {}
-_media_dir = _metadata.get("media_dir", None)
+# env VSIBENCH_VIDEO_ROOT 优先（与 eval 脚本/profile 对齐），yaml metadata 次之
+_env_media_dir = os.getenv("VSIBENCH_VIDEO_ROOT", None)
+_yaml_media_dir = _metadata.get("media_dir", None)
+_media_dir = _env_media_dir or _yaml_media_dir
 if _media_dir and os.path.isdir(_media_dir):
     _video_cache_dir = _media_dir
 else:
