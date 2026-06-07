@@ -2,15 +2,33 @@
 
 服务于 D-13 取层决策（MoPE 取层 + 融合算子）。
 ================================================================================
-背景
+PENDING[D-13]: 本脚本为验证③重新设计的"运动感知特征"提供证据。D-13（MoPE 取层 +
+融合算子）仍 OPEN——取哪一层的结论必须等本脚本抽出的运动感知特征跑完 probe 后才能定。
+解除后，下游 MoPEEncoder 按选出的层 + 池化方式改造；本脚本无需改动（继续抽全层即可）。
+
+背景（为什么 2026-06-07 重新设计）
 ----
 MoPE encoder (`src/model/mope_encoder.py`) 当前只返回 transformer 末层特征
 (`modeling_pretrain.py:135-141` 的 `self.norm(x_vis)`)。本脚本用 **forward hook**
 挂在 `MoPEEncoder.encoder.blocks[i]`（每个 transformer block）上，收集**每一层**的
-block 输出，对 patch 维做 mean-pool，得到每视频每层一个 [768] 向量。配套的
-`mope_probe_layers.py`（纯 CPU）再对每层训线性探针，验证 FAIR《Interpreting
-Physics》(2602.07050) 结论是否在 MoPE 上成立——物理/方向信息是否在中层峰值、
-向输出层退化。若是，则 MoPE 应改抽中层（D-13）。
+block 输出原始 token 张量 [num_patches, 768]，再按 `--pool-mode` 池化。
+
+验证③首跑（2026-06-07）暴露的缺陷：旧逻辑对全部 784 patch（=4 时间块 × 196 空间）
+做 mean-pool＝对空间+时间同时平均 → 数学上必然抹平"方向"（空间反对称 + 时变信号）→
+左右 probe 全在 chance。本次新增 **运动感知池化**（lr-motion / temporal-diff），
+在池化时保留时间块结构和左右空间结构，让运动方向信号可被线性探针解码。
+
+Token 时空排布（reshape 的依据，已从 vendor 源码确认）
+----
+- `modeling_finetune.py:329` PatchEmbed.forward：`self.proj(x).flatten(2).transpose(1,2)`。
+  Conv3d 输出 [B, C, T', H', W']（T'=T/tubelet, H'=W'=img/patch），`flatten(2)` 按
+  **C-order（row-major）**展平最后三维 (T', H', W') → token 顺序为
+  **idx = t*(H'*W') + h*W' + w**（时间最慢、W 最快变）。
+- `modeling_pretrain.py:104-108` 进一步佐证：`num_spatial = num_patches // num_time_bins`，
+  `full_time_ids = arange(num_time_bins).repeat_interleave(num_spatial)`——time index
+  连续重复 num_spatial 次，即每个时间块的 num_spatial 个空间 token 连续排布。
+- 因此对一层的 [num_patches, 768] token，reshape 为 **[T, H, W, 768]**（C-order，
+  W 为最后/最快维），其中 left half = W∈[0, W//2)、right half = W∈[W//2, W)。
 
 ViT-B 有 12 层 block（`encoder.get_num_layers()`），MoE 在顶部 1/3
 （`moe_layer_indices = range(8, 12)`）。
@@ -31,12 +49,23 @@ false-positive）。也可用任意带运动类别标签的视频列表。
     txt 每行  ：/abs/path/clip.mp4         （无标签，--label-key 缺省时全部归 "unlabeled"）
 `--label-key` 指定取哪个字段当标签（默认 "question_type"）。
 
+池化模式（--pool-mode，每模式每层都产出 768 维，输出仍是 3D [N, n_layers, 768]）
+----
+- `spacetime-mean`（默认，向后兼容，逐字节复刻旧行为）：全部 784 patch mean → [768]。
+- `lr-motion`（给左右方向）：reshape [T,H,W,768]；每时间块 left_t=W∈[0,W//2) 空间均值、
+  right_t=W∈[W//2,W) 空间均值；asym_t = left_t - right_t；输出该不对称的时间变化
+  asym_{T-1} - asym_0（"左右质量随时间往哪挪"＝左右运动方向）。[768]
+- `temporal-diff`（给逼近/远离 looming、运动有无）：每时间块全空间均值 g_t；输出
+  g_{T-1} - g_0（整体内容随时间的变化）。[768]
+三模式共用同一份"hook 抽每层原始 token [num_patches,768]"逻辑，仅最后池化分叉。
+
 输出（写到 --out-dir）
 ----------------------
-    features.npy : float32 [N_videos, n_layers, 768]   每视频每层 mean-pool 向量
+    features.npy : float32 [N_videos, n_layers, 768]   每视频每层池化向量（按 pool-mode）
     labels.npy   : int64   [N_videos]                  标签的整数编码
     meta.json    : {n_layers, embed_dim, n_videos, video_ids, label_names,
-                    label_to_id, moe_layer_indices, all_frames, ...}
+                    label_to_id, moe_layer_indices, all_frames,
+                    pool_mode, feat_dim, token_grid={T,H,W}, ...}
 
 用法
 ----
@@ -45,6 +74,7 @@ false-positive）。也可用任意带运动类别标签的视频列表。
     python -m src.analysis.mope_layer_features \\
         --video-list /abs/path/vlm4d.jsonl \\
         --label-key question_type \\
+        --pool-mode lr-motion \\
         --out-dir /abs/path/out/mope_layer_features
 
 约束
@@ -87,10 +117,16 @@ _IMAGENET_MEAN = [0.485, 0.456, 0.406]
 _IMAGENET_STD = [0.229, 0.224, 0.225]
 _VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov", ".mkv")
 
-# PENDING[D-13]: 当前抽 ALL 12 个 block 的输出（每层一个 mean-pool 向量）以供
-# probe 定位峰值层。D-13 取层决策解除后，下游 MoPEEncoder 只需保留所选层；本脚本
-# 是为该决策提供证据，无需改动（继续抽全层即可对照）。
+# PENDING[D-13]: 当前抽 ALL 12 个 block 的输出（每层一个池化向量）以供 probe 定位
+# 峰值层。D-13 取层决策解除后，下游 MoPEEncoder 只需保留所选层 + 选定的池化方式；本
+# 脚本是为该决策提供证据，无需改动（继续抽全层即可对照）。
 PROBE_ALL_BLOCKS = True
+
+# PENDING[D-13]: 三种运动感知池化模式。spacetime-mean 是旧行为（默认，逐字节不变）；
+# lr-motion / temporal-diff 是 2026-06-07 为验证③重新设计的运动感知特征。哪种 +
+# 哪一层最能解码运动方向，是 D-13 取层结论的依据，待 probe 跑完后定。三模式每层都
+# 输出 768 维（保持与 305 样本数匹配，避免维度爆炸过拟合）。
+POOL_MODES = ("spacetime-mean", "lr-motion", "temporal-diff")
 
 
 def _sample_mope_frames(
@@ -210,18 +246,120 @@ def load_mope_encoder(ckpt_path: Optional[str], all_frames: int, device: torch.d
     return encoder
 
 
+def infer_token_grid(encoder, all_frames: int, num_patches: int) -> Tuple[int, int, int]:
+    """Infer (T, H, W) of the MoPE token grid from the encoder, not hardcoded.
+
+    Token layout confirmed from vendor source (see module docstring):
+      - num_time_bins T = all_frames // tubelet_size
+      - num_spatial   = num_patches // T  = H * W   (H == W for square frames)
+      - flatten order = C-order over (T, H, W) → idx = t*(H*W) + h*W + w
+        (modeling_finetune.py:329 flatten(2).transpose; corroborated by
+         modeling_pretrain.py:104-108 time-id repeat_interleave).
+
+    Raises a clear error if the grid cannot be inferred consistently.
+    """
+    vit = encoder.encoder
+    patch_embed = vit.patch_embed
+    tubelet = getattr(patch_embed, "tubelet_size", None)
+    if tubelet is None or tubelet <= 0:
+        raise RuntimeError(
+            f"Cannot infer token grid: tubelet_size unavailable/invalid "
+            f"(got {tubelet}). Patch embed = {type(patch_embed).__name__}."
+        )
+    if all_frames % tubelet != 0:
+        raise RuntimeError(
+            f"Cannot infer token grid: all_frames ({all_frames}) not divisible "
+            f"by tubelet_size ({tubelet})."
+        )
+    T = all_frames // tubelet
+    if T <= 0 or num_patches % T != 0:
+        raise RuntimeError(
+            f"Cannot infer token grid: num_patches ({num_patches}) not divisible "
+            f"by num_time_bins T ({T} = all_frames {all_frames} / tubelet {tubelet})."
+        )
+    num_spatial = num_patches // T
+    side = int(round(num_spatial ** 0.5))
+    if side * side != num_spatial:
+        raise RuntimeError(
+            f"Cannot infer token grid: spatial patches per time bin "
+            f"({num_spatial}) is not a perfect square; non-square frames "
+            "unsupported. Provide square H==W input."
+        )
+    H = W = side
+    if T * H * W != num_patches:
+        raise RuntimeError(
+            f"Token-grid inference inconsistent: T*H*W ({T}*{H}*{W}={T*H*W}) "
+            f"!= num_patches ({num_patches})."
+        )
+    return T, H, W
+
+
+def _pool_layer_tokens(
+    tokens: torch.Tensor, pool_mode: str, grid: Tuple[int, int, int]
+) -> torch.Tensor:
+    """Pool one layer's raw token tensor [num_patches, C] → [C] per pool_mode.
+
+    Token order is C-order over (T, H, W) (W fastest), confirmed from
+    modeling_finetune.py:329 + modeling_pretrain.py:104-108 (see module docstring).
+    All three modes return 768-d (= C).
+
+    - spacetime-mean: mean over ALL patches  → [C]   (旧行为，逐字节不变)
+    - lr-motion:      reshape [T,H,W,C]; per time-bin t:
+                        left_t  = mean over W∈[0, W//2)
+                        right_t = mean over W∈[W//2, W)
+                        asym_t  = left_t - right_t
+                      output = asym_{T-1} - asym_0        ("左右质量随时间往哪挪")
+    - temporal-diff:  reshape [T,H,W,C]; g_t = mean over all spatial (H,W);
+                      output = g_{T-1} - g_0              ("整体内容随时间变化")
+    """
+    num_patches, C = tokens.shape
+    T, H, W = grid
+
+    if pool_mode == "spacetime-mean":
+        # Byte-identical to the legacy path: mean over the patch dim.
+        return tokens.mean(dim=0)
+
+    # The motion-aware modes need the spatiotemporal grid; assert it lines up
+    # with the actual token count before any reshape.
+    assert num_patches == T * H * W, (
+        f"num_patches ({num_patches}) != T*H*W ({T}*{H}*{W}={T * H * W}); "
+        "cannot reshape to the spatiotemporal grid."
+    )
+    grid_tok = tokens.reshape(T, H, W, C)  # C-order: W fastest, then H, then T
+
+    if pool_mode == "temporal-diff":
+        g = grid_tok.mean(dim=(1, 2))      # [T, C] — per time-bin spatial mean
+        return g[T - 1] - g[0]             # [C]
+
+    if pool_mode == "lr-motion":
+        half = W // 2
+        if half == 0:
+            raise RuntimeError(
+                f"lr-motion needs W>=2 to split left/right; got W={W}."
+            )
+        left = grid_tok[:, :, :half, :].mean(dim=(1, 2))     # [T, C]
+        right = grid_tok[:, :, half:, :].mean(dim=(1, 2))    # [T, C]
+        asym = left - right                                   # [T, C]
+        return asym[T - 1] - asym[0]                          # [C]
+
+    raise ValueError(f"Unknown pool_mode: {pool_mode!r}")
+
+
 def extract_features(
     encoder,
     entries: List[Tuple[str, str, str]],
     all_frames: int,
     device: torch.device,
+    pool_mode: str,
+    grid: Tuple[int, int, int],
 ) -> Tuple[np.ndarray, List[str], List[str]]:
     """Run each video through the encoder once, collecting per-block outputs.
 
     Uses forward hooks on `encoder.encoder.blocks[i]` (the transformer blocks
-    inside PretrainVisionTransformerEncoder) to capture every layer's output
-    WITHOUT modifying vendor code. Each captured tensor is [B, N_vis, 768];
-    we mean-pool over the patch dim → [768] per layer.
+    inside PretrainVisionTransformerEncoder) to capture every layer's RAW token
+    tensor [num_patches, 768] WITHOUT modifying vendor code. Pooling is deferred
+    to `_pool_layer_tokens` (per `pool_mode`) so all three modes share the same
+    token-capture path. Each mode outputs 768-d per layer.
 
     Returns:
         features: float32 [N_ok, n_layers, 768]
@@ -248,8 +386,9 @@ def extract_features(
             # Block.forward returns the updated x_vis [B, N_vis, C].
             # Some blocks may return a tuple; take the first tensor element.
             out = output[0] if isinstance(output, (tuple, list)) else output
-            # mean-pool over patch dim (dim=1) → [B, C]; B==1 here.
-            captured[layer_idx] = out.detach().float().mean(dim=1).squeeze(0).cpu()
+            # Capture the RAW token tensor [N_vis, C] (B==1 here); pooling is
+            # deferred to _pool_layer_tokens so all pool-modes share this path.
+            captured[layer_idx] = out.detach().float().squeeze(0).cpu()
         return _hook
 
     handles = []
@@ -298,7 +437,9 @@ def extract_features(
                 )
                 continue
 
-            layer_stack = torch.stack(captured, dim=0).numpy()  # [n_layers, 768]
+            # Pool each layer's raw tokens [num_patches, C] → [C] per pool_mode.
+            pooled = [_pool_layer_tokens(c, pool_mode, grid) for c in captured]
+            layer_stack = torch.stack(pooled, dim=0).numpy()  # [n_layers, 768]
             feats.append(layer_stack.astype(np.float32))
             kept_labels.append(label)
             kept_ids.append(video_id)
@@ -349,6 +490,14 @@ def main():
         help="Number of frames sampled per video (must match MoPE all_frames; default 8).",
     )
     parser.add_argument(
+        "--pool-mode", default="spacetime-mean", choices=list(POOL_MODES),
+        help="Per-layer pooling of the raw [num_patches,768] tokens (all → 768-d): "
+             "'spacetime-mean' (default, legacy: mean over all patches), "
+             "'lr-motion' (left/right asymmetry temporal change, for 左右方向), "
+             "'temporal-diff' (global spatial-mean temporal change, for 逼近/远离/运动有无). "
+             "# PENDING[D-13]: 运动感知模式，取层结论待 probe 后定。",
+    )
+    parser.add_argument(
         "--ckpt-path", default=os.environ.get("MOPE_CKPT_PATH"),
         help="MoPE checkpoint path (default: $MOPE_CKPT_PATH). "
              "If unset, architecture-only (random weights) — for pipeline smoke test only.",
@@ -384,8 +533,16 @@ def main():
 
     encoder = load_mope_encoder(args.ckpt_path, args.all_frames, device)
 
+    # Infer the (T, H, W) token grid from the encoder (not hardcoded).
+    num_patches = int(encoder.encoder.patch_embed.num_patches)
+    T, H, W = infer_token_grid(encoder, args.all_frames, num_patches)
+    logger.info(
+        "Token grid inferred: T=%d, H=%d, W=%d (num_patches=%d); pool_mode=%s",
+        T, H, W, num_patches, args.pool_mode,
+    )
+
     features, kept_labels, kept_ids = extract_features(
-        encoder, entries, args.all_frames, device
+        encoder, entries, args.all_frames, device, args.pool_mode, (T, H, W)
     )
 
     # Encode string labels → int ids (stable, sorted for reproducibility).
@@ -400,10 +557,22 @@ def main():
     np.save(out_dir / "labels.npy", labels)
 
     vit = encoder.encoder
+    _pool_notes = {
+        "spacetime-mean": "features[:, i, :] = 第 i 个 block 输出对全部 784 patch 的 "
+                          "mean-pool（旧行为，对空间+时间同时平均）.",
+        "lr-motion": "features[:, i, :] = 第 i 个 block 的左右不对称时间变化 "
+                     "asym_{T-1}-asym_0，asym_t=left_t-right_t（W 为最快变维，"
+                     "left=W∈[0,W//2)、right=W∈[W//2,W) 的空间均值）；捕捉左右运动方向.",
+        "temporal-diff": "features[:, i, :] = 第 i 个 block 的整体内容时间变化 "
+                         "g_{T-1}-g_0，g_t=每时间块全空间均值；捕捉逼近/远离/运动有无.",
+    }
     meta = {
         "n_videos": int(features.shape[0]),
         "n_layers": int(features.shape[1]),
         "embed_dim": int(features.shape[2]),
+        "feat_dim": int(features.shape[2]),
+        "pool_mode": args.pool_mode,
+        "token_grid": {"T": int(T), "H": int(H), "W": int(W)},
         "video_ids": kept_ids,
         "label_names": label_names,
         "label_to_id": label_to_id,
@@ -411,9 +580,10 @@ def main():
         "all_frames": args.all_frames,
         "ckpt_path": args.ckpt_path,
         "moe_layer_indices": list(getattr(vit, "moe_layer_indices", []) or []),
-        "feature_pooling": "mean over patch dim (per block output)",
-        "note": "服务于 D-13 取层决策；features[:, i, :] 是第 i 个 transformer "
-                "block 输出的 patch-mean (i=0..n_layers-1, 末层最后一个).",
+        "feature_pooling": args.pool_mode,
+        # PENDING[D-13]: 取层结论待 probe 后定；note 按 pool_mode 说明该模式语义。
+        "note": "服务于 D-13 取层决策（运动感知特征，2026-06-07 重设计）。"
+                + _pool_notes.get(args.pool_mode, ""),
     }
     with (out_dir / "meta.json").open("w") as fh:
         json.dump(meta, fh, indent=2, ensure_ascii=False)
