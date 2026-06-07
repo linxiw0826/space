@@ -1,0 +1,50 @@
+# =============================================================================
+# VLM4D task (fork of vsibench MCA branch) — 4-way multiple-choice, NO LLM judge.
+# Dataset: HF `shijiezhou/VLM4D` (real_mc / synthetic_mc splits).
+# Scoring is pure letter matching (fuzzy-extract first option letter -> exact_match).
+#
+# PENDING[D-11]: 论文2 评测范围基本定（VSI-Bench 锚点 + VLM4D 动态主场），
+#   但 D-11 形式上仍为 OPEN。若评测范围调整，可能需要增/删 split 或停用本 task。
+#
+# This is the single main task. It points at one annotation jsonl via data_files.
+# To evaluate a specific split, override the data_files path (see eval scripts:
+# env VLM4D_JSONL) or create per-split copies (vlm4d_real / vlm4d_synthetic) by
+# duplicating this yaml with a different data_files.test path. Kept as one task
+# for the simplest vsibench-style structure.
+# =============================================================================
+dataset_path: json
+dataset_kwargs:
+  data_files:
+    # TODO[verify-after-download]: 确认 VLM4D 实际标注文件名/路径。
+    #   下载后标注可能是 parquet 或不同文件名；real_mc / synthetic_mc 两个 split。
+    #   eval 脚本通过 sed/env 注入实际路径，或直接改这里的默认值。
+    test: /data2/wlx/data/VLM4D/vlm4d_real_mc.jsonl
+task: vlm4d
+test_split: test
+output_type: generate_until
+process_docs: !function utils.process_docs
+doc_to_visual: !function utils.vlm4d_doc_to_visual
+doc_to_text: !function utils.vlm4d_doc_to_text
+doc_to_target: "answer"  # TODO[verify-after-download]: 确认 ground-truth 字段名为 "answer"
+generation_kwargs:
+  # MCA：只需输出一个选项字母（+可能短理由），与 vsibench MCA 同风格取小值。
+  max_new_tokens: 16
+  temperature: 0
+  top_p: 1.0
+  num_beams: 1
+  do_sample: false
+# The return value of process_results will be used by metrics
+process_results: !function utils.vlm4d_process_results
+metric_list:
+  - metric: vlm4d_score
+    aggregation: !function utils.vlm4d_aggregate_results
+    higher_is_better: true
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: ""
+    mca_post_prompt: "Answer with the option's letter from the given choices directly."
+metadata:
+  # VLM4D 视频根目录。utils.py 优先读 env VLM4D_VIDEO_ROOT，其次读这里的 media_dir。
+  # TODO[verify-after-download]: 确认视频子目录结构（视频可能在 real_mc/ synthetic_mc/ 子目录）。
+  media_dir: /data2/wlx/data/VLM4D
+  version: 0.0
