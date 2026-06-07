@@ -64,6 +64,16 @@ GUIDE_TRAIN_ROOT=${SPACE_ROOT}/src
 VSIBENCH_VIDEO_ROOT=${VSIBENCH_VIDEO_ROOT:-/home/nvme01/wlx/Space_sensing/data/VSIBench}
 VSIBENCH_JSONL=${VSIBENCH_JSONL:-/home/nvme01/wlx/Space_sensing/data/VSIBench/test.jsonl}
 
+# Inject the annotation path into the task yaml's dataset_kwargs.data_files.test
+# line so that VSIBENCH_JSONL takes effect (the yaml hardcodes an old default).
+# The data path key is nested under dataset_kwargs.data_files and is indented
+# 4 spaces ("    test: "); the trailing space in the anchor avoids matching the
+# unindented "test_split:" line.
+VSIBENCH_TASK_YAML="${GUIDE_LMMS_EVAL}/lmms_eval/tasks/vsibench/vsibench.yaml"
+if [ -f "${VSIBENCH_TASK_YAML}" ]; then
+    sed -i -E "s#^(    test: ).*#\1${VSIBENCH_JSONL}#" "${VSIBENCH_TASK_YAML}"
+fi
+
 # Results output
 RESULTS_DIR=${RESULTS_DIR:-${SPACE_OUTPUT_ROOT}/eval/vsibench}
 OUTPUT_PATH="${RESULTS_DIR}/${EXP_NAME}"
