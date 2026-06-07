@@ -24,9 +24,8 @@ set -e
 source "$(dirname "${BASH_SOURCE[0]}")/../env/activate.sh"
 
 # --- New-server runtime workarounds ---------------------------------------
-# cuDNN 9.x 在本机初始化失败(CUDNN_STATUS_NOT_INITIALIZED);原生卷积可用,关 cuDNN 绕过。
-export SPACE_DISABLE_CUDNN=1
-# 剔除被其它 conda 环境(videorepa)污染的 cuDNN 路径,避免加载到错误的 libcudnn。
+# 保护性处理:剔除其它 conda 环境(videorepa)注入 LD_LIBRARY_PATH 的路径,
+# 避免加载到错误的 libcudnn,确保使用 space 环境自带的正确 cuDNN(快路径)。
 if [ -n "${LD_LIBRARY_PATH}" ]; then
     export LD_LIBRARY_PATH="$(printf '%s' "${LD_LIBRARY_PATH}" | tr ':' '\n' | grep -v 'videorepa' | paste -sd: -)"
 fi
