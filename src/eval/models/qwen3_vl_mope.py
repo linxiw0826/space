@@ -20,6 +20,10 @@ from typing import List, Optional, Union
 import numpy as np
 import torch
 import torch.nn as nn
+import os
+# new-server cuDNN init workaround, gated by SPACE_DISABLE_CUDNN
+if os.environ.get("SPACE_DISABLE_CUDNN", "0") == "1":
+    torch.backends.cudnn.enabled = False
 from PIL import Image
 
 # ---------------------------------------------------------------------------

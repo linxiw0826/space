@@ -8,6 +8,10 @@ from typing import List, Optional, Tuple, Union
 import decord
 import numpy as np
 import torch
+import os
+# new-server cuDNN init workaround, gated by SPACE_DISABLE_CUDNN
+if os.environ.get("SPACE_DISABLE_CUDNN", "0") == "1":
+    torch.backends.cudnn.enabled = False
 from accelerate import Accelerator, DistributedType
 from loguru import logger as eval_logger
 from PIL import Image
