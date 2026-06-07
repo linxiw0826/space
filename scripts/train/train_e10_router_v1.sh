@@ -263,6 +263,7 @@ args="
     --mope_fusion_mode crossattn \
     --mope_use_gate True \
     --mope_gate_mode learned \
+    --gate_log_interval 25 \
     --mope_checkpoint_path ${MOPE_CKPT_PATH} \
     --mope_encoder_path ${MOPE_CODE_PATH} \
     --mope_all_frames 8 \

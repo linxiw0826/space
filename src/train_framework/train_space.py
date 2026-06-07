@@ -91,6 +91,92 @@ def rank0_print(*args):
 
 
 # ---------------------------------------------------------------------------
+# E-10 (Router v1) gate process logging callback.
+#
+# Zero side effects when the gate is disabled: train() only adds this callback
+# when mope_use_gate is true; even if added, the callback no-ops if it cannot
+# find a projector with a _gate_buf / use_gate. It never all-gathers (rank0 uses
+# only its LOCAL buffer), never touches model numerics, and clears _gate_buf on
+# every rank to keep memory bounded.
+# ---------------------------------------------------------------------------
+class GateStatsCallback(transformers.TrainerCallback):
+    """Periodically logs windowed statistics of the E-10 content-driven gate g.
+
+    The MoPEProjectorCrossAttn.forward stashes ``g.detach().float()`` into
+    ``projector._gate_buf`` on every training forward.  This callback drains
+    that buffer at a fixed step interval and prints one summary line via
+    ``rank0_print`` (rank0 only, into the tee'd LOG_FILE):
+
+        [E10-gate] step=<s> g_mean=.. g_std=.. g_min=.. g_max=.. n=<n> gate_grad_norm=..
+
+    ``gate_grad_norm`` is the L2 norm of the gate-MLP parameter gradients,
+    captured best-effort in ``on_pre_optimizer_step`` (grads still live there);
+    falls back to -1.0 when no grads are available.
+    """
+
+    def __init__(self, gate_log_interval: int = 25, projector=None):
+        self.gate_log_interval = max(1, int(gate_log_interval))
+        # Resolve the projector module; no-op if it has no usable gate buffer.
+        if projector is None or not hasattr(projector, "_gate_buf") \
+                or not getattr(projector, "use_gate", False):
+            self._projector = None
+        else:
+            self._projector = projector
+        self._last_gate_gnorm = -1.0
+
+    def _gate_params(self):
+        """Yield the gate-MLP parameters (empty if no gate)."""
+        proj = self._projector
+        if proj is None or not hasattr(proj, "gate_mlp"):
+            return []
+        return list(proj.gate_mlp.parameters())
+
+    def on_pre_optimizer_step(self, args, state, control, **kwargs):
+        # Grads are still populated here. Compute sum-of-squares L2 norm over the
+        # gate-MLP params; best-effort — any param with grad=None is skipped, and
+        # if none have grads we record -1.0. All local (no cross-rank comm).
+        if self._projector is None:
+            return
+        sq = 0.0
+        seen = False
+        for p in self._gate_params():
+            g = p.grad
+            if g is None:
+                continue
+            seen = True
+            sq += float(g.detach().float().pow(2).sum().item())
+        self._last_gate_gnorm = (sq ** 0.5) if seen else -1.0
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if self._projector is None:
+            return
+        gs = state.global_step
+        if not (gs < 3 or gs % self.gate_log_interval == 0):
+            return
+        buf = self._projector._gate_buf
+        # Always clear (every rank) to bound memory — independent of rank0.
+        if len(buf) == 0:
+            # Nothing accumulated this window; skip printing (no error).
+            return
+        try:
+            cat = torch.cat(buf)
+            n = int(cat.numel())
+            g_mean = cat.mean().item()
+            g_std = cat.std().item() if n > 1 else 0.0
+            g_min = cat.min().item()
+            g_max = cat.max().item()
+        finally:
+            buf.clear()
+        if local_rank == 0:
+            rank0_print(
+                f"[E10-gate] step={gs} "
+                f"g_mean={g_mean:.4f} g_std={g_std:.4f} "
+                f"g_min={g_min:.4f} g_max={g_max:.4f} "
+                f"n={n} gate_grad_norm={self._last_gate_gnorm:.4f}"
+            )
+
+
+# ---------------------------------------------------------------------------
 # Helpers (verbatim from GUIDE)
 # ---------------------------------------------------------------------------
 
@@ -683,6 +769,22 @@ def train(attn_implementation="flash_attention_2"):
     trainer = _DiagTrainer(
         model=model, processing_class=tokenizer, args=training_args, **data_module
     )
+
+    # E-10 (Router v1): attach the gate process-logging callback only when the
+    # learned content-driven gate is enabled. Zero side effects otherwise (the
+    # callback is never added, so the ungated / eval paths are untouched).
+    if mope_args.use_mope and mope_args.mope_use_gate:
+        _gate_projector = getattr(getattr(model, "model", None), "_mope_projector", None)
+        trainer.add_callback(
+            GateStatsCallback(
+                gate_log_interval=mope_args.gate_log_interval,
+                projector=_gate_projector,
+            )
+        )
+        rank0_print(
+            f"[Space Sensing] E-10 GateStatsCallback attached "
+            f"(gate_log_interval={mope_args.gate_log_interval})."
+        )
 
     def _is_complete_checkpoint(ckpt_dir):
         # An auto-detected checkpoint is only safe to resume from if it is fully

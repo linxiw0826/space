@@ -164,6 +164,14 @@ class MoPEArguments:
                           "path (D-15 b). 'oracle_task': true static/dynamic task-label hard gate "
                           "(E-10-oracle routing upper bound, D-15 a) — NOT implemented in this step."},
     )
+    gate_log_interval: int = field(
+        default=25,
+        metadata={"help": "E-10 (Router v1): step interval for the GateStatsCallback process log. "
+                          "Logs g_mean/g_std/g_min/g_max/n + gate_grad_norm every N steps (plus the "
+                          "first few steps), rank0 only, via rank0_print into the tee'd LOG_FILE. "
+                          "Only active when mope_use_gate=True; no effect otherwise (callback not added). "
+                          "Watch for [E10-gate] lines: g_std>0 and rising = the router is learning."},
+    )
 
 
 # ---------------------------------------------------------------------------

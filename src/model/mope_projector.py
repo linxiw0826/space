@@ -194,6 +194,15 @@ class MoPEProjectorCrossAttn(nn.Module):
         # (no separate optimizer/parameter group needed; trainable in both
         # 2-stage stages whenever the projector is trainable).
         # ---------------------------------------------------------------
+        # E-10 gate-value process logging buffer (GateStatsCallback reads/clears
+        # this). A plain Python list of detached fp32 1-D tensors, appended once
+        # per forward ONLY when use_gate and self.training (eval / use_gate=False
+        # never touch it). It is NOT a registered buffer/parameter, so it is
+        # invisible to state_dict / optimizer / FSDP and adds zero overhead on
+        # the disabled path. B=1 per-sample calls each append their own slice;
+        # the callback concatenates the window and clears it (all ranks clear
+        # their own buf to avoid unbounded growth).
+        self._gate_buf = []
         if self.use_gate:
             self.gate_mlp = nn.Sequential(
                 nn.Linear(llm_dim, gate_hidden),
@@ -293,6 +302,12 @@ class MoPEProjectorCrossAttn(nn.Module):
         if self.use_gate:
             # E-10: modulate the MoPE residual by a content-driven scalar gate.
             g = self._compute_gate(cond_text, out)                     # [B, 1, 1]
+            # Stash g for the process-logging callback. Only accumulate during
+            # training (eval never grows the buffer). detach()+float()+reshape
+            # to a flat fp32 1-D tensor keeps it cheap and dtype/device-agnostic;
+            # B=1 per-sample calls each append their own slice.
+            if self.training:
+                self._gate_buf.append(g.detach().float().reshape(-1))
             out = g * out
 
         return image_embeds + out
