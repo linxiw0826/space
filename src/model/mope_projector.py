@@ -13,10 +13,43 @@
 #
 # Only this module is trainable in the MoPE integration; MoPEEncoder is frozen.
 
+import os
+
 from typing import Optional
 
 import torch
 import torch.nn as nn
+
+
+def _read_gate_override() -> Optional[float]:
+    """Read the E-10 oracle-routing gate override from the environment.
+
+    Returns the constant float to force the gate g to (e.g. 0.0 = MoPE off /
+    static expert only, 1.0 = MoPE always on ≈ E-03a), or None when the env var
+    is UNSET or unparseable. When unset, the learned gate path is used exactly
+    as before — behaviour is byte-equivalent to the non-override code.
+
+    Read once at module import (the env var is fixed for the whole eval run).
+    """
+    raw = os.environ.get("E10_GATE_OVERRIDE")
+    if raw is None:
+        return None
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        print(
+            f"[E10-gate-override] WARNING: could not parse E10_GATE_OVERRIDE="
+            f"{raw!r} as float; falling back to learned gate."
+        )
+        return None
+    print(
+        f"[E10-gate-override] forcing constant g={val} (learned gate bypassed)"
+    )
+    return val
+
+
+# None when unset -> learned gate used exactly as today (no behavioural change).
+_GATE_OVERRIDE = _read_gate_override()
 
 
 class MoPEProjector(nn.Module):
@@ -249,6 +282,14 @@ class MoPEProjectorCrossAttn(nn.Module):
             g: Float tensor [B, 1, 1] broadcastable over out [B, N_img, llm_dim].
         """
         B = ref.shape[0]
+        # E-10 oracle-routing ceiling: when E10_GATE_OVERRIDE is set, ignore the
+        # learned gate_mlp entirely and force a constant g for every sample/token
+        # (g=0 -> static expert only; g=1 -> MoPE always on ≈ E-03a). Unset ->
+        # this branch is skipped and behaviour is unchanged.
+        if _GATE_OVERRIDE is not None:
+            return torch.full(
+                (B, 1, 1), _GATE_OVERRIDE, device=ref.device, dtype=ref.dtype
+            )
         if cond_text is None:
             # Safe fallback: g = 1 -> identical to ungated E-03a residual.
             return torch.ones(B, 1, 1, device=ref.device, dtype=ref.dtype)
