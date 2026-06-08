@@ -84,6 +84,33 @@ export NCCL_CUMEM_ENABLE=${NCCL_CUMEM_ENABLE:-0}
 export NCCL_NVLS_ENABLE=${NCCL_NVLS_ENABLE:-0}
 
 # ---------------------------------------------------------------------------
+# Force the pip-installed NCCL (nvidia-nccl-cu12 == 2.21.5, torch 2.6 配套版本).
+#
+# 根因修正(2026-06-07，第3轮)：报错里的 `NCCL version 2.28.9` +
+#   `Cuda failure 'driver insufficient'` 并非 pip 装错了版本——
+#   `pip show nvidia-nccl-cu12` 与纯 `python -c "import torch;print(
+#   torch.cuda.nccl.version())"` 都返回 2.21.5。问题是**库被覆盖**：训练运行时
+#   实际从系统 / LD_LIBRARY_PATH(如 /usr/local/cuda-12.8/lib64 或其它 conda env)
+#   加载到另一个 libnccl.so.2(2.28.9)，把 pip 的 2.21.5 盖掉了。纯 python 不走
+#   activate.sh 的 LD 故看到 2.21.5；训练经 activate.sh + torchrun 被系统 2.28.9
+#   抢占。**与之前 cuDNN 被 videorepa / 系统 cuda-12.8 覆盖是同一类"库覆盖"问题。**
+#
+# 修复(参照 cuDNN 用 LD_PRELOAD 强制的成功做法，最稳)：动态求出 pip 的
+#   nvidia.nccl 包 lib 目录(其中 libnccl.so.2 = 2.21.5)，用 LD_PRELOAD 强制
+#   优先加载该 so，并把该目录 prepend 到 LD_LIBRARY_PATH 双保险。路径用
+#   `python -c` 动态求，不硬编码——不同机/环境通用。仅 preload nccl 这一个 so，
+#   不误伤其它库。
+# ---------------------------------------------------------------------------
+NCCL_LIB_DIR=$(python -c "import os,nvidia.nccl;print(os.path.join(os.path.dirname(nvidia.nccl.__file__),'lib'))" 2>/dev/null)
+if [ -n "${NCCL_LIB_DIR}" ] && [ -f "${NCCL_LIB_DIR}/libnccl.so.2" ]; then
+    export LD_PRELOAD="${NCCL_LIB_DIR}/libnccl.so.2:${LD_PRELOAD}"
+    export LD_LIBRARY_PATH="${NCCL_LIB_DIR}:${LD_LIBRARY_PATH}"
+    echo "[nccl] forcing pip NCCL via LD_PRELOAD: ${NCCL_LIB_DIR}/libnccl.so.2"
+else
+    echo "[nccl] WARNING: pip nvidia-nccl-cu12 lib not found; cannot force-preload NCCL (got NCCL_LIB_DIR='${NCCL_LIB_DIR}')." >&2
+fi
+
+# ---------------------------------------------------------------------------
 # Path configuration (override via env vars as needed)
 # ---------------------------------------------------------------------------
 SPACE_ROOT=${SPACE_ROOT:-"/home/nvme03/wlx/Space_sensing/projects/space"}

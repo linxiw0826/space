@@ -116,6 +116,26 @@ export NCCL_NVLS_ENABLE=${NCCL_NVLS_ENABLE:-0}
 export NCCL_CUMEM_ENABLE=${NCCL_CUMEM_ENABLE:-0}
 
 # ---------------------------------------------------------------------------
+# Force the pip-installed NCCL (nvidia-nccl-cu12 == 2.21.5) — prevents a rogue
+# system / other-conda libnccl.so.2 (2.28.9) from shadowing pip's 2.21.5 and
+# causing `NCCL version 2.28.9` + `Cuda failure 'driver insufficient'` in
+# multi-GPU NCCL init. Same class of "library shadowing" as the cuDNN/videorepa
+# issue above; the fix mirrors the cuDNN LD_PRELOAD approach. eval currently
+# dodges NCCL via NUM_PROCESSES=1 single-card (harmless there); kept for any
+# future multi-card eval. Path is resolved dynamically via `python -c` — no
+# hardcoding, machine/env portable; only the nccl so is preloaded.
+# See train_e10_router_v1.sh for the full root-cause note.
+# ---------------------------------------------------------------------------
+NCCL_LIB_DIR=$(python -c "import os,nvidia.nccl;print(os.path.join(os.path.dirname(nvidia.nccl.__file__),'lib'))" 2>/dev/null)
+if [ -n "${NCCL_LIB_DIR}" ] && [ -f "${NCCL_LIB_DIR}/libnccl.so.2" ]; then
+    export LD_PRELOAD="${NCCL_LIB_DIR}/libnccl.so.2:${LD_PRELOAD}"
+    export LD_LIBRARY_PATH="${NCCL_LIB_DIR}:${LD_LIBRARY_PATH}"
+    echo "[nccl] forcing pip NCCL via LD_PRELOAD: ${NCCL_LIB_DIR}/libnccl.so.2"
+else
+    echo "[nccl] WARNING: pip nvidia-nccl-cu12 lib not found; cannot force-preload NCCL (got NCCL_LIB_DIR='${NCCL_LIB_DIR}')." >&2
+fi
+
+# ---------------------------------------------------------------------------
 # Model args — MoPE router model (qwen3_vl_mope_router), mope_all_frames=8
 # ---------------------------------------------------------------------------
 MODEL_ARGS="pretrained=${CKPT_PATH},max_pixels=268324,min_pixels=8192,attn_implementation=flash_attention_2,mope_all_frames=8"
