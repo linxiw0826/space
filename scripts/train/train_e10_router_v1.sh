@@ -95,19 +95,35 @@ export NCCL_NVLS_ENABLE=${NCCL_NVLS_ENABLE:-0}
 #   activate.sh 的 LD 故看到 2.21.5；训练经 activate.sh + torchrun 被系统 2.28.9
 #   抢占。**与之前 cuDNN 被 videorepa / 系统 cuda-12.8 覆盖是同一类"库覆盖"问题。**
 #
-# 修复(参照 cuDNN 用 LD_PRELOAD 强制的成功做法，最稳)：动态求出 pip 的
-#   nvidia.nccl 包 lib 目录(其中 libnccl.so.2 = 2.21.5)，用 LD_PRELOAD 强制
-#   优先加载该 so，并把该目录 prepend 到 LD_LIBRARY_PATH 双保险。路径用
-#   `python -c` 动态求，不硬编码——不同机/环境通用。仅 preload nccl 这一个 so，
-#   不误伤其它库。
+# 修复(2026-06-07，第4轮：两处坑均治)：
+#   坑1 — 旧的 `import nvidia.nccl` 定位法**静默失败**：nvidia.nccl 是
+#     namespace 包，本环境 import 不稳定 → NCCL_LIB_DIR="" → 走 else 警告分支，
+#     真正的 LD_LIBRARY_PATH prepend(line 107)从未执行。改用 **sys.prefix glob**
+#     直接找 site-packages 下的 libnccl.so.2，不依赖 import 成功，找不到优雅回退空串。
+#   坑2 — 只设 LD_PRELOAD 不够：`python -m torch.distributed.run`(torchrun)**不会
+#     可靠地把 LD_PRELOAD 传给 spawn 出来的 worker 进程**，但 **LD_LIBRARY_PATH 会
+#     被传播**。故主机制 = 把 pip nccl 目录 prepend 到 LD_LIBRARY_PATH(传得到
+#     worker)；LD_PRELOAD 仅作父进程的双保险。
+#   另：脚本**自清洗** LD_LIBRARY_PATH，剔除已知污染源(用户 ~/.bashrc 注入的
+#     /usr/local/cuda-12.8/lib64 与 videorepa cudnn 目录)，使脚本自洽、不依赖外部
+#     shell 状态。清洗必须在 prepend 之前，保证 pip 目录排在最前。
 # ---------------------------------------------------------------------------
-NCCL_LIB_DIR=$(python -c "import os,nvidia.nccl;print(os.path.join(os.path.dirname(nvidia.nccl.__file__),'lib'))" 2>/dev/null)
-if [ -n "${NCCL_LIB_DIR}" ] && [ -f "${NCCL_LIB_DIR}/libnccl.so.2" ]; then
-    export LD_PRELOAD="${NCCL_LIB_DIR}/libnccl.so.2:${LD_PRELOAD}"
-    export LD_LIBRARY_PATH="${NCCL_LIB_DIR}:${LD_LIBRARY_PATH}"
-    echo "[nccl] forcing pip NCCL via LD_PRELOAD: ${NCCL_LIB_DIR}/libnccl.so.2"
+NCCL_SO=$(python - <<'PY' 2>/dev/null
+import os, sys, glob
+cands = glob.glob(os.path.join(sys.prefix, "lib", "python*", "site-packages", "nvidia", "nccl", "lib", "libnccl.so.2"))
+print(cands[0] if cands else "")
+PY
+)
+# 自清洗：剔除会盖掉 pip nccl/cudnn 的已知污染目录(cuda-12.8 / videorepa)
+export LD_LIBRARY_PATH=$(printf '%s' "${LD_LIBRARY_PATH:-}" | tr ':' '\n' | grep -vE 'cuda-12\.8|videorepa' | paste -sd: -)
+if [ -n "${NCCL_SO}" ] && [ -f "${NCCL_SO}" ]; then
+    NCCL_LIB_DIR=$(dirname "${NCCL_SO}")
+    export LD_LIBRARY_PATH="${NCCL_LIB_DIR}:${LD_LIBRARY_PATH}"   # 主机制：torchrun 会把它传给 worker
+    export LD_PRELOAD="${NCCL_SO}:${LD_PRELOAD}"                  # 父进程双保险
+    echo "[nccl] forcing pip NCCL: ${NCCL_SO}"
+    echo "[nccl] torch.cuda.nccl.version() -> $(python -c 'import torch;print(torch.cuda.nccl.version())' 2>/dev/null)"
 else
-    echo "[nccl] WARNING: pip nvidia-nccl-cu12 lib not found; cannot force-preload NCCL (got NCCL_LIB_DIR='${NCCL_LIB_DIR}')." >&2
+    echo "[nccl] WARNING: pip nvidia-nccl-cu12 libnccl.so.2 not found via sys.prefix glob (got NCCL_SO='${NCCL_SO}'); NCCL may load a shadowed system 2.28.9." >&2
 fi
 
 # ---------------------------------------------------------------------------
