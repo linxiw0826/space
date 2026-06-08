@@ -108,12 +108,19 @@ export NCCL_NVLS_ENABLE=${NCCL_NVLS_ENABLE:-0}
 #     /usr/local/cuda-12.8/lib64 与 videorepa cudnn 目录)，使脚本自洽、不依赖外部
 #     shell 状态。清洗必须在 prepend 之前，保证 pip 目录排在最前。
 # ---------------------------------------------------------------------------
-NCCL_SO=$(python - <<'PY' 2>/dev/null
+# Known pip NCCL on this server (space conda env is fixed/user-owned). Glob is a
+# portable fallback for other hosts. Hardcoded first so a glob miss can't silently
+# leave NCCL unforced (the sys.prefix glob returned empty in-script before, causing
+# workers to load the stray system libnccl.so.2 == 2.28.9).
+NCCL_SO="${NCCL_SO:-/data1/miniconda3/envs/space/lib/python3.10/site-packages/nvidia/nccl/lib/libnccl.so.2}"
+if [ ! -f "${NCCL_SO}" ]; then
+    NCCL_SO=$(python - <<'PY' 2>/dev/null
 import os, sys, glob
-cands = glob.glob(os.path.join(sys.prefix, "lib", "python*", "site-packages", "nvidia", "nccl", "lib", "libnccl.so.2"))
-print(cands[0] if cands else "")
+c = glob.glob(os.path.join(sys.prefix, "lib", "python*", "site-packages", "nvidia", "nccl", "lib", "libnccl.so.2"))
+print(c[0] if c else "")
 PY
 )
+fi
 # 自清洗：剔除会盖掉 pip nccl/cudnn 的已知污染目录(cuda-12.8 / videorepa)
 export LD_LIBRARY_PATH=$(printf '%s' "${LD_LIBRARY_PATH:-}" | tr ':' '\n' | grep -vE 'cuda-12\.8|videorepa' | paste -sd: -)
 if [ -n "${NCCL_SO}" ] && [ -f "${NCCL_SO}" ]; then

@@ -35,6 +35,26 @@ Fusion insertion point (wraps get_image_features in model.model.forward):
   monkey-patching after model creation (see src/model/mope_patch.py).
 """
 
+# === E-10 NCCL hard-pin (must run before any torch/deepspeed import) ===========
+# A dependency import can otherwise ctypes-load the stray system libnccl.so.2
+# (2.28.9, CUDA-13 build) first, which then satisfies torch's NCCL symbols and
+# crashes multi-GPU DeepSpeed broadcast with "driver insufficient". LD_PRELOAD
+# can't fix an already-dlopen'd lib, so we dlopen the pip 2.21.5 FIRST (RTLD_GLOBAL).
+import os as _os, sys as _sys, glob as _glob, ctypes as _ctypes
+for _cand in (
+    _glob.glob(_os.path.join(_sys.prefix, "lib", "python*", "site-packages",
+                             "nvidia", "nccl", "lib", "libnccl.so.2"))
+    or ["/data1/miniconda3/envs/space/lib/python3.10/site-packages/nvidia/nccl/lib/libnccl.so.2"]
+):
+    if _os.path.isfile(_cand):
+        try:
+            _ctypes.CDLL(_cand, mode=_ctypes.RTLD_GLOBAL)
+            print(f"[E10-nccl-pin] preloaded {_cand}", flush=True)
+        except OSError as _e:
+            print(f"[E10-nccl-pin] WARN could not preload {_cand}: {_e}", flush=True)
+        break
+# ==============================================================================
+
 import os
 import logging
 import pathlib
