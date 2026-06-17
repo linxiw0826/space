@@ -12,10 +12,15 @@
 #   warmup so MI runs at full strength from step 0.
 #   A1 non-saturated gate init : --mope_gate_init_bias 0.0  (g starts ≈0.5)
 #                                 (E-10 used +4.0 → g≈0.98 saturated → collapse)
-#   v2.2 last-layer seed       : --mope_gate_lastw_std 0.5  (lastw_std=0.5 seed)
+#   v2.2 last-layer seed       : --mope_gate_lastw_std 8.0  (lastw_std=8.0 seed)
 #                                 (E-10 used 1e-3 ≈ near-zero -> logit≈0, no seed)
-#                                 init g spreads to ~0.3–0.7 -> MI has content to
-#                                 amplify and the gradient reaches W1.
+#                                 Calibrated by v2.2 first run: lastw_std=0.5 gave
+#                                 init g_std only 0.004 (seed too small, MI can't
+#                                 grab it); g_std is ~linear in lastw_std so 8.0
+#                                 lifts init g_std to ≈0.06, inside the [0.03,0.2]
+#                                 seed target -> MI has content to amplify and the
+#                                 gradient reaches W1. Still overridable via env
+#                                 GATE_LASTW_STD.
 #   A2 gate logit z-loss       : OFF (coef=0) by default. v2's always-on z-loss
 #                                 pulled the gate to the constant g=0.5; the MI
 #                                 objective is self-saturating so z-loss is now a
@@ -125,7 +130,7 @@ MOPE_CODE_PATH=${MOPE_CODE_PATH:-${SPACE_ROOT}/src/vendor/mope}
 # E-10). All overridable via env for ablations.
 # ---------------------------------------------------------------------------
 GATE_INIT_BIAS=${GATE_INIT_BIAS:-0.0}             # A1: g starts ≈0.5 (non-saturated)
-GATE_LASTW_STD=${GATE_LASTW_STD:-0.5}             # v2.2: final-layer weight init std = content seed (E-10 used 1e-3 ≈ near-zero)
+GATE_LASTW_STD=${GATE_LASTW_STD:-8.0}             # v2.2: final-layer weight init std = content seed (E-10 used 1e-3 ≈ near-zero). Calibrated by v2.2 first run: 0.5→g_std 0.004 too small, 8.0→g_std≈0.06 into [0.03,0.2] seed target; override via env GATE_LASTW_STD
 GATE_ZLOSS_COEF=${GATE_ZLOSS_COEF:-0.0}           # A2: z-loss OFF by default (set >0 to guard logit runaway)
 GATE_ENTROPY_COEF=${GATE_ENTROPY_COEF:-1e-2}      # A3: lambda_max for MI objective
 GATE_ENTROPY_WARMUP=${GATE_ENTROPY_WARMUP:-0}     # v2.2: NO warmup (MI at full strength from step 0)
