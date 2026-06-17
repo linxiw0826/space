@@ -7,11 +7,18 @@
 # only by the gate fix" is the single variable (D-17 naming):
 #   A1 non-saturated gate init : --mope_gate_init_bias 0.0  (g starts ≈0.5)
 #                                 (E-10 used +4.0 → g≈0.98 saturated → collapse)
-#   A2 gate logit z-loss       : --mope_gate_zloss_coef 1e-3   (L_z=mean(logit^2))
-#   A3 Bernoulli entropy +warmup: --mope_gate_entropy_coef 1e-2
+#   A2 gate logit z-loss       : OFF (coef=0) by default. v2's always-on z-loss
+#                                 pulled the gate to the constant g=0.5; the MI
+#                                 objective is self-saturating so z-loss is now a
+#                                 disabled optional guard (--mope_gate_zloss_coef 0.0)
+#   A3 mutual-information +warmup: --mope_gate_entropy_coef 1e-2
 #                                 --mope_gate_entropy_warmup_steps 500
+#                                 MI = marginal entropy − mean per-sample entropy
+#                                 (RIM/IMSAT form); replaces v2's Bernoulli
+#                                 batch-mean entropy, whose stable max at g=0.5
+#                                 could not pry the gate open
 #   anti-collapse master switch: --mope_gate_anticollapse True
-#   rich [gate-diag] training log: --mope_gate_diag_every 20
+#   rich [gate-diag] training log: --mope_gate_diag_every 10  (print every 10 steps)
 #
 # All new args default to E-10's status quo in argument.py, so E-03a/E-02c/E-10
 # scripts are unchanged; this script turns the fix ON explicitly.
@@ -108,10 +115,10 @@ MOPE_CODE_PATH=${MOPE_CODE_PATH:-${SPACE_ROOT}/src/vendor/mope}
 # E-10). All overridable via env for ablations.
 # ---------------------------------------------------------------------------
 GATE_INIT_BIAS=${GATE_INIT_BIAS:-0.0}             # A1: g starts ≈0.5 (non-saturated)
-GATE_ZLOSS_COEF=${GATE_ZLOSS_COEF:-1e-3}          # A2: L_z = mean(logit^2)
-GATE_ENTROPY_COEF=${GATE_ENTROPY_COEF:-1e-2}      # A3: lambda_max
+GATE_ZLOSS_COEF=${GATE_ZLOSS_COEF:-0.0}           # A2: z-loss OFF by default (set >0 to guard logit runaway)
+GATE_ENTROPY_COEF=${GATE_ENTROPY_COEF:-1e-2}      # A3: lambda_max for MI objective
 GATE_ENTROPY_WARMUP=${GATE_ENTROPY_WARMUP:-500}   # A3: T_warm (linear warm-up)
-GATE_DIAG_EVERY=${GATE_DIAG_EVERY:-20}            # change B: [gate-diag] interval
+GATE_DIAG_EVERY=${GATE_DIAG_EVERY:-10}            # change B: [gate-diag] interval (every 10 steps)
 
 # ---------------------------------------------------------------------------
 # Per-size configuration. Global batch is pinned to E-03a/E-10 (target=48 for 4B,
@@ -286,7 +293,7 @@ echo "Start ckpt   : ${GUIDE_CKPT_PATH}"
 echo "Output       : ${output_dir}"
 echo "Log          : ${LOG_FILE}"
 echo "Fusion       : crossattn + learned content-driven gate, batch=${batch_size}, accum=${grad_accum_steps}, NPROC=${NPROC_PER_NODE}, global_batch=${global_batch} (target=${TARGET_GLOBAL_BATCH})"
-echo "Gate fix     : anticollapse=True init_bias=${GATE_INIT_BIAS} zloss=${GATE_ZLOSS_COEF} entropy=${GATE_ENTROPY_COEF} warmup=${GATE_ENTROPY_WARMUP} diag_every=${GATE_DIAG_EVERY}"
+echo "Gate fix     : anticollapse=True init_bias=${GATE_INIT_BIAS} zloss=${GATE_ZLOSS_COEF}(OFF) entropy=MI(coef=${GATE_ENTROPY_COEF}) warmup=${GATE_ENTROPY_WARMUP} diag_every=${GATE_DIAG_EVERY}"
 if [ "${TRAIN_STAGE}" = "stage1" ]; then
     echo "Trainable    : MoPEProjectorCrossAttn + gate (LLM frozen, Stage 1)"
 else

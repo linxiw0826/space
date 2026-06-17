@@ -196,18 +196,26 @@ class MoPEArguments:
                           "E-10 control. Used at projector construction; no effect when mope_use_gate=False."},
     )
     mope_gate_zloss_coef: float = field(
-        default=1e-3,
-        metadata={"help": "E-10b A2: coefficient of the gate logit z-loss L_z = mean(logit^2), which "
-                          "penalises the pre-sigmoid scalar drifting to ±large (re-saturation). Added "
-                          "to the task loss only when mope_gate_anticollapse=True. Default 1e-3."},
+        default=0.0,
+        metadata={"help": "E-10b v2.1 A2: coefficient of the gate logit z-loss L_z = mean(logit^2). "
+                          "DEFAULT 0.0 = z-loss OFF. v2 added it always, but its unique minimum at "
+                          "logit=0 (g=0.5) actively pulled the gate toward the constant 0.5 and fought "
+                          "the per-sample confidence the MI objective needs, so it is now off by "
+                          "default; the MI objective is self-saturating/self-limiting. Set a small "
+                          "positive value (e.g. 1e-3) only if you observe logit runaway. Still computed "
+                          "for diagnostics (l_z_raw); added to the loss only when this coef > 0 AND "
+                          "mope_gate_anticollapse=True."},
     )
     mope_gate_entropy_coef: float = field(
         default=1e-2,
-        metadata={"help": "E-10b A3: max coefficient lambda_max of the Bernoulli batch-usage entropy "
-                          "anti-collapse term. Loss adds -lambda_t * H(g_bar) where g_bar is the batch "
-                          "mean gate and H is the binary entropy (maximising H spreads usage off the "
-                          "0/1 corners). Linearly warmed up over mope_gate_entropy_warmup_steps. "
-                          "Default 0.01. Only active when mope_gate_anticollapse=True."},
+        metadata={"help": "E-10b v2.1 A3: max coefficient lambda_max of the mutual-information (MI) "
+                          "anti-collapse term (RIM/IMSAT). Loss adds -lambda_t * MI where "
+                          "MI = H_marg - H_cond (marginal batch-usage entropy minus mean per-sample "
+                          "entropy); maximising MI drives content-dependent divergence and makes the "
+                          "all-0.5 collapse point MI's global MINIMUM (unstable saddle) instead of the "
+                          "stable max the v2 batch-mean entropy term had. Linearly warmed up over "
+                          "mope_gate_entropy_warmup_steps. Default 0.01. Only active when "
+                          "mope_gate_anticollapse=True."},
     )
     mope_gate_entropy_warmup_steps: int = field(
         default=500,
@@ -216,11 +224,12 @@ class MoPEArguments:
                           "typical single-epoch VSI-590K run). Set 0 to apply lambda_max from step 0."},
     )
     mope_gate_diag_every: int = field(
-        default=20,
+        default=10,
         metadata={"help": "E-10b change B: step interval for the rich [gate-diag] training log "
-                          "(gate value histogram, logit saturation, gate_mlp weight/grad norms, loss "
-                          "decomposition, residual ratio, optional static/dynamic g split). rank0 only, "
-                          "into the tee'd LOG_FILE. Only active when mope_use_gate=True. Default 20."},
+                          "(gate value histogram, logit saturation, gate_mlp weight norms, real "
+                          "gate_grad_norm, MI loss decomposition H_marg/H_cond/MI, residual ratio). "
+                          "rank0 only, into the tee'd LOG_FILE. Only active when mope_use_gate=True. "
+                          "Default 10 (print every 10 steps)."},
     )
 
 

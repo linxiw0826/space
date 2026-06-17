@@ -211,8 +211,15 @@ class GateStatsCallback(transformers.TrainerCallback):
 #   gate logit     : logit_mean logit_absmean (saturation monitor)
 #   gate weights   : w0_norm wlast_norm blast (content-sensitivity = is the
 #                    INPUT weight still alive — the v1 collapse smoking gun)
-#   gate grad      : gate_grad_norm (≈0 => gate not learning)
-#   loss decomp    : task_loss l_z(raw/weighted) H(raw/weighted) lambda_t
+#   gate grad      : gate_grad_norm (≈0 => gate not learning). E-10b v2.1: this
+#                    is the LIVE-GRAPH logit grad norm d(loss)/d(gate_logits),
+#                    captured by a backward hook in _gate_anticollapse_loss
+#                    (reliable under DeepSpeed ZeRO-2, unlike the param .grad
+#                    which is reduced/unavailable and gave the -1 sentinel).
+#   loss decomp    : task_loss H_marg H_cond MI MI_w lambda_t l_z(raw/weighted).
+#                    E-10b v2.1 uses a mutual-information objective (marginal
+#                    entropy − mean per-sample entropy, RIM/IMSAT); z-loss is OFF
+#                    by default (coef=0) so l_z_w=0 unless explicitly enabled.
 #   residual ratio : mean(‖g·mope_out‖/‖image_embeds‖) (branch influence)
 #   task-label split: SKIPPED — no static/dynamic label is plumbed into the
 #                    forward (would require label pass-through, which we avoid
@@ -231,17 +238,17 @@ class GateDiagCallback(transformers.TrainerCallback):
         else:
             self._projector = projector
         self._trainer_ref = trainer_ref      # set after Trainer construction
-        self._last_gate_gnorm = -1.0
         self._stage = "?"
 
     def set_trainer(self, trainer_ref):
         self._trainer_ref = trainer_ref
 
-    def _gate_params(self):
-        proj = self._projector
-        if proj is None or not hasattr(proj, "gate_mlp"):
-            return []
-        return list(proj.gate_mlp.parameters())
+    # E-10b v2.1: the gate_grad_norm printed in [gate-diag] is now the live-graph
+    # logit grad norm captured by the backward hook in _gate_anticollapse_loss and
+    # read off the trainer (trainer._last_gate_logit_gnorm). The old
+    # on_pre_optimizer_step param-grad sampler was removed because under DeepSpeed
+    # ZeRO-2 the gate_mlp param .grad is reduced/unavailable at that callback,
+    # which produced the misleading gate_grad_norm=-1 sentinel.
 
     def on_train_begin(self, args, state, control, **kwargs):
         # Stage tag: Stage 2 trains the LLM (warm-start joint); Stage 1 does not.
@@ -253,19 +260,6 @@ class GateDiagCallback(transformers.TrainerCallback):
             self._stage = "stage2" if llm_trainable else "stage1"
         except Exception:
             self._stage = "?"
-
-    def on_pre_optimizer_step(self, args, state, control, **kwargs):
-        if self._projector is None:
-            return
-        sq = 0.0
-        seen = False
-        for p in self._gate_params():
-            g = p.grad
-            if g is None:
-                continue
-            seen = True
-            sq += float(g.detach().float().pow(2).sum().item())
-        self._last_gate_gnorm = (sq ** 0.5) if seen else -1.0
 
     @staticmethod
     def _histogram(vals):
@@ -333,13 +327,22 @@ class GateDiagCallback(transformers.TrainerCallback):
 
         # Loss decomposition snapshot from the trainer (most recent micro-batch).
         gd = {}
+        gate_grad_norm = -1.0
         if self._trainer_ref is not None:
             gd = getattr(self._trainer_ref, "_gate_diag", {}) or {}
+            # E-10b v2.1: real gate-logit grad norm captured by the live-graph
+            # backward hook in _gate_anticollapse_loss (logit grad calibre, see
+            # note there). Falls back to -1 sentinel if no backward seen yet.
+            gate_grad_norm = float(
+                getattr(self._trainer_ref, "_last_gate_logit_gnorm", -1.0)
+            )
         task_loss = gd.get("task_loss", float("nan"))
         l_z_raw = gd.get("l_z_raw", float("nan"))
         l_z_w = gd.get("l_z_weighted", float("nan"))
-        H_raw = gd.get("H_raw", float("nan"))
-        H_w = gd.get("H_weighted", float("nan"))
+        H_marg = gd.get("H_marg", float("nan"))
+        H_cond = gd.get("H_cond", float("nan"))
+        MI = gd.get("MI", float("nan"))
+        MI_w = gd.get("MI_weighted", float("nan"))
         lam_t = gd.get("lambda_t", float("nan"))
 
         if local_rank == 0:
@@ -349,10 +352,11 @@ class GateDiagCallback(transformers.TrainerCallback):
                 f"g_hist[0,.1,.3,.7,.9,1]={hist} n={n} "
                 f"logit_mean={logit_mean:.4f} logit_absmean={logit_absmean:.4f} "
                 f"w0_norm={w0:.4f} wlast_norm={wlast:.4f} blast={blast:.4f} "
-                f"gate_grad_norm={self._last_gate_gnorm:.6f} "
+                f"gate_grad_norm={gate_grad_norm:.6f} "
                 f"task_loss={task_loss:.4f} "
+                f"H_marg={H_marg:.4f} H_cond={H_cond:.4f} MI={MI:.4f} "
+                f"MI_w={MI_w:.6f} lambda_t={lam_t:.6f} "
                 f"l_z_raw={l_z_raw:.6f} l_z_w={l_z_w:.6f} "
-                f"H_raw={H_raw:.4f} H_w={H_w:.6f} lambda_t={lam_t:.6f} "
                 f"resid_ratio={resid_ratio:.6f} "
                 f"axis_split=skip(no_task_labels)"
             )
@@ -939,17 +943,42 @@ def train(attn_implementation="flash_attention_2"):
             self._gate_ewarm = max(0, int(mope_args.mope_gate_entropy_warmup_steps))
             # Last-window diagnostic snapshot for GateDiagCallback to print.
             self._gate_diag = {}
+            # E-10b v2.1: real gate-logit grad norm captured by the backward hook
+            # registered in _gate_anticollapse_loss (change 2). -1 = not yet seen.
+            self._last_gate_logit_gnorm = -1.0
 
         def _gate_anticollapse_loss(self, base_loss):
-            """E-10b: build the gate anti-collapse loss bundle on the live graph.
+            """E-10b v2.1: build the gate anti-collapse loss bundle on the live graph.
 
             Drains projector._gate_logit_graph_buf (one live-graph fp32 logit per
-            cross-attn forward this micro-batch) and computes, with gradients:
+            cross-attn forward this micro-batch) and computes, with gradients, a
+            MUTUAL-INFORMATION objective (RIM/IMSAT form) plus an OPTIONAL weak
+            z-loss guard:
 
-              A2 z-loss        : L_z = mean(logit^2)                    [* zloss_coef]
-              A3 Bernoulli ent : maximise H(g_bar), g_bar = mean(sigmoid(logit))
-                                 added as  -lambda_t * H(g_bar)
-                                 lambda_t = entropy_coef * min(1, step/T_warm)
+              MI (maximised)   : MI = H_marg - H_cond
+                  H_marg  = binary entropy of g_bar = mean(sigmoid(logit))
+                            (marginal / batch-usage entropy)
+                  H_cond  = mean over samples of the per-sample binary entropy
+                            of g_i = sigmoid(logit_i)  (conditional entropy)
+                  -> loss term = -lambda_t * MI         (maximise MI)
+                     lambda_t  = entropy_coef * min(1, step/T_warm)
+                  At the all-0.5 collapse point MI = 0 (its GLOBAL MINIMUM /
+                  unstable saddle), so the MI gradient pushes the gate AWAY from
+                  the constant g=0.5 — every sample sharpens (H_cond down) while
+                  batch usage stays spread (H_marg up) => content-dependent
+                  divergence. This replaces the v2 batch-mean entropy term, whose
+                  stable max at g_bar=0.5 had zero gradient and could not pry the
+                  gate open.
+
+              z-loss (guard)   : L_z = mean(logit^2). DEFAULT OFF. Only added to
+                  the loss when mope_gate_zloss_coef > 0. v2 added it always and
+                  its unique minimum at logit=0 (g=0.5) actively pulled the gate
+                  TOWARD the constant 0.5, fighting the per-sample confidence the
+                  MI term needs. Kept for diagnostics (l_z_raw) regardless.
+
+            Also registers a backward hook on the live-graph logits tensor so the
+            GateDiagCallback can report a real, non-negative gate_grad_norm (see
+            note at the hook below).
 
             Returns (extra_loss_tensor_or_None, diag_dict). When the gate is
             disabled / anti-collapse off / no logits were stashed, returns
@@ -971,14 +1000,47 @@ def train(attn_implementation="flash_attention_2"):
             if not self._gate_ac:
                 return None, {}
 
-            # A2: logit z-loss — penalise drift to ±large (re-saturation).
+            # --- gate_grad_norm instrumentation (change 2) -------------------
+            # Register a hook on the LIVE-GRAPH logits tensor. On backward this
+            # fires with grad = d(total_loss)/d(gate_logits); we stash its norm
+            # on the trainer for GateDiagCallback to print as gate_grad_norm.
+            # CALIBRE: this is the *logit* gradient norm (signal arriving AT the
+            # gate output), NOT the gate_mlp *parameter* gradient norm. We use it
+            # because under DeepSpeed ZeRO-2 the gate_mlp param .grad is reduced /
+            # may be unavailable at on_pre_optimizer_step (yielding the -1
+            # sentinel); the activation-level grad of the live logits tensor is
+            # always populated during backward, before any partition/reduce, so
+            # it is a reliable, real measure of whether the gate is receiving
+            # gradient. A non-zero value => the gate is being driven by the loss.
+            if logits.requires_grad:
+                def _logit_grad_hook(grad):
+                    try:
+                        self._last_gate_logit_gnorm = float(
+                            grad.detach().float().norm().item()
+                        )
+                    except Exception:
+                        self._last_gate_logit_gnorm = -1.0
+                    return None
+                logits.register_hook(_logit_grad_hook)
+
+            # z-loss (diagnostic always; added to loss only if coef > 0).
             l_z = (logits ** 2).mean()
 
-            # A3: Bernoulli batch-usage entropy. g_bar = mean gate over the batch;
-            # clamp to [1e-6, 1-1e-6] before log for numerical stability.
+            # All entropy/MI math in fp32 (logits already fp32). Clamp before log.
             g = torch.sigmoid(logits)
+
+            # Marginal (batch-usage) entropy: H_marg = H(g_bar).
             g_bar = g.mean().clamp(1e-6, 1.0 - 1e-6)
-            H = -(g_bar * torch.log(g_bar) + (1.0 - g_bar) * torch.log(1.0 - g_bar))
+            H_marg = -(g_bar * torch.log(g_bar)
+                       + (1.0 - g_bar) * torch.log(1.0 - g_bar))
+
+            # Conditional (per-sample) entropy: mean_i H(g_i).
+            g_c = g.clamp(1e-6, 1.0 - 1e-6)
+            H_cond_i = -(g_c * torch.log(g_c) + (1.0 - g_c) * torch.log(1.0 - g_c))
+            H_cond = H_cond_i.mean()
+
+            # Mutual information in [0, ln2]; 0 at the all-0.5 collapse point.
+            MI = H_marg - H_cond
 
             # Linear warm-up of lambda_t.
             step = float(self.state.global_step)
@@ -988,16 +1050,26 @@ def train(attn_implementation="flash_attention_2"):
                 warm = 1.0
             lam_t = self._gate_ec * warm
 
-            zloss_term = self._gate_zc * l_z
-            ent_term = -lam_t * H            # maximise H => subtract it
-            extra = (zloss_term + ent_term).to(base_loss.dtype)
+            # Entropy term: maximise MI => subtract lam_t * MI.
+            ent_term = -lam_t * MI
+            extra = ent_term
+            # z-loss guard: OFF by default (coef=0). Only add when coef > 0.
+            if self._gate_zc > 0.0:
+                zloss_term = self._gate_zc * l_z
+                extra = extra + zloss_term
+                l_z_weighted = float(zloss_term.detach().float().item())
+            else:
+                l_z_weighted = 0.0
+            extra = extra.to(base_loss.dtype)
 
             diag = {
                 "task_loss": float(base_loss.detach().float().item()),
                 "l_z_raw": float(l_z.detach().float().item()),
-                "l_z_weighted": float(zloss_term.detach().float().item()),
-                "H_raw": float(H.detach().float().item()),
-                "H_weighted": float((lam_t * H).detach().float().item()),
+                "l_z_weighted": l_z_weighted,
+                "H_marg": float(H_marg.detach().float().item()),
+                "H_cond": float(H_cond.detach().float().item()),
+                "MI": float(MI.detach().float().item()),
+                "MI_weighted": float((lam_t * MI).detach().float().item()),
                 "lambda_t": float(lam_t),
                 "n_logits": int(logits.numel()),
             }
