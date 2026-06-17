@@ -173,6 +173,56 @@ class MoPEArguments:
                           "Watch for [E10-gate] lines: g_std>0 and rising = the router is learning."},
     )
 
+    # -----------------------------------------------------------------------
+    # E-10b (Router v1.1): gate anti-collapse three-piece fix + diagnostics.
+    # All default to the E-10 status quo, so existing E-03a/E-02c/E-10 scripts
+    # are byte-for-byte unchanged. The E-10b train script turns them on
+    # explicitly via --mope_gate_anticollapse True (+ the three coefs).
+    # PENDING[D-15]: gate input is still content-driven (b); the anti-collapse
+    # terms only regularise that learned scalar — no task-label supervision.
+    # -----------------------------------------------------------------------
+    mope_gate_anticollapse: bool = field(
+        default=False,
+        metadata={"help": "E-10b: enable the gate anti-collapse loss bundle (z-loss + Bernoulli "
+                          "entropy with linear warm-up). Default False = E-10 status quo (no extra "
+                          "loss). Only takes effect when mope_use_gate=True. The E-10b train script "
+                          "sets this True; E-03a/E-02c/E-10 leave it False (unchanged behaviour)."},
+    )
+    mope_gate_init_bias: float = field(
+        default=0.0,
+        metadata={"help": "E-10b A1: final-layer bias init of the gate MLP. Default 0.0 -> g starts "
+                          "≈0.5 (sigmoid slope maximal, non-saturated). The E-10 collapse-prone value "
+                          "was +4.0 (g≈0.98 saturated); set --mope_gate_init_bias 4.0 to reproduce the "
+                          "E-10 control. Used at projector construction; no effect when mope_use_gate=False."},
+    )
+    mope_gate_zloss_coef: float = field(
+        default=1e-3,
+        metadata={"help": "E-10b A2: coefficient of the gate logit z-loss L_z = mean(logit^2), which "
+                          "penalises the pre-sigmoid scalar drifting to ±large (re-saturation). Added "
+                          "to the task loss only when mope_gate_anticollapse=True. Default 1e-3."},
+    )
+    mope_gate_entropy_coef: float = field(
+        default=1e-2,
+        metadata={"help": "E-10b A3: max coefficient lambda_max of the Bernoulli batch-usage entropy "
+                          "anti-collapse term. Loss adds -lambda_t * H(g_bar) where g_bar is the batch "
+                          "mean gate and H is the binary entropy (maximising H spreads usage off the "
+                          "0/1 corners). Linearly warmed up over mope_gate_entropy_warmup_steps. "
+                          "Default 0.01. Only active when mope_gate_anticollapse=True."},
+    )
+    mope_gate_entropy_warmup_steps: int = field(
+        default=500,
+        metadata={"help": "E-10b A3: linear warm-up length T_warm for the entropy coefficient: "
+                          "lambda_t = lambda_max * min(1, step / T_warm). Default 500 (~10%% of a "
+                          "typical single-epoch VSI-590K run). Set 0 to apply lambda_max from step 0."},
+    )
+    mope_gate_diag_every: int = field(
+        default=20,
+        metadata={"help": "E-10b change B: step interval for the rich [gate-diag] training log "
+                          "(gate value histogram, logit saturation, gate_mlp weight/grad norms, loss "
+                          "decomposition, residual ratio, optional static/dynamic g split). rank0 only, "
+                          "into the tee'd LOG_FILE. Only active when mope_use_gate=True. Default 20."},
+    )
+
 
 # ---------------------------------------------------------------------------
 # DataArguments  (verbatim copy from GUIDE — do not modify)

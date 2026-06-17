@@ -1,15 +1,18 @@
 #!/bin/bash
 # =============================================================================
-# Evaluate E-10 (Router v1: CrossAttn + learned content-driven gate) on VLM4D
-# Model type: qwen3_vl_mope_router
-# (forked from eval_e03a_vlm4d.sh — only the model type + ckpt/exp names differ).
+# Evaluate E-10b (Router v1.1 gatefix: CrossAttn + learned content-driven gate +
+# anti-collapse) on VLM4D. Model type: qwen3_vl_mope_router (UNCHANGED — the gate
+# fix is training-only; the eval model class is the same as E-10).
+# (forked from eval_e10_vlm4d.sh — only the ckpt/exp/output names differ. The
+#  E10_GATE_LOG g-log is default-ON and now ALSO records per-question
+#  ‖mope_out‖ / ‖image_embeds‖ / residual ratio — see change C.)
 #
 # VLM4D: 4-way multiple-choice motion benchmark, pure letter matching, no judge.
 #
 # PENDING[D-11]: 论文2 评测范围基本定（VLM4D 动态主场），D-11 形式上仍 OPEN。
 #
 # Usage:
-#   bash eval_e10_vlm4d.sh [CKPT_PATH] [EXP_NAME]
+#   bash eval_e10b_vlm4d.sh [CKPT_PATH] [EXP_NAME]
 #
 # Env vars (all optional, have defaults):
 #   MODEL_SIZE           — model size to evaluate: "4b" or "8b" (default: 4b)
@@ -44,12 +47,12 @@ MODEL_SIZE=${MODEL_SIZE:-4b}
 
 case "${MODEL_SIZE}" in
     4b)
-        DEFAULT_CKPT_PATH="${SPACE_OUTPUT_ROOT}/train/e10_router_v1_4b"
-        DEFAULT_EXP_NAME="e10_router_v1_4b_vlm4d"
+        DEFAULT_CKPT_PATH="${SPACE_OUTPUT_ROOT}/train/e10b_router_v1_4b"
+        DEFAULT_EXP_NAME="e10b_router_v1_4b_vlm4d"
         ;;
     8b)
-        DEFAULT_CKPT_PATH="${SPACE_OUTPUT_ROOT}/train/e10_router_v1_8b"
-        DEFAULT_EXP_NAME="e10_router_v1_8b_vlm4d"
+        DEFAULT_CKPT_PATH="${SPACE_OUTPUT_ROOT}/train/e10b_router_v1_8b"
+        DEFAULT_EXP_NAME="e10b_router_v1_8b_vlm4d"
         ;;
     *)
         echo "ERROR: MODEL_SIZE must be '4b' or '8b', got '${MODEL_SIZE}'"
@@ -106,7 +109,7 @@ export E10_GATE_LOG="${E10_GATE_LOG-${OUTPUT_PATH}/gate_log_learned.jsonl}"
 # Log file
 LOG_DIR=${LOG_DIR:-${SPACE_LOG_ROOT}/eval}
 mkdir -p "${LOG_DIR}"
-LOG_FILE="${LOG_DIR}/e10_vlm4d_${MODEL_SIZE}_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="${LOG_DIR}/e10b_vlm4d_${MODEL_SIZE}_$(date +%Y%m%d_%H%M%S).log"
 
 # GPU configuration
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
@@ -135,7 +138,7 @@ MODEL_ARGS="pretrained=${CKPT_PATH},max_pixels=268324,min_pixels=8192,attn_imple
 # ---------------------------------------------------------------------------
 # Status output
 # ---------------------------------------------------------------------------
-echo "=== VLM4D Evaluation (E-10 Router v1: CrossAttn + learned gate) ==="
+echo "=== VLM4D Evaluation (E-10b Router v1.1 gatefix: CrossAttn + learned gate + anti-collapse) ==="
 echo "Model size : ${MODEL_SIZE}"
 echo "Checkpoint : ${CKPT_PATH}"
 echo "Experiment : ${EXP_NAME}"

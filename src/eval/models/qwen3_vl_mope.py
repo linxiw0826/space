@@ -642,7 +642,222 @@ class Qwen3_VL_MoPE_Router(Qwen3_VL_MoPE_CrossAttn):
                 "— running as standard GUIDE model."
             )
 
-    # _compute_mope_frames + generate_until inherited from Qwen3_VL_MoPE_CrossAttn.
+    # _compute_mope_frames inherited from Qwen3_VL_MoPE_CrossAttn.
+    #
+    # generate_until OVERRIDDEN below to add the two E-10 eval diagnostics:
+    #   ① per-question gate-value (g) logging  — VSI + VLM4D
+    #   ② VSI oracle hard-gating by static/dynamic task label  — VSI only
+    # Both are pure-inference; learned mode (GATE_MODE unset/=learned) keeps the
+    # inherited behaviour byte-for-byte (no oracle sidecar set; g-log is a passive
+    # read-out that never alters numerics).
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # VSI static/dynamic task axis (D-15 oracle = task-label gating).
+    # Source: lmms_eval/tasks/vsibench/utils.py — MCA_QUESTION_TYPES are the
+    # dynamic subtasks (rel direction/distance, route planning, appearance
+    # order), NA_QUESTION_TYPES are the static metric subtasks (abs distance,
+    # counting, size, room size). The doc's question_type for rel_direction is
+    # suffixed _easy/_medium/_hard, so we match by prefix for robustness.
+    # ------------------------------------------------------------------
+    _VSI_DYNAMIC_SUBTASKS = (
+        "object_rel_direction",   # matches _easy/_medium/_hard via prefix
+        "object_rel_distance",
+        "route_planning",
+        "obj_appearance_order",
+    )
+    _VSI_STATIC_SUBTASKS = (
+        "object_abs_distance",
+        "object_counting",
+        "object_size_estimation",
+        "room_size_estimation",
+    )
+
+    @staticmethod
+    def _vsi_is_dynamic(question_type):
+        """Return True if a VSI question_type is on the DYNAMIC axis, False if
+        STATIC, or None if the type is unrecognised (oracle then skips it)."""
+        if question_type is None:
+            return None
+        qt = str(question_type)
+        if any(qt.startswith(d) for d in Qwen3_VL_MoPE_Router._VSI_DYNAMIC_SUBTASKS):
+            return True
+        if qt in Qwen3_VL_MoPE_Router._VSI_STATIC_SUBTASKS:
+            return False
+        return None
+
+    @staticmethod
+    def _vlm4d_source(doc):
+        """Derive the VLM4D video source (ego4d / davis / youtube-vos /
+        videos_synthetic) from the doc's video URL — mirrors the ``source``
+        field that vlm4d_process_results computes (dir name of the local
+        relative path). Returns None if the field is absent."""
+        try:
+            import os as _os
+            video = doc.get("video")
+            if video is None:
+                return None
+            url = str(video)
+            rel = url.split("resolve/main/")[-1] if "resolve/main/" in url else _os.path.basename(url)
+            return _os.path.basename(_os.path.dirname(rel))
+        except Exception:
+            return None
+
+    def _gate_log_path(self):
+        """Per-rank gate-log output path, or None when logging is disabled.
+
+        Set via env ``E10_GATE_LOG`` (the eval scripts export it). Each rank
+        writes its own file (``<base>.rank{r}.jsonl``) to avoid concurrent-write
+        clobbering under accelerate data parallelism; merge across ranks after
+        the run with a simple cat (doc_id is the alignment key)."""
+        import os as _os
+        base = _os.environ.get("E10_GATE_LOG")
+        if not base:
+            return None
+        root, ext = _os.path.splitext(base)
+        if not ext:
+            ext = ".jsonl"
+        return f"{root}.rank{self._rank}{ext}"
+
+    def generate_until(self, requests: list) -> List[str]:
+        """E-10 router eval loop: inject MoPE frames (sidecar, inherited pattern)
+        + optionally force the oracle gate (② VSI only) + log per-question g (①).
+
+        GATE_MODE env: "learned" (default) | "oracle".
+          - learned: gate runs from the trained gate_mlp; no override. Identical
+            numerics to the inherited crossattn/router path.
+          - oracle : VSI only — g is hard-set to 1.0 for dynamic subtasks and 0.0
+            for static subtasks (per the VSI static/dynamic task axis). For
+            non-VSI tasks (e.g. VLM4D) or unrecognised subtasks, no override is
+            applied (falls back to the learned gate) — VLM4D has no clean
+            static/dynamic task axis, so ② is VSI-only by design.
+        """
+        import json
+        import os as _os
+        from tqdm import tqdm
+
+        gate_mode = _os.environ.get("GATE_MODE", "learned").strip().lower()
+        log_path = self._gate_log_path()
+        if log_path is not None:
+            _os.makedirs(_os.path.dirname(log_path) or ".", exist_ok=True)
+
+        inner = self._model.model
+        projector = getattr(inner, "_mope_projector", None)
+
+        # E-10b change C: enable the per-forward residual diagnostics on the
+        # projector ONLY when g-logging is on. When E10_GATE_LOG is unset the
+        # projector's _eval_resid_active stays False and the default learned-eval
+        # path is byte-for-byte identical to E-10 (no extra norm computation).
+        if projector is not None and hasattr(projector, "_eval_resid_active"):
+            projector._eval_resid_active = log_path is not None
+
+        results = []
+        log_fh = open(log_path, "a", encoding="utf-8") if log_path is not None else None
+        try:
+            for request in tqdm(
+                requests, desc="[MoPE-Router] generate_until", dynamic_ncols=True
+            ):
+                context, gen_kwargs, doc_to_visual, doc_id, task, split = request.args
+
+                # Fetch the doc to read subtask (VSI) / source (VLM4D) + oracle label.
+                doc = None
+                try:
+                    doc = self.task_dict[task][split][doc_id]
+                except Exception as exc:
+                    print(
+                        f"[Qwen3_VL_MoPE_Router] WARNING: could not fetch doc "
+                        f"({type(exc).__name__}: {exc}); g-log/oracle degraded for this sample."
+                    )
+
+                # Discriminate the benchmark by TASK NAME, not by field presence:
+                # VLM4D docs ALSO carry a "question_type" field (constant
+                # "multiple-choice", see vlm4d/utils.py FIELD_QUESTION_TYPE), so a
+                # field-presence test would misclassify VLM4D as VSI and suppress
+                # the per-source g breakdown. The task name is the reliable axis:
+                # only the VSI-Bench task gets the subtask/oracle path; everything
+                # else (VLM4D) gets the _vlm4d_source breakdown.
+                is_vsi = task is not None and "vsi" in str(task).lower()
+                subtask = doc.get("question_type") if (is_vsi and doc is not None) else None
+                source = self._vlm4d_source(doc) if (doc is not None and not is_vsi) else None
+
+                # ---- ② VSI oracle hard-gate: set the per-sample sidecar. ----
+                oracle_g = None
+                if gate_mode == "oracle" and is_vsi and projector is not None:
+                    is_dyn = self._vsi_is_dynamic(subtask)
+                    if is_dyn is not None:
+                        oracle_g = 1.0 if is_dyn else 0.0  # dynamic -> MoPE on, static -> off
+                if projector is not None:
+                    projector._pending_oracle_gate = oracle_g
+                    # ---- ① reset the per-question g buffer before generation. ----
+                    if hasattr(projector, "_eval_gate_log"):
+                        projector._eval_gate_log.clear()
+                    # ---- change C: reset the per-question residual diag buffer. ----
+                    if hasattr(projector, "_eval_resid_log"):
+                        projector._eval_resid_log.clear()
+
+                # ---- MoPE frames sidecar (inherited pattern). ----
+                try:
+                    visuals = doc_to_visual(self.task_dict[task][split][doc_id])
+                except Exception as exc:
+                    print(
+                        f"[Qwen3_VL_MoPE_Router] WARNING: could not extract visuals "
+                        f"({type(exc).__name__}: {exc}). MoPE skipped."
+                    )
+                    visuals = None
+                mope_frames = (
+                    self._compute_mope_frames(visuals) if visuals is not None else None
+                )
+
+                try:
+                    if mope_frames is not None:
+                        target_device = next(inner.parameters()).device
+                        target_dtype = next(inner.parameters()).dtype
+                        inner._pending_mope_frames = mope_frames.to(
+                            device=target_device, dtype=target_dtype
+                        )
+                    single_result = super(Qwen3_VL_MoPE, self).generate_until([request])
+                    results.extend(single_result)
+                finally:
+                    inner._pending_mope_frames = None
+                    if projector is not None:
+                        projector._pending_oracle_gate = None
+
+                # ---- ① drain + aggregate per-question g, then log. ----
+                if log_fh is not None and projector is not None:
+                    gvals = list(getattr(projector, "_eval_gate_log", []))
+                    g_mean = sum(gvals) / len(gvals) if gvals else None
+                    # ---- change C: drain + aggregate per-question residual diag. ----
+                    rvals = list(getattr(projector, "_eval_resid_log", []))
+                    if rvals:
+                        mope_out_norm = sum(r[0] for r in rvals) / len(rvals)
+                        image_embeds_norm = sum(r[1] for r in rvals) / len(rvals)
+                        resid_ratio = sum(r[2] for r in rvals) / len(rvals)
+                    else:
+                        mope_out_norm = image_embeds_norm = resid_ratio = None
+                    record = {
+                        "sample_id": doc_id,
+                        "task": task,
+                        "gate_mode": gate_mode,
+                        "g": g_mean,                 # per-question MEAN over forwards
+                        "g_num_forwards": len(gvals),
+                        "g_oracle_forced": oracle_g,  # the forced value, or null
+                        # change C: per-question MEAN over forwards of each norm.
+                        "mope_out_norm": mope_out_norm,            # ‖g·mope_out‖
+                        "image_embeds_norm": image_embeds_norm,    # ‖image_embeds‖
+                        "resid_ratio": resid_ratio,                # ‖g·mope_out‖/‖image_embeds‖
+                    }
+                    if is_vsi:
+                        record["subtask"] = subtask
+                        record["is_dynamic"] = self._vsi_is_dynamic(subtask)
+                    if source is not None:
+                        record["source"] = source
+                    log_fh.write(json.dumps(record) + "\n")
+                    log_fh.flush()
+        finally:
+            if log_fh is not None:
+                log_fh.close()
+
+        return results
 
 
 @register_model("qwen3_vl_mope_qformer")

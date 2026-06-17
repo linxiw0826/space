@@ -1,14 +1,17 @@
 #!/bin/bash
 # =============================================================================
-# Evaluate E-10 (Router v1: CrossAttn + learned content-driven gate) on VSIBench
-# Model type: qwen3_vl_mope_router
-# (forked from eval_e03a_vsibench.sh — only the model type + ckpt/exp names differ).
+# Evaluate E-10b (Router v1.1 gatefix: CrossAttn + learned content-driven gate +
+# anti-collapse) on VSIBench. Model type: qwen3_vl_mope_router (UNCHANGED — the
+# gate fix is training-only; the eval model class is the same as E-10).
+# (forked from eval_e10_vsibench.sh — only the ckpt/exp/output names differ. The
+#  E10_GATE_LOG g-log is default-ON and now ALSO records per-question
+#  ‖mope_out‖ / ‖image_embeds‖ / residual ratio — see change C.)
 #
 # Usage:
-#   bash eval_e10_vsibench.sh [CKPT_PATH] [EXP_NAME]
+#   bash eval_e10b_vsibench.sh [CKPT_PATH] [EXP_NAME]
 #
 # Arguments (optional — derived from MODEL_SIZE when omitted):
-#   CKPT_PATH  — path to the E-10 checkpoint directory to evaluate
+#   CKPT_PATH  — path to the E-10b checkpoint directory to evaluate
 #   EXP_NAME   — short name for this evaluation run, used for output dir
 #
 # Env vars (all optional, have defaults):
@@ -45,12 +48,12 @@ MODEL_SIZE=${MODEL_SIZE:-4b}
 
 case "${MODEL_SIZE}" in
     4b)
-        DEFAULT_CKPT_PATH="${SPACE_OUTPUT_ROOT}/train/e10_router_v1_4b"
-        DEFAULT_EXP_NAME="e10_router_v1_4b"
+        DEFAULT_CKPT_PATH="${SPACE_OUTPUT_ROOT}/train/e10b_router_v1_4b"
+        DEFAULT_EXP_NAME="e10b_router_v1_4b"
         ;;
     8b)
-        DEFAULT_CKPT_PATH="${SPACE_OUTPUT_ROOT}/train/e10_router_v1_8b"
-        DEFAULT_EXP_NAME="e10_router_v1_8b"
+        DEFAULT_CKPT_PATH="${SPACE_OUTPUT_ROOT}/train/e10b_router_v1_8b"
+        DEFAULT_EXP_NAME="e10b_router_v1_8b"
         ;;
     *)
         echo "ERROR: MODEL_SIZE must be '4b' or '8b', got '${MODEL_SIZE}'"
@@ -108,7 +111,7 @@ export E10_GATE_LOG="${E10_GATE_LOG-${OUTPUT_PATH}/gate_log_${GATE_MODE}.jsonl}"
 # Log file — independent log directory, tee'd to stdout
 LOG_DIR=${LOG_DIR:-${SPACE_LOG_ROOT}/eval}
 mkdir -p "${LOG_DIR}"
-LOG_FILE="${LOG_DIR}/e10_vsibench_${MODEL_SIZE}_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="${LOG_DIR}/e10b_vsibench_${MODEL_SIZE}_$(date +%Y%m%d_%H%M%S).log"
 
 # GPU configuration
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
@@ -164,7 +167,7 @@ MODEL_ARGS="pretrained=${CKPT_PATH},max_pixels=268324,min_pixels=8192,attn_imple
 # ---------------------------------------------------------------------------
 # Status output
 # ---------------------------------------------------------------------------
-echo "=== VSIBench Evaluation (E-10 Router v1: CrossAttn + learned gate) ==="
+echo "=== VSIBench Evaluation (E-10b Router v1.1 gatefix: CrossAttn + learned gate + anti-collapse) ==="
 echo "Model size : ${MODEL_SIZE}"
 echo "Checkpoint : ${CKPT_PATH}"
 echo "Experiment : ${EXP_NAME}"

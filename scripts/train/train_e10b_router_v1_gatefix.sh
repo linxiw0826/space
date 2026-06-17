@@ -1,40 +1,41 @@
 #!/bin/bash
 # =============================================================================
-# E-10: Router v1 — GUIDE + frozen VGGT static expert + frozen MoPE dynamic
-#       expert + LEARNED content-driven scalar gate g, two-stage training
-#       (unified 4B / 8B).
+# E-10b: Router v1.1 — gate anti-collapse ("gatefix") version of E-10.
 #
-# Architecture (论文2 R1, D-16/D-17):
-#   - Static expert  = frozen VGGT geometry stream (D-14 方案A, reused as-is).
-#   - Dynamic expert = frozen MoPE (last layer, E-03a config; 取层不动).
-#   - Gate g         = learned content-driven scalar gate (D-15 b): modulates
-#                      the MoPE cross-attention residual: image_embeds + g*out.
-#   - No auxiliary loss; MoPE layer selection unchanged.
+# ARCHITECTURE / TWO-STAGE WARM-START RECIPE = IDENTICAL TO E-10.
+# The ONLY difference vs E-10 is the gate fix bundle, so "E-10b vs E-10 differs
+# only by the gate fix" is the single variable (D-17 naming):
+#   A1 non-saturated gate init : --mope_gate_init_bias 0.0  (g starts ≈0.5)
+#                                 (E-10 used +4.0 → g≈0.98 saturated → collapse)
+#   A2 gate logit z-loss       : --mope_gate_zloss_coef 1e-3   (L_z=mean(logit^2))
+#   A3 Bernoulli entropy +warmup: --mope_gate_entropy_coef 1e-2
+#                                 --mope_gate_entropy_warmup_steps 500
+#   anti-collapse master switch: --mope_gate_anticollapse True
+#   rich [gate-diag] training log: --mope_gate_diag_every 20
 #
-# Two-stage training (same recipe as E-03a, D-09/D-10):
+# All new args default to E-10's status quo in argument.py, so E-03a/E-02c/E-10
+# scripts are unchanged; this script turns the fix ON explicitly.
+#
+# Architecture (论文2 R1, D-16/D-17), same as E-10:
+#   - Static expert  = frozen VGGT geometry stream (D-14 方案A).
+#   - Dynamic expert = frozen MoPE (last layer, E-03a config).
+#   - Gate g         = learned content-driven scalar gate (D-15 b): image_embeds + g*out.
+#   - No auxiliary task loss; MoPE layer selection unchanged.
+#
+# Two-stage training (same recipe as E-10/E-03a, D-09/D-10):
 #   - Stage 1 (TRAIN_STAGE=stage1): freeze LLM, train projector + gate.
-#       start = E-00b projector-only checkpoint (or GUIDE checkpoint).
-#       --tune_mm_llm False  --freeze_mope_projector False  (projector+gate train)
+#       start = E-00b projector-only checkpoint.
+#       --tune_mm_llm False
 #   - Stage 2 (TRAIN_STAGE=stage2, DEFAULT): warm-start joint training.
-#       start = E-10 Stage-1 checkpoint.
-#       --tune_mm_llm True   (projector + gate + LLM all trainable)
-#
-# The gate submodule lives inside MoPEProjectorCrossAttn, so it follows the
-# projector's requires_grad (managed by --freeze_mope_projector) in BOTH stages
-# — no separate parameter group needed, g is trainable & non-zero-grad in both.
+#       start = E-10b Stage-1 checkpoint.
+#       --tune_mm_llm True
 #
 # Usage:
-#   # Stage 1 (projector + gate only, frozen LLM):
-#   TRAIN_STAGE=stage1 MODEL_SIZE=4b bash train_e10_router_v1.sh
-#   # Stage 2 (warm-start joint; start from Stage-1 ckpt):
-#   TRAIN_STAGE=stage2 MODEL_SIZE=4b bash train_e10_router_v1.sh   # default
+#   TRAIN_STAGE=stage1 MODEL_SIZE=4b bash train_e10b_router_v1_gatefix.sh
+#   TRAIN_STAGE=stage2 MODEL_SIZE=4b bash train_e10b_router_v1_gatefix.sh   # default
 #
 # Supported MODEL_SIZE values: 4b  8b
-#
-# Key differences from E-03a:
-#   - --mope_use_gate True   --mope_gate_mode learned   (E-10 learned gate)
-#   - --model qwen3_vl_mope_router at eval time (see eval_e10_*.sh)
-#   - output_dir → e10_router_v1_{size} (stage2) / e10_router_v1_stage1_{size}
+# Output dir: e10b_router_v1_{size} (stage2) / e10b_router_v1_stage1_{size}
 # =============================================================================
 set -e
 source "$(dirname "${BASH_SOURCE[0]}")/../env/activate.sh"
@@ -56,62 +57,16 @@ export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
 
 # ---------------------------------------------------------------------------
 # NCCL runtime workarounds (new server huirui: driver 570 / CUDA 12.8,
-# torch 2.6.0+cu124, NCCL 2.28.9).
-#
-# 现象：单卡 CUDA 正常（模型能上卡），仅多卡 DeepSpeed `_broadcast_model`
-#       通信阶段崩：
-#   torch.distributed.DistBackendError: NCCL error ... unhandled cuda error
-#   ncclUnhandledCudaError: Cuda failure 'CUDA driver version is insufficient
-#                           for CUDA runtime version'
-#
-# 根因：NCCL>=2.18 默认走 cuMem API 分配通信 buffer；在驱动/runtime 版本边界
-#       场景常误报 "driver insufficient" 并使 NCCL init/broadcast 失败。单卡不
-#       走 NCCL 集合通信故无此问题。关闭 cuMem 是已知无副作用修复（不动环境/
-#       不降包），优先尝试。
-#   - NCCL_CUMEM_ENABLE=0  ← 关键修复
-#   - NCCL_NVLS_ENABLE=0   ← 与 eval 脚本一致（NVLS 在多卡 lmms-eval 曾致 hang）
-#   兜底（仅当只设 CUMEM 仍崩时，逐个取消注释加上；会牺牲 NVLink/IB/SHM 速度）：
-#   - export NCCL_P2P_DISABLE=1
-#   - export NCCL_IB_DISABLE=1
-#   - export NCCL_SHM_DISABLE=1
-#   排查时可临时打开详细日志定位：export NCCL_DEBUG=INFO
-#
-# 这些 export 对后续所有多卡训练（E-11/E-13/E-14）通用——复制本 block 即可。
-# 放在训练脚本环境区而非 activate.sh：activate.sh 同时被 eval 脚本 source，
-# eval 已用 NUM_PROCESSES=1 单卡绕开 NCCL，避免全局改动影响现有 eval 路径。
+# torch 2.6.0+cu124, NCCL 2.28.9). Copied verbatim from train_e10_router_v1.sh
+# — required for multi-card DeepSpeed on the new server. See that script for
+# the full root-cause notes.
 # ---------------------------------------------------------------------------
 export NCCL_CUMEM_ENABLE=${NCCL_CUMEM_ENABLE:-0}
 export NCCL_NVLS_ENABLE=${NCCL_NVLS_ENABLE:-0}
 
-# ---------------------------------------------------------------------------
-# Force the pip-installed NCCL (nvidia-nccl-cu12 == 2.21.5, torch 2.6 配套版本).
-#
-# 根因修正(2026-06-07，第3轮)：报错里的 `NCCL version 2.28.9` +
-#   `Cuda failure 'driver insufficient'` 并非 pip 装错了版本——
-#   `pip show nvidia-nccl-cu12` 与纯 `python -c "import torch;print(
-#   torch.cuda.nccl.version())"` 都返回 2.21.5。问题是**库被覆盖**：训练运行时
-#   实际从系统 / LD_LIBRARY_PATH(如 /usr/local/cuda-12.8/lib64 或其它 conda env)
-#   加载到另一个 libnccl.so.2(2.28.9)，把 pip 的 2.21.5 盖掉了。纯 python 不走
-#   activate.sh 的 LD 故看到 2.21.5；训练经 activate.sh + torchrun 被系统 2.28.9
-#   抢占。**与之前 cuDNN 被 videorepa / 系统 cuda-12.8 覆盖是同一类"库覆盖"问题。**
-#
-# 修复(2026-06-07，第4轮：两处坑均治)：
-#   坑1 — 旧的 `import nvidia.nccl` 定位法**静默失败**：nvidia.nccl 是
-#     namespace 包，本环境 import 不稳定 → NCCL_LIB_DIR="" → 走 else 警告分支，
-#     真正的 LD_LIBRARY_PATH prepend(line 107)从未执行。改用 **sys.prefix glob**
-#     直接找 site-packages 下的 libnccl.so.2，不依赖 import 成功，找不到优雅回退空串。
-#   坑2 — 只设 LD_PRELOAD 不够：`python -m torch.distributed.run`(torchrun)**不会
-#     可靠地把 LD_PRELOAD 传给 spawn 出来的 worker 进程**，但 **LD_LIBRARY_PATH 会
-#     被传播**。故主机制 = 把 pip nccl 目录 prepend 到 LD_LIBRARY_PATH(传得到
-#     worker)；LD_PRELOAD 仅作父进程的双保险。
-#   另：脚本**自清洗** LD_LIBRARY_PATH，剔除已知污染源(用户 ~/.bashrc 注入的
-#     /usr/local/cuda-12.8/lib64 与 videorepa cudnn 目录)，使脚本自洽、不依赖外部
-#     shell 状态。清洗必须在 prepend 之前，保证 pip 目录排在最前。
-# ---------------------------------------------------------------------------
-# Known pip NCCL on this server (space conda env is fixed/user-owned). Glob is a
-# portable fallback for other hosts. Hardcoded first so a glob miss can't silently
-# leave NCCL unforced (the sys.prefix glob returned empty in-script before, causing
-# workers to load the stray system libnccl.so.2 == 2.28.9).
+# Force the pip-installed NCCL (torch 2.6 配套版本); prevents a rogue system /
+# other-conda libnccl.so.2 (2.28.9) from shadowing pip's and causing
+# `Cuda failure 'driver insufficient'` in multi-GPU NCCL init.
 NCCL_SO="${NCCL_SO:-/data1/miniconda3/envs/space/lib/python3.10/site-packages/nvidia/nccl/lib/libnccl.so.2}"
 if [ ! -f "${NCCL_SO}" ]; then
     NCCL_SO=$(python - <<'PY' 2>/dev/null
@@ -149,29 +104,29 @@ MOPE_CKPT_PATH=${MOPE_CKPT_PATH:-/home/nvme04/mope-jepa/output/mope_jepa_wisa7k_
 MOPE_CODE_PATH=${MOPE_CODE_PATH:-${SPACE_ROOT}/src/vendor/mope}
 
 # ---------------------------------------------------------------------------
-# Per-size configuration
-#
-# Global batch alignment with E-03a (the reference experiment): E-10 is the
-# gated counterpart of E-03a, so the global batch MUST match E-03a exactly,
-# otherwise differences cannot be attributed to the gate. We therefore pin a
-# TARGET_GLOBAL_BATCH per model size and DERIVE grad_accum from the current
-# GPU count, so the global batch stays constant regardless of NPROC.
-#   global_batch = batch_size * NPROC_PER_NODE * grad_accum_steps
+# E-10b gate anti-collapse hyperparameters (the ONLY thing that differs from
+# E-10). All overridable via env for ablations.
+# ---------------------------------------------------------------------------
+GATE_INIT_BIAS=${GATE_INIT_BIAS:-0.0}             # A1: g starts ≈0.5 (non-saturated)
+GATE_ZLOSS_COEF=${GATE_ZLOSS_COEF:-1e-3}          # A2: L_z = mean(logit^2)
+GATE_ENTROPY_COEF=${GATE_ENTROPY_COEF:-1e-2}      # A3: lambda_max
+GATE_ENTROPY_WARMUP=${GATE_ENTROPY_WARMUP:-500}   # A3: T_warm (linear warm-up)
+GATE_DIAG_EVERY=${GATE_DIAG_EVERY:-20}            # change B: [gate-diag] interval
+
+# ---------------------------------------------------------------------------
+# Per-size configuration. Global batch is pinned to E-03a/E-10 (target=48 for 4B,
+# 96 for 8B) and grad_accum is DERIVED from the GPU count, so global batch is
+# constant regardless of NPROC (the gate fix stays the only variable vs E-10).
 # ---------------------------------------------------------------------------
 if [ "${MODEL_SIZE}" = "4b" ]; then
     batch_size=2
-    # E-03a 6-GPU baseline: 2 (per_device) * 6 (NPROC) * 4 (accum) = 48
     TARGET_GLOBAL_BATCH=48
     DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${SPACE_ROOT}/configs/zero2.json}
-    DEEPSPEED_CONFIG_8B_FLAG=0
 elif [ "${MODEL_SIZE}" = "8b" ]; then
     batch_size=1
-    # E-03a 6-GPU baseline: 1 (per_device) * 6 (NPROC) * 16 (accum) = 96
     TARGET_GLOBAL_BATCH=96
-    # 8B requires ZeRO-3 to fit on 8x H20 GPUs.
     DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${SPACE_ROOT}/configs/zero3.json}
-    DEEPSPEED_CONFIG_8B_FLAG=1
-    echo "WARNING: 8B E-10 is experimental — monitor VRAM usage carefully." >&2
+    echo "WARNING: 8B E-10b is experimental — monitor VRAM usage carefully." >&2
 else
     echo "ERROR: Unknown MODEL_SIZE='${MODEL_SIZE}'. Must be '4b' or '8b'." >&2
     exit 1
@@ -179,12 +134,7 @@ fi
 
 # ---------------------------------------------------------------------------
 # Derive gradient_accumulation_steps so the GLOBAL batch stays aligned with
-# E-03a regardless of GPU count:
-#   grad_accum_steps = TARGET_GLOBAL_BATCH / (batch_size * NPROC_PER_NODE)
-# Examples (4B, target=48): 4 GPUs -> 6, 6 GPUs -> 4, 3 GPUs -> 8.
-#
-# GRAD_ACCUM_STEPS env explicitly overrides the auto-computation (and skips the
-# divisibility check); the resulting global batch is still echoed for review.
+# E-03a/E-10 regardless of GPU count.
 # ---------------------------------------------------------------------------
 per_step_batch=$((batch_size * NPROC_PER_NODE))
 if [ -n "${GRAD_ACCUM_STEPS:-}" ]; then
@@ -203,23 +153,23 @@ fi
 
 # ---------------------------------------------------------------------------
 # Stage-specific configuration: start checkpoint, tune_mm_llm, output dir.
-# Stage 1: freeze LLM, train projector+gate, start from E-00b (Stage-1 warm).
-# Stage 2: warm-start joint, train LLM+projector+gate, start from E-10 Stage1.
+# Stage 1: freeze LLM, train projector+gate, start from E-00b.
+# Stage 2: warm-start joint, train LLM+projector+gate, start from E-10b Stage1.
 # ---------------------------------------------------------------------------
 if [ "${TRAIN_STAGE}" = "stage1" ]; then
     TUNE_MM_LLM=False
-    # Stage 1 starts from the E-00b projector-only checkpoint (same as E-03a Stage 1 source).
+    # Stage 1 starts from the E-00b projector-only checkpoint (same source as E-10/E-03a Stage 1).
     GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-${SPACE_OUTPUT_ROOT}/train/e00b_mope_projector_only_${MODEL_SIZE}}
-    output_dir="${OUTPUT_DIR:-${SPACE_OUTPUT_ROOT}/train/e10_router_v1_stage1_${MODEL_SIZE}}"
-    run_name="space_e10_router_v1_stage1_${MODEL_SIZE}_lr1e-5"
-    exp_name="e10_router_v1_stage1_${MODEL_SIZE}"
+    output_dir="${OUTPUT_DIR:-${SPACE_OUTPUT_ROOT}/train/e10b_router_v1_stage1_${MODEL_SIZE}}"
+    run_name="space_e10b_router_v1_stage1_${MODEL_SIZE}_lr1e-5"
+    exp_name="e10b_router_v1_stage1_${MODEL_SIZE}"
 elif [ "${TRAIN_STAGE}" = "stage2" ]; then
     TUNE_MM_LLM=True
-    # Stage 2 (warm-start joint) starts from the E-10 Stage-1 checkpoint.
-    GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-${SPACE_OUTPUT_ROOT}/train/e10_router_v1_stage1_${MODEL_SIZE}}
-    output_dir="${OUTPUT_DIR:-${SPACE_OUTPUT_ROOT}/train/e10_router_v1_${MODEL_SIZE}}"
-    run_name="space_e10_router_v1_${MODEL_SIZE}_lr1e-5"
-    exp_name="e10_router_v1_${MODEL_SIZE}"
+    # Stage 2 (warm-start joint) starts from the E-10b Stage-1 checkpoint.
+    GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-${SPACE_OUTPUT_ROOT}/train/e10b_router_v1_stage1_${MODEL_SIZE}}
+    output_dir="${OUTPUT_DIR:-${SPACE_OUTPUT_ROOT}/train/e10b_router_v1_${MODEL_SIZE}}"
+    run_name="space_e10b_router_v1_${MODEL_SIZE}_lr1e-5"
+    exp_name="e10b_router_v1_${MODEL_SIZE}"
 else
     echo "ERROR: Unknown TRAIN_STAGE='${TRAIN_STAGE}'. Must be 'stage1' or 'stage2'." >&2
     exit 1
@@ -313,7 +263,12 @@ args="
     --mope_fusion_mode crossattn \
     --mope_use_gate True \
     --mope_gate_mode learned \
-    --mope_gate_init_bias 4.0 \
+    --mope_gate_anticollapse True \
+    --mope_gate_init_bias ${GATE_INIT_BIAS} \
+    --mope_gate_zloss_coef ${GATE_ZLOSS_COEF} \
+    --mope_gate_entropy_coef ${GATE_ENTROPY_COEF} \
+    --mope_gate_entropy_warmup_steps ${GATE_ENTROPY_WARMUP} \
+    --mope_gate_diag_every ${GATE_DIAG_EVERY} \
     --gate_log_interval 25 \
     --mope_checkpoint_path ${MOPE_CKPT_PATH} \
     --mope_encoder_path ${MOPE_CODE_PATH} \
@@ -326,15 +281,16 @@ args="
 # ---------------------------------------------------------------------------
 LOG_FILE="${LOG_DIR}/${exp_name}_$(date +%Y%m%d_%H%M%S).log"
 
-echo "=== E-10 Router v1 Training (MODEL_SIZE=${MODEL_SIZE}, STAGE=${TRAIN_STAGE}) ==="
-echo "Start ckpt: ${GUIDE_CKPT_PATH}"
-echo "Output    : ${output_dir}"
-echo "Log       : ${LOG_FILE}"
-echo "Fusion    : crossattn + learned content-driven gate, batch=${batch_size}, accum=${grad_accum_steps}, NPROC=${NPROC_PER_NODE}, global_batch=${global_batch} (target=${TARGET_GLOBAL_BATCH})"
+echo "=== E-10b Router v1.1 gatefix Training (MODEL_SIZE=${MODEL_SIZE}, STAGE=${TRAIN_STAGE}) ==="
+echo "Start ckpt   : ${GUIDE_CKPT_PATH}"
+echo "Output       : ${output_dir}"
+echo "Log          : ${LOG_FILE}"
+echo "Fusion       : crossattn + learned content-driven gate, batch=${batch_size}, accum=${grad_accum_steps}, NPROC=${NPROC_PER_NODE}, global_batch=${global_batch} (target=${TARGET_GLOBAL_BATCH})"
+echo "Gate fix     : anticollapse=True init_bias=${GATE_INIT_BIAS} zloss=${GATE_ZLOSS_COEF} entropy=${GATE_ENTROPY_COEF} warmup=${GATE_ENTROPY_WARMUP} diag_every=${GATE_DIAG_EVERY}"
 if [ "${TRAIN_STAGE}" = "stage1" ]; then
-    echo "Trainable : MoPEProjectorCrossAttn + gate (LLM frozen, Stage 1)"
+    echo "Trainable    : MoPEProjectorCrossAttn + gate (LLM frozen, Stage 1)"
 else
-    echo "Trainable : LLM + MoPEProjectorCrossAttn + gate (warm-start joint, Stage 2)"
+    echo "Trainable    : LLM + MoPEProjectorCrossAttn + gate (warm-start joint, Stage 2)"
 fi
 
 python -m torch.distributed.run --nproc_per_node=${NPROC_PER_NODE} \

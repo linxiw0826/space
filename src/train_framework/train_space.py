@@ -197,6 +197,168 @@ class GateStatsCallback(transformers.TrainerCallback):
 
 
 # ---------------------------------------------------------------------------
+# E-10b (Router v1.1) rich gate diagnostic callback.
+#
+# Goal (change B): one `[gate-diag]` line every mope_gate_diag_every steps that
+# captures everything needed to localise gate collapse in a single training run
+# (so v2/v3 do not have to be re-run). Reads ONLY local projector buffers /
+# trainer snapshot; never all-gathers, never touches numerics. All buffers it
+# reads are plain Python lists (invisible to state_dict / optimizer / FSDP).
+#
+# Fields per line (all distinguish Stage1/Stage2 via the `stage` tag, derived
+# from whether the LLM is trainable):
+#   g distribution : g_mean g_std g_min g_max + histogram bins
+#   gate logit     : logit_mean logit_absmean (saturation monitor)
+#   gate weights   : w0_norm wlast_norm blast (content-sensitivity = is the
+#                    INPUT weight still alive — the v1 collapse smoking gun)
+#   gate grad      : gate_grad_norm (≈0 => gate not learning)
+#   loss decomp    : task_loss l_z(raw/weighted) H(raw/weighted) lambda_t
+#   residual ratio : mean(‖g·mope_out‖/‖image_embeds‖) (branch influence)
+#   task-label split: SKIPPED — no static/dynamic label is plumbed into the
+#                    forward (would require label pass-through, which we avoid
+#                    to keep the gate content-driven, D-15 b). Logged as
+#                    `axis_split=skip(no_task_labels)`.
+# ---------------------------------------------------------------------------
+class GateDiagCallback(transformers.TrainerCallback):
+    """E-10b: rich per-window gate diagnostics into the tee'd LOG_FILE (rank0)."""
+
+    _HIST_EDGES = (0.0, 0.1, 0.3, 0.7, 0.9, 1.0)
+
+    def __init__(self, diag_every: int = 20, projector=None, trainer_ref=None):
+        self.diag_every = max(1, int(diag_every))
+        if projector is None or not getattr(projector, "use_gate", False):
+            self._projector = None
+        else:
+            self._projector = projector
+        self._trainer_ref = trainer_ref      # set after Trainer construction
+        self._last_gate_gnorm = -1.0
+        self._stage = "?"
+
+    def set_trainer(self, trainer_ref):
+        self._trainer_ref = trainer_ref
+
+    def _gate_params(self):
+        proj = self._projector
+        if proj is None or not hasattr(proj, "gate_mlp"):
+            return []
+        return list(proj.gate_mlp.parameters())
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        # Stage tag: Stage 2 trains the LLM (warm-start joint); Stage 1 does not.
+        model = kwargs.get("model", None)
+        try:
+            llm_trainable = any(
+                p.requires_grad for p in model.language_model.parameters()
+            )
+            self._stage = "stage2" if llm_trainable else "stage1"
+        except Exception:
+            self._stage = "?"
+
+    def on_pre_optimizer_step(self, args, state, control, **kwargs):
+        if self._projector is None:
+            return
+        sq = 0.0
+        seen = False
+        for p in self._gate_params():
+            g = p.grad
+            if g is None:
+                continue
+            seen = True
+            sq += float(g.detach().float().pow(2).sum().item())
+        self._last_gate_gnorm = (sq ** 0.5) if seen else -1.0
+
+    @staticmethod
+    def _histogram(vals):
+        edges = GateDiagCallback._HIST_EDGES
+        bins = [0] * (len(edges) - 1)
+        n = len(vals)
+        for v in vals:
+            for j in range(len(edges) - 1):
+                hi = edges[j + 1]
+                # last bin is closed on the right so g==1.0 lands in [0.9,1.0].
+                if v < hi or (j == len(edges) - 2 and v <= hi):
+                    bins[j] += 1
+                    break
+        if n == 0:
+            return "0/0/0/0/0"
+        return "/".join(f"{b / n:.2f}" for b in bins)
+
+    def on_step_end(self, args, state, control, **kwargs):
+        proj = self._projector
+        if proj is None:
+            return
+        gs = state.global_step
+        if not (gs < 3 or gs % self.diag_every == 0):
+            # Still drain the projector diag buffers to bound memory.
+            proj._gate_buf_diag.clear()
+            proj._gate_logit_buf.clear()
+            proj._resid_ratio_buf.clear()
+            return
+
+        # Read this callback's OWN g window (_gate_buf_diag), independent of the
+        # _gate_buf that GateStatsCallback drains — so a colliding step never
+        # robs this line of its data.
+        gbuf = proj._gate_buf_diag
+        lbuf = proj._gate_logit_buf
+        rbuf = proj._resid_ratio_buf
+        if len(gbuf) == 0:
+            return
+        try:
+            gcat = torch.cat(gbuf)
+            n = int(gcat.numel())
+            g_mean = gcat.mean().item()
+            g_std = gcat.std().item() if n > 1 else 0.0
+            g_min = gcat.min().item()
+            g_max = gcat.max().item()
+            hist = self._histogram(gcat.tolist())
+            if len(lbuf) > 0:
+                lcat = torch.cat(lbuf)
+                logit_mean = lcat.mean().item()
+                logit_absmean = lcat.abs().mean().item()
+            else:
+                logit_mean = logit_absmean = float("nan")
+            resid_ratio = (sum(rbuf) / len(rbuf)) if rbuf else float("nan")
+        finally:
+            gbuf.clear()
+            lbuf.clear()
+            rbuf.clear()
+
+        # gate_mlp weight norms (content-sensitivity smoking gun).
+        try:
+            w0 = float(proj.gate_mlp[0].weight.detach().float().norm().item())
+            wlast = float(proj.gate_mlp[-1].weight.detach().float().norm().item())
+            blast = float(proj.gate_mlp[-1].bias.detach().float().item())
+        except Exception:
+            w0 = wlast = blast = float("nan")
+
+        # Loss decomposition snapshot from the trainer (most recent micro-batch).
+        gd = {}
+        if self._trainer_ref is not None:
+            gd = getattr(self._trainer_ref, "_gate_diag", {}) or {}
+        task_loss = gd.get("task_loss", float("nan"))
+        l_z_raw = gd.get("l_z_raw", float("nan"))
+        l_z_w = gd.get("l_z_weighted", float("nan"))
+        H_raw = gd.get("H_raw", float("nan"))
+        H_w = gd.get("H_weighted", float("nan"))
+        lam_t = gd.get("lambda_t", float("nan"))
+
+        if local_rank == 0:
+            rank0_print(
+                f"[gate-diag] stage={self._stage} step={gs} "
+                f"g_mean={g_mean:.4f} g_std={g_std:.4f} g_min={g_min:.4f} g_max={g_max:.4f} "
+                f"g_hist[0,.1,.3,.7,.9,1]={hist} n={n} "
+                f"logit_mean={logit_mean:.4f} logit_absmean={logit_absmean:.4f} "
+                f"w0_norm={w0:.4f} wlast_norm={wlast:.4f} blast={blast:.4f} "
+                f"gate_grad_norm={self._last_gate_gnorm:.6f} "
+                f"task_loss={task_loss:.4f} "
+                f"l_z_raw={l_z_raw:.6f} l_z_w={l_z_w:.6f} "
+                f"H_raw={H_raw:.4f} H_w={H_w:.6f} lambda_t={lam_t:.6f} "
+                f"resid_ratio={resid_ratio:.6f} "
+                f"axis_split=skip(no_task_labels)"
+            )
+
+
+# ---------------------------------------------------------------------------
 # Helpers (verbatim from GUIDE)
 # ---------------------------------------------------------------------------
 
@@ -302,11 +464,15 @@ def _attach_mope_to_model(model, mope_args: MoPEArguments):
         # trainability in both 2-stage stages with no extra parameter group.
         # PENDING[D-15]: gate_mode "oracle_task" (真值静/动标签硬门控 = E-10-oracle
         # 路由上界, D-15 a) 留第二步; 本任务只实现 learned 主路径.
+        # E-10b A1: gate_init_bias defaults to 0.0 (g≈0.5, non-saturated) so the
+        # gate starts in its maximal-slope regime instead of the E-10 saturated
+        # +4.0 (g≈0.98). E-10 behaviour is recoverable with --mope_gate_init_bias 4.0.
         projector = MoPEProjectorCrossAttn(
             mope_dim=768,
             llm_dim=llm_dim,
             use_gate=mope_args.mope_use_gate,
             gate_mode=mope_args.mope_gate_mode,
+            gate_init_bias=mope_args.mope_gate_init_bias,
         )
     elif mope_args.mope_fusion_mode == "qformer":
         from model.mope_projector import MoPEProjectorQFormer
@@ -318,6 +484,19 @@ def _attach_mope_to_model(model, mope_args: MoPEArguments):
     else:
         projector = MoPEProjector(mope_dim=768, llm_dim=llm_dim)
     inner_model.add_module("_mope_projector", projector)
+
+    # E-10b: enable the gate anti-collapse loss + rich training diagnostics on the
+    # projector only for the E-10b run (--mope_gate_anticollapse). Default False
+    # => E-10's training forward is byte-for-byte unchanged (no diagnostic buffers
+    # populated, no z-loss graph buffer). Safe on non-crossattn projectors too
+    # (they have no use_gate; the flags are simply unused).
+    if mope_args.mope_use_gate and mope_args.mope_gate_anticollapse \
+            and hasattr(projector, "_diag_enabled"):
+        projector._diag_enabled = True
+        projector._anticollapse_enabled = True
+        rank0_print(
+            "[Space Sensing] E-10b gate anti-collapse + diagnostics ENABLED on projector."
+        )
 
     # Ensure projector is trainable (encoder is already frozen internally).
     for p in projector.parameters():
@@ -738,12 +917,91 @@ def train(attn_implementation="flash_attention_2"):
         )
         training_args.remove_unused_columns = False
 
+    # Resolve the gate projector once (None unless mope_use_gate); the trainer
+    # closes over it + mope_args for the E-10b anti-collapse loss / diagnostics.
+    _gate_proj = None
+    if mope_args.use_mope and mope_args.mope_use_gate:
+        _gate_proj = getattr(getattr(model, "model", None), "_mope_projector", None)
+
     # [DIAG] Subclass to print actual loss.item() for first 20 micro-batches.
     # Covers ~5 optimizer steps (grad_accum=4) to capture the step-1→step-2 transition.
     class _DiagTrainer(Trainer):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
             self._diag_calls = 0
+            # E-10b gate anti-collapse config (closed over from mope_args).
+            self._gate_proj = _gate_proj
+            self._gate_ac = bool(
+                mope_args.mope_use_gate and mope_args.mope_gate_anticollapse
+            )
+            self._gate_zc = float(mope_args.mope_gate_zloss_coef)
+            self._gate_ec = float(mope_args.mope_gate_entropy_coef)
+            self._gate_ewarm = max(0, int(mope_args.mope_gate_entropy_warmup_steps))
+            # Last-window diagnostic snapshot for GateDiagCallback to print.
+            self._gate_diag = {}
+
+        def _gate_anticollapse_loss(self, base_loss):
+            """E-10b: build the gate anti-collapse loss bundle on the live graph.
+
+            Drains projector._gate_logit_graph_buf (one live-graph fp32 logit per
+            cross-attn forward this micro-batch) and computes, with gradients:
+
+              A2 z-loss        : L_z = mean(logit^2)                    [* zloss_coef]
+              A3 Bernoulli ent : maximise H(g_bar), g_bar = mean(sigmoid(logit))
+                                 added as  -lambda_t * H(g_bar)
+                                 lambda_t = entropy_coef * min(1, step/T_warm)
+
+            Returns (extra_loss_tensor_or_None, diag_dict). When the gate is
+            disabled / anti-collapse off / no logits were stashed, returns
+            (None, {}) and the task loss is unchanged.
+            """
+            proj = self._gate_proj
+            if proj is None:
+                return None, {}
+            buf = getattr(proj, "_gate_logit_graph_buf", None)
+            if not buf:
+                # Always drain to bound memory even if anti-collapse is off.
+                if buf is not None:
+                    buf.clear()
+                return None, {}
+            # Concatenate all live-graph logits of this micro-batch -> [N].
+            logits = torch.cat(buf)                       # fp32, graph intact
+            buf.clear()                                   # drain (memory-bounded)
+
+            if not self._gate_ac:
+                return None, {}
+
+            # A2: logit z-loss — penalise drift to ±large (re-saturation).
+            l_z = (logits ** 2).mean()
+
+            # A3: Bernoulli batch-usage entropy. g_bar = mean gate over the batch;
+            # clamp to [1e-6, 1-1e-6] before log for numerical stability.
+            g = torch.sigmoid(logits)
+            g_bar = g.mean().clamp(1e-6, 1.0 - 1e-6)
+            H = -(g_bar * torch.log(g_bar) + (1.0 - g_bar) * torch.log(1.0 - g_bar))
+
+            # Linear warm-up of lambda_t.
+            step = float(self.state.global_step)
+            if self._gate_ewarm > 0:
+                warm = min(1.0, step / float(self._gate_ewarm))
+            else:
+                warm = 1.0
+            lam_t = self._gate_ec * warm
+
+            zloss_term = self._gate_zc * l_z
+            ent_term = -lam_t * H            # maximise H => subtract it
+            extra = (zloss_term + ent_term).to(base_loss.dtype)
+
+            diag = {
+                "task_loss": float(base_loss.detach().float().item()),
+                "l_z_raw": float(l_z.detach().float().item()),
+                "l_z_weighted": float(zloss_term.detach().float().item()),
+                "H_raw": float(H.detach().float().item()),
+                "H_weighted": float((lam_t * H).detach().float().item()),
+                "lambda_t": float(lam_t),
+                "n_logits": int(logits.numel()),
+            }
+            return extra, diag
 
         def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
             _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
@@ -770,6 +1028,22 @@ def train(attn_implementation="flash_attention_2"):
                         flush=True,
                     )
                 _loss = torch.nan_to_num(_loss, nan=0.0, posinf=0.0, neginf=0.0)
+
+            # ----------------------------------------------------------------
+            # E-10b: add the gate anti-collapse loss bundle (z-loss + warmed-up
+            # Bernoulli entropy). The drain of _gate_logit_graph_buf ALWAYS runs
+            # (memory hygiene) but the extra loss is only added when
+            # mope_gate_anticollapse=True; otherwise _loss is unchanged
+            # (E-10 / E-03a path byte-for-byte). PENDING[D-15]: regularises the
+            # content-driven (b) scalar gate, no task-label supervision.
+            # ----------------------------------------------------------------
+            _extra, _gdiag = self._gate_anticollapse_loss(_loss)
+            if _extra is not None:
+                _loss = _loss + _extra
+            if _gdiag:
+                # Stash the most-recent decomposition for GateDiagCallback.
+                self._gate_diag = _gdiag
+
             if self._diag_calls < 20 and _rank == 0:
                 self._diag_calls += 1
                 _logits_shape = None
@@ -805,6 +1079,25 @@ def train(attn_implementation="flash_attention_2"):
             f"[Space Sensing] E-10 GateStatsCallback attached "
             f"(gate_log_interval={mope_args.gate_log_interval})."
         )
+        # E-10b (Router v1.1): attach the rich [gate-diag] diagnostic callback.
+        # Gated on --mope_gate_anticollapse so E-10's logs stay byte-for-byte
+        # unchanged; the E-10b script sets it True and gets the rich diagnostics.
+        if mope_args.mope_gate_anticollapse:
+            _gate_diag_cb = GateDiagCallback(
+                diag_every=mope_args.mope_gate_diag_every,
+                projector=_gate_projector,
+                trainer_ref=trainer,
+            )
+            trainer.add_callback(_gate_diag_cb)
+            rank0_print(
+                f"[Space Sensing] E-10b GateDiagCallback attached "
+                f"(diag_every={mope_args.mope_gate_diag_every}, "
+                f"anticollapse={mope_args.mope_gate_anticollapse}, "
+                f"zloss_coef={mope_args.mope_gate_zloss_coef}, "
+                f"entropy_coef={mope_args.mope_gate_entropy_coef}, "
+                f"entropy_warmup={mope_args.mope_gate_entropy_warmup_steps}, "
+                f"gate_init_bias={mope_args.mope_gate_init_bias})."
+            )
 
     def _is_complete_checkpoint(ckpt_dir):
         # An auto-detected checkpoint is only safe to resume from if it is fully

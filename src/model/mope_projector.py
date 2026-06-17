@@ -236,6 +236,55 @@ class MoPEProjectorCrossAttn(nn.Module):
         # the callback concatenates the window and clears it (all ranks clear
         # their own buf to avoid unbounded growth).
         self._gate_buf = []
+        # ---------------------------------------------------------------
+        # E-10 eval-time gate diagnostics (① g-logging / ② oracle override).
+        # These are plain Python attributes, NOT registered buffers/params, so
+        # they are invisible to state_dict / optimizer / FSDP and add ZERO
+        # overhead on the disabled (use_gate=False / training) path.
+        #
+        #   _eval_gate_log     : list of fp32 floats. _compute_gate appends the
+        #                        scalar g of every forward here (regardless of
+        #                        learned / oracle). The eval wrapper drains +
+        #                        aggregates this per question to write the g-log.
+        #                        Left empty and untouched when use_gate=False.
+        #   _pending_oracle_gate: Optional[float]. When set (by the eval wrapper
+        #                        for ② VSI oracle hard-gating) it FORCES g to that
+        #                        per-sample constant for the duration of one
+        #                        question, taking priority over the learned MLP.
+        #                        None -> learned/global-override behaviour, i.e.
+        #                        byte-for-byte identical to before.
+        # ---------------------------------------------------------------
+        self._eval_gate_log = []
+        self._pending_oracle_gate = None
+        # ---------------------------------------------------------------
+        # E-10b (Router v1.1) gate anti-collapse + diagnostics buffers.
+        # All plain Python lists / floats (NOT buffers/params): invisible to
+        # state_dict / optimizer / FSDP, drained by the training compute_loss /
+        # eval wrapper, zero overhead on the disabled path.
+        #   _gate_logit_buf : detached fp32 1-D logits (pre-sigmoid) of every
+        #                     TRAINING forward, used for the z-loss / saturation
+        #                     diagnostics. Parallels _gate_buf (which holds g).
+        #   _resid_ratio_buf: per-TRAINING-forward mean(‖g·out‖/‖image_embeds‖)
+        #                     scalar — the actual residual influence magnitude.
+        #   _eval_resid_log : per-EVAL-forward (‖mope_out‖, ‖image_embeds‖,
+        #                     ‖g·out‖/‖image_embeds‖) tuples, drained per
+        #                     question by the eval wrapper (change C).
+        # ---------------------------------------------------------------
+        self._gate_logit_buf = []
+        self._gate_buf_diag = []          # E-10b: independent g window for GateDiagCallback
+        self._gate_logit_graph_buf = []
+        self._resid_ratio_buf = []
+        self._eval_resid_log = []
+        # E-10b: training-time rich diagnostics + anti-collapse loss are OFF by
+        # default. train_space sets these True only for the E-10b run
+        # (--mope_gate_anticollapse). When False the projector behaves exactly as
+        # E-10 (no logit/resid diagnostic buffers populated, no z-loss graph buf),
+        # so E-10's training path is byte-for-byte unchanged and memory-bounded.
+        self._diag_enabled = False        # gates _gate_logit_buf / _resid_ratio_buf
+        self._anticollapse_enabled = False  # gates _gate_logit_graph_buf
+        # Eval (change C): the router wrapper sets this True only when E10_GATE_LOG
+        # is enabled, so the default learned-eval path stays byte-for-byte E-10.
+        self._eval_resid_active = False
         if self.use_gate:
             self.gate_mlp = nn.Sequential(
                 nn.Linear(llm_dim, gate_hidden),
@@ -282,17 +331,39 @@ class MoPEProjectorCrossAttn(nn.Module):
             g: Float tensor [B, 1, 1] broadcastable over out [B, N_img, llm_dim].
         """
         B = ref.shape[0]
+
+        # PENDING[D-15]: ② VSI oracle hard-gating (oracle = 任务标签门控, 对应
+        # D-15 "(a) 任务标签驱动 = E-10-oracle 上界"). Per-sample override set by
+        # the eval wrapper via inner._mope_projector._pending_oracle_gate just
+        # before each question's generate(): g is forced to a per-sample constant
+        # derived from the VSI subtask static/dynamic label (dynamic -> 1.0 = MoPE
+        # full-open; static -> 0.0 = MoPE off / static expert only). This takes
+        # priority over the learned gate_mlp. When the sidecar is None (the
+        # default, and ALWAYS during training) this branch is skipped and the
+        # learned path below runs unchanged — learned mode is byte-for-byte equal
+        # to before. Distinct from the global E10_GATE_OVERRIDE below, which forces
+        # the SAME constant for every sample; the sidecar is PER-sample.
+        oracle_g = self._pending_oracle_gate
+        if oracle_g is not None:
+            g = torch.full((B, 1, 1), float(oracle_g), device=ref.device, dtype=ref.dtype)
+            self._log_eval_gate(g)
+            return g
+
         # E-10 oracle-routing ceiling: when E10_GATE_OVERRIDE is set, ignore the
         # learned gate_mlp entirely and force a constant g for every sample/token
         # (g=0 -> static expert only; g=1 -> MoPE always on ≈ E-03a). Unset ->
         # this branch is skipped and behaviour is unchanged.
         if _GATE_OVERRIDE is not None:
-            return torch.full(
+            g = torch.full(
                 (B, 1, 1), _GATE_OVERRIDE, device=ref.device, dtype=ref.dtype
             )
+            self._log_eval_gate(g)
+            return g
         if cond_text is None:
             # Safe fallback: g = 1 -> identical to ungated E-03a residual.
-            return torch.ones(B, 1, 1, device=ref.device, dtype=ref.dtype)
+            g = torch.ones(B, 1, 1, device=ref.device, dtype=ref.dtype)
+            self._log_eval_gate(g)
+            return g
         # Gate MLP forward + sigmoid run in float32 for numerical stability,
         # then cast g back to the residual dtype. We run the whole MLP in
         # float32 (input + each linear's weight/bias cast to fp32 per-call) so
@@ -308,9 +379,40 @@ class MoPEProjectorCrossAttn(nn.Module):
         logit = torch.nn.functional.linear(
             h, fc2.weight.float(), fc2.bias.float()
         )                                                                   # [B, 1] fp32
-        g = torch.sigmoid(logit)                                            # [B, 1] fp32
-        g = g.view(B, 1, 1).to(ref.dtype)                                   # [B, 1, 1]
+        g_fp32 = torch.sigmoid(logit)                                       # [B, 1] fp32
+        # E-10b: stash the pre-sigmoid logit during TRAINING for the z-loss /
+        # saturation diagnostic. Detached float so it carries no autograd state
+        # (the z-loss is computed on the live-graph logit, see below). Only when
+        # diagnostics are enabled (E-10b); E-10 never populates this list.
+        if self.training and self._diag_enabled:
+            self._gate_logit_buf.append(logit.detach().float().reshape(-1))
+        g = g_fp32.view(B, 1, 1).to(ref.dtype)                              # [B, 1, 1]
+        self._log_eval_gate(g)
+        # E-10b: stash the LIVE-GRAPH fp32 logit so compute_loss can build the
+        # z-loss / Bernoulli-entropy anti-collapse terms with gradients intact.
+        # One entry per training forward (per image shard); compute_loss drains
+        # the whole micro-batch window. Only when anti-collapse is enabled
+        # (E-10b); E-10 never populates this buffer.
+        if self.training and self.use_gate and self._anticollapse_enabled:
+            self._gate_logit_graph_buf.append(logit.reshape(-1))
         return g
+
+    def _log_eval_gate(self, g: torch.Tensor) -> None:
+        """Stash the per-forward gate scalar(s) for the eval ① g-logging path.
+
+        Appends the mean gate value of this forward to ``self._eval_gate_log``
+        ONLY at inference (``not self.training``); training never touches this
+        list (the GateStatsCallback uses the separate ``_gate_buf``). The value
+        is a detached fp32 Python float, so it carries no autograd state and is
+        cheap. The eval wrapper drains + aggregates this list per question.
+
+        At eval, cross-attn is invoked once per image shard (8 frames) with the
+        SAME per-sample ``cond_text`` / oracle constant, so every shard yields an
+        identical g; the per-question mean over the drained list is therefore the
+        representative gate value for that question.
+        """
+        if not self.training:
+            self._eval_gate_log.append(float(g.detach().float().mean().item()))
 
     def forward(
         self,
@@ -348,8 +450,50 @@ class MoPEProjectorCrossAttn(nn.Module):
             # to a flat fp32 1-D tensor keeps it cheap and dtype/device-agnostic;
             # B=1 per-sample calls each append their own slice.
             if self.training:
-                self._gate_buf.append(g.detach().float().reshape(-1))
+                _g_flat = g.detach().float().reshape(-1)
+                self._gate_buf.append(_g_flat)        # GateStatsCallback ([E10-gate])
+                if self._diag_enabled:
+                    # E-10b: independent g window so GateDiagCallback never loses a
+                    # line to GateStatsCallback draining _gate_buf at a colliding step.
+                    self._gate_buf_diag.append(_g_flat)
             out = g * out
+
+        # ------------------------------------------------------------------
+        # E-10b residual-influence diagnostic: mean over tokens of
+        # ‖(g·)out‖ / ‖image_embeds‖ — the actual magnitude the MoPE branch
+        # contributes to the fused feature (extremely small => branch is weak
+        # regardless of the gate). Computed AFTER gate scaling so it reflects the
+        # gated residual. Pure read-out: detached, plain list, zero autograd /
+        # state_dict impact.
+        #   - TRAINING: only when _diag_enabled (E-10b). E-10 never enters here,
+        #     so its forward is byte-for-byte unchanged and memory-bounded.
+        #   - EVAL: only when an eval consumer is listening (the router wrapper
+        #     resets _eval_resid_log before each question — see change C). A
+        #     non-empty list signals "logging requested"; otherwise we skip the
+        #     norm computation entirely so the default learned-eval numerics &
+        #     cost are unchanged unless E10_GATE_LOG enabled the wrapper drain.
+        # ------------------------------------------------------------------
+        if self.use_gate and (
+            (self.training and self._diag_enabled)
+            or (not self.training and self._eval_resid_active)
+        ):
+            with torch.no_grad():
+                _out_n = out.detach().float().norm(dim=-1)             # [B, N_img]
+                _img_n = image_embeds.detach().float().norm(dim=-1)    # [B, N_img]
+                _ratio = (_out_n / _img_n.clamp_min(1e-6)).mean()      # scalar
+                _ratio_f = float(_ratio.item())
+            if self.training:
+                self._resid_ratio_buf.append(_ratio_f)
+            else:
+                # Eval (change C): record per-forward (‖mope_out‖, ‖image_embeds‖,
+                # residual ratio) for per-question logging by the eval wrapper.
+                self._eval_resid_log.append(
+                    (
+                        float(_out_n.mean().item()),
+                        float(_img_n.mean().item()),
+                        _ratio_f,
+                    )
+                )
 
         return image_embeds + out
 
