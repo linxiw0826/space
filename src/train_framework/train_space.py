@@ -477,6 +477,7 @@ def _attach_mope_to_model(model, mope_args: MoPEArguments):
             use_gate=mope_args.mope_use_gate,
             gate_mode=mope_args.mope_gate_mode,
             gate_init_bias=mope_args.mope_gate_init_bias,
+            gate_lastw_std=mope_args.mope_gate_lastw_std,
         )
     elif mope_args.mope_fusion_mode == "qformer":
         from model.mope_projector import MoPEProjectorQFormer

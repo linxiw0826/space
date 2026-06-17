@@ -195,6 +195,15 @@ class MoPEArguments:
                           "was +4.0 (g≈0.98 saturated); set --mope_gate_init_bias 4.0 to reproduce the "
                           "E-10 control. Used at projector construction; no effect when mope_use_gate=False."},
     )
+    mope_gate_lastw_std: float = field(
+        default=1e-3,
+        metadata={"help": "E-10b v2.2: gate MLP final-layer weight init std = the gate's content-seed "
+                          "magnitude. Set a larger value (e.g. 0.5) so the init gate g spreads to "
+                          "~0.3–0.7, giving the MI objective a content seed to amplify and reopening "
+                          "the gradient path back to the content-read layer W1. Default 1e-3 = E-10 "
+                          "status quo (near-zero W2; paired with bias 4.0 -> a constant g≈0.98). "
+                          "Used at projector construction; no effect when mope_use_gate=False."},
+    )
     mope_gate_zloss_coef: float = field(
         default=0.0,
         metadata={"help": "E-10b v2.1 A2: coefficient of the gate logit z-loss L_z = mean(logit^2). "

@@ -5,14 +5,24 @@
 # ARCHITECTURE / TWO-STAGE WARM-START RECIPE = IDENTICAL TO E-10.
 # The ONLY difference vs E-10 is the gate fix bundle, so "E-10b vs E-10 differs
 # only by the gate fix" is the single variable (D-17 naming):
+#   v2.2 = SEED-INIT FIX: the gate MLP final-layer weight init std was near-zero
+#   (1e-3) so the init logit≈0 with only ~1e-4 per-sample divergence -> MI had no
+#   seed to amplify and the grad to the content-read layer W1 was choked to ~0
+#   (W1 frozen). v2.2 enlarges that std into a real content seed AND drops the MI
+#   warmup so MI runs at full strength from step 0.
 #   A1 non-saturated gate init : --mope_gate_init_bias 0.0  (g starts ≈0.5)
 #                                 (E-10 used +4.0 → g≈0.98 saturated → collapse)
+#   v2.2 last-layer seed       : --mope_gate_lastw_std 0.5  (lastw_std=0.5 seed)
+#                                 (E-10 used 1e-3 ≈ near-zero -> logit≈0, no seed)
+#                                 init g spreads to ~0.3–0.7 -> MI has content to
+#                                 amplify and the gradient reaches W1.
 #   A2 gate logit z-loss       : OFF (coef=0) by default. v2's always-on z-loss
 #                                 pulled the gate to the constant g=0.5; the MI
 #                                 objective is self-saturating so z-loss is now a
 #                                 disabled optional guard (--mope_gate_zloss_coef 0.0)
 #   A3 mutual-information +warmup: --mope_gate_entropy_coef 1e-2
-#                                 --mope_gate_entropy_warmup_steps 500
+#                                 --mope_gate_entropy_warmup_steps 0  (v2.2: NO
+#                                 warmup, MI at full strength from step 0)
 #                                 MI = marginal entropy − mean per-sample entropy
 #                                 (RIM/IMSAT form); replaces v2's Bernoulli
 #                                 batch-mean entropy, whose stable max at g=0.5
@@ -115,9 +125,10 @@ MOPE_CODE_PATH=${MOPE_CODE_PATH:-${SPACE_ROOT}/src/vendor/mope}
 # E-10). All overridable via env for ablations.
 # ---------------------------------------------------------------------------
 GATE_INIT_BIAS=${GATE_INIT_BIAS:-0.0}             # A1: g starts ≈0.5 (non-saturated)
+GATE_LASTW_STD=${GATE_LASTW_STD:-0.5}             # v2.2: final-layer weight init std = content seed (E-10 used 1e-3 ≈ near-zero)
 GATE_ZLOSS_COEF=${GATE_ZLOSS_COEF:-0.0}           # A2: z-loss OFF by default (set >0 to guard logit runaway)
 GATE_ENTROPY_COEF=${GATE_ENTROPY_COEF:-1e-2}      # A3: lambda_max for MI objective
-GATE_ENTROPY_WARMUP=${GATE_ENTROPY_WARMUP:-500}   # A3: T_warm (linear warm-up)
+GATE_ENTROPY_WARMUP=${GATE_ENTROPY_WARMUP:-0}     # v2.2: NO warmup (MI at full strength from step 0)
 GATE_DIAG_EVERY=${GATE_DIAG_EVERY:-10}            # change B: [gate-diag] interval (every 10 steps)
 
 # ---------------------------------------------------------------------------
@@ -272,6 +283,7 @@ args="
     --mope_gate_mode learned \
     --mope_gate_anticollapse True \
     --mope_gate_init_bias ${GATE_INIT_BIAS} \
+    --mope_gate_lastw_std ${GATE_LASTW_STD} \
     --mope_gate_zloss_coef ${GATE_ZLOSS_COEF} \
     --mope_gate_entropy_coef ${GATE_ENTROPY_COEF} \
     --mope_gate_entropy_warmup_steps ${GATE_ENTROPY_WARMUP} \
@@ -293,7 +305,7 @@ echo "Start ckpt   : ${GUIDE_CKPT_PATH}"
 echo "Output       : ${output_dir}"
 echo "Log          : ${LOG_FILE}"
 echo "Fusion       : crossattn + learned content-driven gate, batch=${batch_size}, accum=${grad_accum_steps}, NPROC=${NPROC_PER_NODE}, global_batch=${global_batch} (target=${TARGET_GLOBAL_BATCH})"
-echo "Gate fix     : anticollapse=True init_bias=${GATE_INIT_BIAS} zloss=${GATE_ZLOSS_COEF}(OFF) entropy=MI(coef=${GATE_ENTROPY_COEF}) warmup=${GATE_ENTROPY_WARMUP} diag_every=${GATE_DIAG_EVERY}"
+echo "Gate fix     : v2.2 seed-init | anticollapse=True init_bias=${GATE_INIT_BIAS} lastw_std=${GATE_LASTW_STD}(seed) zloss=${GATE_ZLOSS_COEF}(OFF) entropy=MI(coef=${GATE_ENTROPY_COEF}) warmup=${GATE_ENTROPY_WARMUP} diag_every=${GATE_DIAG_EVERY}"
 if [ "${TRAIN_STAGE}" = "stage1" ]; then
     echo "Trainable    : MoPEProjectorCrossAttn + gate (LLM frozen, Stage 1)"
 else

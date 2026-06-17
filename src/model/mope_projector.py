@@ -198,6 +198,7 @@ class MoPEProjectorCrossAttn(nn.Module):
         gate_mode: str = "learned",
         gate_hidden: int = 256,
         gate_init_bias: float = 4.0,
+        gate_lastw_std: float = 1e-3,
     ):
         super().__init__()
         self.mope_dim = mope_dim
@@ -205,6 +206,7 @@ class MoPEProjectorCrossAttn(nn.Module):
         self.use_gate = use_gate
         self.gate_mode = gate_mode
         self.gate_init_bias = gate_init_bias
+        self.gate_lastw_std = gate_lastw_std
 
         self.norm = nn.LayerNorm(mope_dim)
         self.k_proj = nn.Linear(mope_dim, llm_dim)
@@ -310,7 +312,15 @@ class MoPEProjectorCrossAttn(nn.Module):
             #   - b1 = 0.
             nn.init.normal_(self.gate_mlp[0].weight, std=0.02)
             nn.init.zeros_(self.gate_mlp[0].bias)
-            nn.init.normal_(self.gate_mlp[-1].weight, std=1e-3)
+            # E-10b v2.2: gate_lastw_std is the gate's "content seed" magnitude.
+            # std≈1e-3 is near-zero (E-10 default, paired with bias=4.0 -> a
+            # constant g≈0.98); but near-zero W2 makes logit≈0 with ~1e-4
+            # per-sample divergence -> MI has no seed to amplify and the grad to
+            # the content-read layer W1 (∝ W2) is choked to ~0, freezing it.
+            # E-10b v2.2 uses a larger value (e.g. 0.5) so logit has REAL
+            # per-sample divergence at init (g spreads to ~0.3–0.7), giving MI a
+            # content seed to amplify and reopening the gradient path back to W1.
+            nn.init.normal_(self.gate_mlp[-1].weight, std=self.gate_lastw_std)
             nn.init.constant_(self.gate_mlp[-1].bias, gate_init_bias)
 
     def _compute_gate(
