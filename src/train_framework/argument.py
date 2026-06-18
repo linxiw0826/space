@@ -148,6 +148,19 @@ class MoPEArguments:
                           "experiments (E-03a, E-03b) where projector was pre-trained in Stage 1 "
                           "(E-00b / E-00c) and LLM is trained in Stage 2."},
     )
+    load_mope_projector_from_ckpt: bool = field(
+        default=False,
+        metadata={"help": "E-10b warm-gate probe: load the MoPE projector (k/v/out_proj) weights from "
+                          "--model_name_or_path WITHOUT freezing it. Unlike --freeze_mope_projector (which "
+                          "loads AND freezes for Stage-1→Stage-2 warm-start), this loads the projector but "
+                          "keeps it trainable, and tolerates a checkpoint that lacks gate_mlp keys "
+                          "(strict=False -> the freshly-built gate_mlp keeps its constructor MI-seed init). "
+                          "Purpose: start a gated crossattn run from a NON-gated warm checkpoint (e.g. E-03a "
+                          "checkpoint-4000, out_proj≈1.147) so the dynamic branch is non-zero from step 0 and "
+                          "the gate has a live d(loss)/d(g) signal ('doubly-dead gate' falsification probe). "
+                          "Default False = unchanged behaviour for E-03a/E-02c/E-10/E-10b gatefix. Ignored "
+                          "when --freeze_mope_projector is True (that path already loads the projector)."},
+    )
     mope_use_gate: bool = field(
         default=False,
         metadata={"help": "E-10 (Router v1): enable the learned content-driven scalar gate g that "

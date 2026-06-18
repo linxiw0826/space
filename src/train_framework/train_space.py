@@ -781,6 +781,35 @@ def train(attn_implementation="flash_attention_2"):
                     f"(E-00b / E-00c)."
                 )
             rank0_print("[Space Sensing] Stage 2: loaded pre-trained projector weights from Stage 1 checkpoint.")
+        elif mope_args.load_mope_projector_from_ckpt:
+            # E-10b warm-gate probe: load the projector (k/v/out_proj) from
+            # --model_name_or_path but keep it TRAINABLE. The projector is attached
+            # AFTER from_pretrained (line ~769), so HF's from_pretrained silently
+            # dropped the checkpoint's `model._mope_projector.*` keys as unexpected
+            # and the fresh projector is currently zero-init. Without this load the
+            # warm-gate probe would start with out_proj≈0 (dead dynamic branch),
+            # defeating its whole premise. _load_mope_weights_from_checkpoint uses
+            # strict=False, so a non-gated checkpoint (e.g. E-03a, no gate_mlp keys)
+            # loads k/v/out_proj while the freshly-constructed gate_mlp KEEPS its
+            # constructor MI-seed init (it is simply absent from the loaded
+            # state_dict). Unlike the freeze branch above this does NOT freeze the
+            # projector (warm-start joint training) and is non-fatal if the
+            # checkpoint has no MoPE keys (warns and proceeds with the init).
+            _loaded = _load_mope_weights_from_checkpoint(
+                model.model, model_args.model_name_or_path
+            )
+            if _loaded:
+                rank0_print(
+                    "[Space Sensing] Warm-gate probe: loaded MoPE projector "
+                    "(k/v/out_proj) from --model_name_or_path; gate_mlp (if any) "
+                    "keeps its fresh init (strict=False); projector stays trainable."
+                )
+            else:
+                rank0_print(
+                    "[Space Sensing] WARNING: --load_mope_projector_from_ckpt set but "
+                    f"no MoPE projector keys found at {model_args.model_name_or_path}; "
+                    "projector keeps its zero-init (dynamic branch would start dead)."
+                )
 
     # ------------------------------------------------------------------
     # Trainability setup (verbatim from GUIDE, with MoPE projector unfreeze)
