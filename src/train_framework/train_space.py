@@ -555,9 +555,16 @@ def _load_mope_weights_from_checkpoint(inner_model, ckpt_dir: str) -> bool:
         return False
 
     msg = inner_model.load_state_dict(state_dict, strict=False)
+    # Explicitly report the projector keys actually loaded so the warm-gate probe
+    # can confirm at runtime that out_proj (the warm dynamic-branch weight, e.g.
+    # E-03a ~1.147) really came in — not just the encoder. Shard layout is handled
+    # by the *.safetensors glob loop above (every shard is read + prefix-filtered),
+    # so projector tensors are found no matter which shard holds them.
+    _proj_keys = sorted(k for k in state_dict if k.startswith("_mope_projector."))
     rank0_print(
         f"[Space Sensing] Loaded {len(state_dict)} MoPE tensors from checkpoint "
-        f"at {ckpt_path}.  Missing keys (expected): {msg.missing_keys}"
+        f"at {ckpt_path} ({len(_proj_keys)} projector keys): {_proj_keys}.  "
+        f"Missing keys (expected): {msg.missing_keys}"
     )
     return True
 

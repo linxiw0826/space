@@ -36,8 +36,9 @@
 #     init_bias=0.0  lastw_std=8.0  zloss=0.0  entropy_coef=1e-2  warmup=0
 #     anticollapse=True  diag_every=10
 #   THE ONLY meaningful differences vs gatefix stage2 are:
-#     1. START CKPT = E-03a checkpoint-4000 (GUIDE_CKPT_PATH below), NOT the
-#        E-10b stage1 dir. This is the warm out_proj≈1.147 source.
+#     1. START CKPT = E-03a run ROOT dir (GUIDE_CKPT_PATH below) — the finished
+#        stage2 joint model (sharded safetensors in the root, NO checkpoint-N/
+#        subdir), NOT the E-10b stage1 dir. This is the warm out_proj≈1.147 source.
 #     2. --load_mope_projector_from_ckpt True : because the projector is attached
 #        AFTER from_pretrained, HF silently drops the checkpoint's
 #        model._mope_projector.* keys; this flag re-loads k/v/out_proj from the
@@ -63,8 +64,10 @@
 # Supported MODEL_SIZE values: 4b  8b
 # Output dir: e10b_probe_warmgate_{size}
 #
-# RUN-BEFORE CHECK (server huirui): the E-03a start checkpoint must exist:
-#   ${SPACE_OUTPUT_ROOT}/train/e03a_mope_crossattn_two_stage_4b/checkpoint-4000
+# RUN-BEFORE CHECK (server huirui): the E-03a final weights must exist in the run
+# ROOT dir (sharded safetensors, NOT a checkpoint-N/ subdir):
+#   ${SPACE_OUTPUT_ROOT}/train/e03a_mope_crossattn_two_stage_4b/
+#   (model-0000N-of-0000M.safetensors + model.safetensors.index.json)
 # =============================================================================
 set -e
 source "$(dirname "${BASH_SOURCE[0]}")/../env/activate.sh"
@@ -182,14 +185,19 @@ fi
 
 # ---------------------------------------------------------------------------
 # Probe configuration: warm START checkpoint, tune_mm_llm, INDEPENDENT output dir.
-#   - START = E-03a checkpoint-4000 (out_proj warm ~1.147). Overridable via env
-#     GUIDE_CKPT_PATH; defaults to the E-03a ckpt, NOT the E-10b stage1 dir.
+#   - START = E-03a run ROOT dir (out_proj warm ~1.147). Overridable via env
+#     GUIDE_CKPT_PATH; defaults to the E-03a root, NOT the E-10b stage1 dir.
 #   - tune_mm_llm True (stage2-style warm-start JOINT training).
 #   - --load_mope_projector_from_ckpt True re-loads the projector from the E-03a
 #     ckpt (strict=False) and keeps it trainable (see header).
 # ---------------------------------------------------------------------------
 TUNE_MM_LLM=True
-GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-${SPACE_OUTPUT_ROOT}/train/e03a_mope_crossattn_two_stage_${MODEL_SIZE}/checkpoint-4000}
+# E-03a final weights live in the run ROOT dir (sharded safetensors:
+# model-0000N-of-0000M.safetensors + model.safetensors.index.json), NOT under a
+# checkpoint-N/ subdir. The root is the finished stage2 joint model -> out_proj is
+# warm (~1.147) here. _load_mope_weights_from_checkpoint globs *.safetensors and
+# reads every shard, so out_proj is found regardless of which shard holds it.
+GUIDE_CKPT_PATH=${GUIDE_CKPT_PATH:-${SPACE_OUTPUT_ROOT}/train/e03a_mope_crossattn_two_stage_${MODEL_SIZE}}
 output_dir="${OUTPUT_DIR:-${SPACE_OUTPUT_ROOT}/train/e10b_probe_warmgate_${MODEL_SIZE}}"
 run_name="space_e10b_probe_warmgate_${MODEL_SIZE}_lr1e-5"
 exp_name="e10b_probe_warmgate_${MODEL_SIZE}"
