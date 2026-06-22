@@ -16,7 +16,7 @@
 # =============================================================================
 # Per-server profile (sets SPACE_ROOT, SPACE_LOG_ROOT, etc.)
 # =============================================================================
-source "$(dirname "${BASH_SOURCE[0]}")/../env/activate.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/../_common/env/activate.sh"
 
 # =============================================================================
 # Log setup: stdout + stderr → terminal AND log file simultaneously

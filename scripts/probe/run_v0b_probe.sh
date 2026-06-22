@@ -55,7 +55,7 @@ SPACE_ROOT="${SPACE_ROOT:-$(cd "${_SCRIPT_DIR}/../.." && pwd)}"
 # Source per-server environment profile (sets SPACE_PROFILE / conda env etc.)
 # Non-fatal: the warning from activate.sh is acceptable on unknown hosts.
 # ---------------------------------------------------------------------------
-source "${_SCRIPT_DIR}/../env/activate.sh" || true
+source "${_SCRIPT_DIR}/../_common/env/activate.sh" || true
 
 # ---------------------------------------------------------------------------
 # Configuration — all overridable via env or positional args
