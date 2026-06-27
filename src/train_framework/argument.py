@@ -254,6 +254,109 @@ class MoPEArguments:
                           "Default 10 (print every 10 steps)."},
     )
 
+    # -----------------------------------------------------------------------
+    # paper-2 Stage 1: LFP (Latent Future Prediction) auxiliary head.
+    # ALL fields default to OFF / zero-impact (the same opt-in pattern as
+    # ``load_mope_projector_from_ckpt`` and ``mope_use_gate``). When
+    # ``mope_lfp_enable=False`` (the default) the LFP head is NOT built, the
+    # outer LFP forward-patch is NOT installed, and the E-03a / E-10 / E-10b
+    # paths are byte-for-byte unchanged. implements D-12 (论文2 辅助信号 =
+    # MoPE latent future-feature prediction; Stage 1 activation per
+    # decisions.md 2026-06-19, distillation-style target per paper2_design.md §2.3).
+    # NOT a PENDING marker: D-12 is activated as the paper-2 main method.
+    # -----------------------------------------------------------------------
+    mope_lfp_enable: bool = field(
+        default=False,
+        metadata={"help": "paper-2 Stage 1 MAIN SWITCH: enable the LFP auxiliary prediction head "
+                          "(LLM hidden state -> predict frozen-MoPE future-frame latent). When False "
+                          "(default) the head is not built, the outer LFP forward-patch is not "
+                          "installed, and the training path is byte-for-byte identical to E-03a. "
+                          "Only meaningful when mope_fusion_mode=crossattn (the inner crossattn patch "
+                          "must run to cache the frozen-MoPE latent for the LFP target). "
+                          "implements D-12."},
+    )
+    mope_lfp_weight: float = field(
+        default=0.1,
+        metadata={"help": "LFP auxiliary loss weight lambda in L = L_NTP + lambda * L_lfp. "
+                          "Default 0.1 (Cambrian-S scale). Monitor |L_lfp| vs |L_NTP|: the "
+                          "auxiliary term must stay ~1 order of magnitude below NTP so it "
+                          "reshapes the representation without swamping the LM objective "
+                          "(risk-7). lambda=0.1 is the starting value; tune per run. "
+                          "Before a full run, read the rank0 '[LFP DIAG]' print (first 3 "
+                          "steps) and adjust lambda by the ratio_L_lfp/L_ntp it reports: "
+                          "target lambda*L_lfp ~1 order of magnitude below L_ntp "
+                          "(ratio ~0.05-0.2); >0.5 -> lower lambda, <0.01 -> raise it."},
+    )
+    mope_lfp_mse_weight: float = field(
+        default=1.0,
+        metadata={"help": "LFP MSE term weight in L_lfp = mse_w*MSE + cos_w*(1-cos). Default 1.0."},
+    )
+    mope_lfp_cos_weight: float = field(
+        default=1.0,
+        metadata={"help": "LFP cosine term weight in L_lfp = mse_w*MSE + cos_w*(1-cos). Default 1.0."},
+    )
+    mope_lfp_hidden: int = field(
+        default=2048,
+        metadata={"help": "LFP head MLP hidden width (Cambrian-S scale). Default 2048. "
+                          "Used at head construction; no effect when mope_lfp_enable=False."},
+    )
+    mope_lfp_target_dim: int = field(
+        default=768,
+        metadata={"help": "LFP target dimension (= MoPE embed_dim, fixed 768 for ViT-B). "
+                          "Used at head construction; no effect when mope_lfp_enable=False."},
+    )
+    mope_lfp_context_frames: int = field(
+        default=4,
+        metadata={"help": "DEPRECATED (kept for back-compat, no effect on the default "
+                          "token-shift path). Was the leading-context frame count for the "
+                          "old distillation-style target (方案 4-A). The FINAL token-shift "
+                          "target (decisions.md 2026-06-27, pred_source=per_frame_video) does "
+                          "NOT use a context/future split — it derives 3 predict-next-bin pairs "
+                          "from the 4 latent time-bins directly. Only consulted when "
+                          "pred_source != 'per_frame_video' (legacy distillation path)."},
+    )
+    mope_lfp_target_pool: str = field(
+        default="mean",
+        metadata={"help": "LFP target aggregation: 'mean' (default) -> [B, 768] (single-vector "
+                          "prediction, the Cambrian-S 2-layer-MLP template, most stable); "
+                          "'token' -> [B, N_future, 768] (per-token prediction, reserved for a "
+                          "later Stage-1 extension). Stage 1 uses 'mean'."},
+    )
+    mope_lfp_pred_source: str = field(
+        default="per_frame_video",
+        metadata={"help": "Selects the LFP target/source construction. 'per_frame_video' "
+                          "(DEFAULT, FINAL token-shift path, decisions.md 2026-06-27): pool the "
+                          "LLM last hidden state PER VIDEO FRAME (one mean-pool per contiguous "
+                          "run of video_token_id, temporal order), uniformly group the F frames "
+                          "into the MoPE 4 time-bins, and predict bin t+1's frozen-MoPE latent "
+                          "from bin t's causal hidden (3 predict-next-bin pairs). This is the "
+                          "Cambrian-S-faithful TRUE-future objective with no leakage (LLM is "
+                          "strictly causal). 'last_answer' (legacy, BLOCK-1 distillation): read "
+                          "the hidden state at the last non -100 label token — kept only to "
+                          "reproduce old runs; it leaks future info and is no longer the default."},
+    )
+    mope_lfp_align_strategy: str = field(
+        default="uniform",
+        metadata={"help": "How to align the F LLM video frames to the MoPE 4 time-bins for the "
+                          "token-shift target (pred_source=per_frame_video). 'uniform' (default): "
+                          "bin b covers LLM frames [b*F//4, (b+1)*F//4) (time-segment alignment, "
+                          "robust to F != 8 since the LLM frame count is set by the video_processor "
+                          "while MoPE always uses 8 frames). Reserved knob; only 'uniform' is "
+                          "currently implemented."},
+    )
+    mope_feed_features: bool = field(
+        default=True,
+        metadata={"help": "paper-2 Stage 1 feed-features bypass (orthogonal to mope_lfp_enable). "
+                          "True (default) = E-03a behavior: the cross-attn residual fuses MoPE "
+                          "features into each image-embed shard. False = skip the residual fusion "
+                          "(return image_embeds untouched) — the LLM no longer SEES MoPE features "
+                          "injected, but the frozen encoder still runs once per forward and its "
+                          "latent is cached for the LFP target path. This flag + mope_lfp_enable "
+                          "form the three orthogonal arms: E-03a (feed=T, lfp=F) / E-15 "
+                          "prediction-only (feed=F, lfp=T) / E-16 both (feed=T, lfp=T). Default "
+                          "True keeps E-03a/E-10/E-10b byte-for-byte unchanged."},
+    )
+
 
 # ---------------------------------------------------------------------------
 # DataArguments  (verbatim copy from GUIDE — do not modify)

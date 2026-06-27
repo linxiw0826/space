@@ -507,6 +507,38 @@ def _attach_mope_to_model(model, mope_args: MoPEArguments):
     for p in projector.parameters():
         p.requires_grad = True
 
+    # -----------------------------------------------------------------
+    # paper-2 Stage 1: LFP auxiliary head (implements D-12).
+    # Only built when mope_lfp_enable=True (opt-in). When False the head is
+    # never constructed and the training path is byte-for-byte E-03a. The
+    # head lives on model.model as _mope_lfp_head (mirrors _mope_projector)
+    # so it participates in .to(device)/.parameters()/state_dict/FSDP.
+    # Trainability is managed jointly with --freeze_mope_projector later in
+    # the trainability block (both 2-stage stages train it, aligned with the
+    # projector). The head has its OWN decoupled input projection so the
+    # "prediction-only" arm (mope_feed_features=False) is strictly orthogonal
+    # to the cross-attn projector (risk-6).
+    # -----------------------------------------------------------------
+    if mope_args.mope_lfp_enable:
+        from model.lfp_head import MoPELFPHead
+        lfp_head = MoPELFPHead(
+            llm_dim=llm_dim,
+            hidden=mope_args.mope_lfp_hidden,
+            target_dim=mope_args.mope_lfp_target_dim,
+        )
+        inner_model.add_module("_mope_lfp_head", lfp_head)
+        for p in lfp_head.parameters():
+            p.requires_grad = True
+        rank0_print(
+            f"[Space Sensing] LFP auxiliary head attached "
+            f"(implements D-12; hidden={mope_args.mope_lfp_hidden}, "
+            f"target_dim={mope_args.mope_lfp_target_dim}, "
+            f"weight={mope_args.mope_lfp_weight}, "
+            f"context_frames={mope_args.mope_lfp_context_frames}, "
+            f"target_pool={mope_args.mope_lfp_target_pool}, "
+            f"pred_source={mope_args.mope_lfp_pred_source})."
+        )
+
     rank0_print(
         f"[Space Sensing] MoPE attached: encoder frozen, "
         f"projector dim 768 -> {llm_dim} (trainable)"
@@ -534,7 +566,15 @@ def _load_mope_weights_from_checkpoint(inner_model, ckpt_dir: str) -> bool:
         for shard in shards:
             shard_data = _st_load_file(str(shard))
             for k, v in shard_data.items():
-                if k.startswith("model._mope_encoder.") or k.startswith("model._mope_projector."):
+                # Also pick up the paper-2 Stage 1 LFP head keys when present
+                # (implements D-12) so a Stage-1 LFP checkpoint warm-starts the
+                # head in Stage 2. Checkpoints without LFP keys (the default,
+                # e.g. E-00b Stage-1) simply contribute none here.
+                if (
+                    k.startswith("model._mope_encoder.")
+                    or k.startswith("model._mope_projector.")
+                    or k.startswith("model._mope_lfp_head.")
+                ):
                     state_dict[k[len("model."):]] = v
     except ImportError:
         pass
@@ -545,7 +585,11 @@ def _load_mope_weights_from_checkpoint(inner_model, ckpt_dir: str) -> bool:
         for bin_file in bin_files:
             bin_data = torch.load(str(bin_file), map_location="cpu", weights_only=True)
             for k, v in bin_data.items():
-                if k.startswith("model._mope_encoder.") or k.startswith("model._mope_projector."):
+                if (
+                    k.startswith("model._mope_encoder.")
+                    or k.startswith("model._mope_projector.")
+                    or k.startswith("model._mope_lfp_head.")
+                ):
                     state_dict[k[len("model."):]] = v
 
     if not state_dict:
@@ -846,6 +890,16 @@ def train(attn_implementation="flash_attention_2"):
                 p.requires_grad = not mope_args.freeze_mope_projector
             _proj_status = "frozen (two-stage)" if mope_args.freeze_mope_projector else "re-enabled"
             rank0_print(f"[Space Sensing] MoPEProjector {_proj_status} after LoRA freeze.")
+            # paper-2 Stage 1: the LFP head trains in BOTH 2-stage stages
+            # (aligned with the projector, implements D-12). It is only present
+            # when mope_lfp_enable=True; default False -> this block is skipped.
+            if hasattr(model.model, "_mope_lfp_head"):
+                for p in model.model._mope_lfp_head.parameters():
+                    p.requires_grad = True
+                rank0_print(
+                    "[Space Sensing] MoPELFPHead trainable after LoRA freeze "
+                    "(both stages train it, aligned with the projector)."
+                )
     else:
         set_model(model_args, model)
 
@@ -860,6 +914,16 @@ def train(attn_implementation="flash_attention_2"):
                 p.requires_grad = not mope_args.freeze_mope_projector
             _proj_status = "frozen (two-stage)" if mope_args.freeze_mope_projector else "trainable"
             rank0_print(f"[Space Sensing] MoPEEncoder frozen, MoPEProjector {_proj_status}.")
+            # paper-2 Stage 1: the LFP head trains in BOTH 2-stage stages
+            # (aligned with the projector, implements D-12). It is only present
+            # when mope_lfp_enable=True; default False -> this block is skipped.
+            if hasattr(model.model, "_mope_lfp_head"):
+                for p in model.model._mope_lfp_head.parameters():
+                    p.requires_grad = True
+                rank0_print(
+                    "[Space Sensing] MoPELFPHead trainable "
+                    "(both stages train it, aligned with the projector)."
+                )
 
         is_rank0 = (
             (not torch.distributed.is_available())
@@ -920,11 +984,53 @@ def train(attn_implementation="flash_attention_2"):
         if mope_args.mope_fusion_mode == "concat":
             _patch_model_for_mope_concat(model)
         elif mope_args.mope_fusion_mode == "crossattn":
-            _patch_model_for_mope_crossattn(model)
+            # paper-2 Stage 1: mope_feed_features bypass (spec Q6/S5). Default
+            # True = E-03a residual fusion unchanged. False = skip the residual
+            # (LLM no longer sees MoPE features injected) but still cache the
+            # frozen-encoder latent for the LFP target path. Orthogonal to
+            # mope_lfp_enable.
+            _patch_model_for_mope_crossattn(
+                model, feed_features=mope_args.mope_feed_features
+            )
         elif mope_args.mope_fusion_mode == "qformer":
             _patch_model_for_mope_qformer(model)
         else:
             _patch_model_for_mope(model)
+
+        # ----------------------------------------------------------------
+        # paper-2 Stage 1: LFP outer forward-patch (implements D-12).
+        # Installed ONLY when mope_lfp_enable=True (opt-in). When False the
+        # outer forward is untouched and the E-03a path is byte-for-byte
+        # unchanged. Requires the inner crossattn patch above to populate the
+        # frozen-MoPE latent cache (_mope_cached_x_vis) used as the prediction
+        # target, so we only attach it when the fusion mode is crossattn.
+        # ----------------------------------------------------------------
+        if mope_args.mope_lfp_enable:
+            if mope_args.mope_fusion_mode != "crossattn":
+                raise RuntimeError(
+                    "mope_lfp_enable=True requires mope_fusion_mode=crossattn "
+                    "(the inner crossattn patch caches the frozen-MoPE latent "
+                    "that the LFP target path reuses). Got "
+                    f"mope_fusion_mode={mope_args.mope_fusion_mode!r}."
+                )
+            from model.mope_patch import _patch_model_for_lfp
+
+            # Lightweight config container closed over by the patch closure.
+            class _LFPCfg:
+                enable = True
+                weight = float(mope_args.mope_lfp_weight)
+                mse_weight = float(mope_args.mope_lfp_mse_weight)
+                cos_weight = float(mope_args.mope_lfp_cos_weight)
+                # pred_source="per_frame_video" (default) -> FINAL token-shift
+                # path; any other value -> legacy distillation (uses the two
+                # fields below). align_strategy is reserved (only "uniform" now).
+                pred_source = str(mope_args.mope_lfp_pred_source)
+                align_strategy = str(mope_args.mope_lfp_align_strategy)
+                # Legacy distillation fields (back-compat; ignored by token-shift).
+                context_frames = int(mope_args.mope_lfp_context_frames)
+                target_pool = str(mope_args.mope_lfp_target_pool)
+
+            _patch_model_for_lfp(model, _LFPCfg)
 
     # ------------------------------------------------------------------
     # Data + training (verbatim from GUIDE)
