@@ -18,6 +18,7 @@
 # 3 pairs; decisions.md 2026-06-27) / align_strategy uniform.
 # Before a full run, read the rank0 '[LFP DIAG]' print (first 3 steps) and
 # tune --mope_lfp_weight by the ratio it reports (target ratio ~0.05-0.2).
+# Override lambda without editing this file: LFP_WEIGHT=0.03 bash train_e15_lfp_predonly.sh
 #
 # Paper-2 Stage-1 3-way ablation (see paper2_design.md §3):
 #   E-03a  = feed only      (mope_feed_features=T, mope_lfp_enable=F)  baseline
@@ -116,6 +117,9 @@ fi
 # Hyperparameters
 # ---------------------------------------------------------------------------
 lr=1e-5
+# LFP auxiliary loss weight lambda. Default 0.1 (== argument.py default, so
+# byte-equivalent to before when unset). Override: LFP_WEIGHT=0.03 bash ...
+LFP_WEIGHT=${LFP_WEIGHT:-0.1}
 
 # ---------------------------------------------------------------------------
 # Entry point: our fork of the training framework
@@ -175,6 +179,7 @@ args="
     --group_by_modality_length True \
     --mope_feed_features False \
     --mope_lfp_enable True \
+    --mope_lfp_weight ${LFP_WEIGHT} \
     ${RESUME_FROM_CHECKPOINT:+--resume_from_checkpoint ${RESUME_FROM_CHECKPOINT}}"
 
 # ---------------------------------------------------------------------------
@@ -187,7 +192,7 @@ echo "Output : ${output_dir}"
 echo "Log    : ${LOG_FILE}"
 echo "Fusion : crossattn, batch=${batch_size}, accum=${grad_accum_steps}"
 echo "Feed   : OFF (mope_feed_features=False)"
-echo "LFP    : ON  (mope_lfp_enable=True, weight=0.1, token-shift predict-next-bin, src=per_frame_video)"
+echo "LFP    : ON  (mope_lfp_enable=True, weight=${LFP_WEIGHT}, token-shift predict-next-bin, src=per_frame_video)"
 echo "Trainable: LLM + LFP head (warm-start joint, D-10)"
 
 python -m torch.distributed.run --nproc_per_node=${NPROC_PER_NODE} \
