@@ -752,34 +752,56 @@ def _extract_pred_source(hidden_states, labels, pred_source):
 # =============================================================================
 
 
-def _extract_per_frame_video_hidden(hidden_states, input_ids, video_token_id):
-    """Pool the LLM last hidden state PER VIDEO FRAME, in temporal order (spec S1).
+def _extract_per_frame_video_hidden(hidden_states, input_ids, visual_token_ids):
+    """Pool the LLM last hidden state PER VISUAL FRAME, in temporal order (spec S1).
 
-    Qwen3VL lays out each video frame as an independent run
-    ``<timestamp> <vision_start> <video_token x N> <vision_end>`` in the LLM
-    sequence (spec F1), where N (= tokens-per-frame) depends on the frame
-    resolution and is therefore NOT a fixed constant across videos. We must
-    NOT assume 8 frames or a fixed token count: instead we split on contiguous
-    runs of ``video_token_id`` (a run break = a gap > 1 between consecutive
-    video-token indices) and mean-pool each run into one per-frame vector.
+    Qwen3VL lays out each frame as an independent run
+    ``<vision_start> <visual_token x N> <vision_end>`` in the LLM sequence (spec
+    F1), where N (= tokens-per-frame) depends on the frame resolution and is
+    therefore NOT a fixed constant. We must NOT assume 8 frames or a fixed token
+    count: we split on contiguous runs of ANY visual placeholder token (a run
+    break = a gap > 1 between consecutive visual-token indices) and mean-pool
+    each run into one per-frame vector.
+
+    IMPORTANT (training-vs-eval token id, the E-16 no-DIAG bug fix): the SPAR /
+    VSI-590K training pipeline converts each video into a list of IMAGES
+    (data_processor.py:743-755 replaces <video> with N <image> tokens and drops
+    the "video" key), so during TRAINING each frame is an IMAGE token
+    (image_token_id=151655), NOT a video token (151656). At eval (VSI-Bench) the
+    same frames may instead be video tokens. We therefore key on the SET of
+    visual token ids (image_token_id AND video_token_id) so the per-frame
+    extraction works for both layouts. The temporal-order + causal-isolation
+    argument (spec F1) holds identically for the multi-image layout: images are
+    emitted in temporal order, contiguously, and the LLM is strictly causal, so
+    frame t's hidden cannot attend to frame t+1's tokens.
 
     Args:
-        hidden_states:  [B, L, llm_dim] LLM last hidden state.
-        input_ids:      [B, L] token ids.
-        video_token_id: int (= config.video_token_id, e.g. 151656).
+        hidden_states:    [B, L, llm_dim] LLM last hidden state.
+        input_ids:        [B, L] token ids.
+        visual_token_ids: int OR iterable of ints (e.g. (image_token_id,
+                          video_token_id)). None entries are ignored.
 
     Returns:
         per_frame_hidden: [B, F, llm_dim] per-frame mean-pooled hidden, in
                           TEMPORAL ORDER (frame 0 .. frame F-1). F is the number
-                          of video frames in this batch's sequence. If samples
-                          disagree on F (different resolutions / frame counts),
-                          they are truncated to the per-batch minimum F (defensive).
-                          Returns None if input_ids is None, video_token_id is
-                          None, or no video tokens are present.
+                          of frames in this batch's sequence. If samples disagree
+                          on F (different resolutions / frame counts), they are
+                          truncated to the per-batch minimum F (defensive).
+                          Returns None if input_ids is None, no valid visual
+                          token id is given, or no visual tokens are present.
     """
-    if input_ids is None or video_token_id is None:
+    if input_ids is None or visual_token_ids is None:
         return None
-    is_video = (input_ids == video_token_id)        # [B, L] bool
+    # Normalize to a list of valid (non-None) ids.
+    if isinstance(visual_token_ids, int):
+        id_list = [visual_token_ids]
+    else:
+        id_list = [t for t in visual_token_ids if t is not None]
+    if not id_list:
+        return None
+    is_video = torch.zeros_like(input_ids, dtype=torch.bool)   # [B, L]
+    for tid in id_list:
+        is_video |= (input_ids == tid)
     B, L, D = hidden_states.shape
     per_frame = []
     for b in range(B):
@@ -1032,6 +1054,26 @@ def _patch_model_for_lfp(model, lfp_cfg) -> None:
         lfp_head = getattr(inner_model, '_mope_lfp_head', None)
         cached_x_vis = getattr(inner_model, '_mope_cached_x_vis', None)
 
+        # ----------------------------------------------------------------
+        # One-time unconditional entry probe (rank0). Prints WHY the LFP block
+        # was or was not entered, so a 5-step dry run confirms the wiring. It
+        # fires once per process and then auto-silences.
+        # ----------------------------------------------------------------
+        if not _lfp_diag_state.get("entry_probed", False):
+            try:
+                import torch.distributed as _dist
+                _probe_rank0 = (not _dist.is_initialized()) or _dist.get_rank() == 0
+            except Exception:
+                _probe_rank0 = True
+            if _probe_rank0:
+                _lfp_diag_state["entry_probed"] = True
+                print(
+                    f"[LFP PROBE] entry: use_tokenshift={_use_tokenshift}, "
+                    f"lfp_head_is_None={lfp_head is None}, "
+                    f"cached_x_vis_is_None={cached_x_vis is None}",
+                    flush=True,
+                )
+
         if lfp_head is not None and cached_x_vis is not None and _use_tokenshift:
             # ----------------------------------------------------------------
             # FINAL token-shift path (Cambrian-S faithful, decisions.md
@@ -1039,17 +1081,50 @@ def _patch_model_for_lfp(model, lfp_cfg) -> None:
             # frozen-MoPE latent bins 1..K-1 -> bin t hidden predicts bin t+1
             # latent (3 pairs for 4 bins). spec S1-S4.
             # ----------------------------------------------------------------
-            video_token_id = getattr(getattr(self, 'config', None), 'video_token_id', None)
-            if video_token_id is None:
-                video_token_id = getattr(getattr(inner_model, 'config', None), 'video_token_id', None)
+            # Key on BOTH image and video placeholder ids: SPAR/VSI-590K training
+            # feeds frames as IMAGES (data_processor converts <video> -> N <image>),
+            # so the per-frame runs are image tokens at train time; eval may use
+            # video tokens. See _extract_per_frame_video_hidden docstring.
+            _cfg = getattr(self, 'config', None) or getattr(inner_model, 'config', None)
+            image_token_id = getattr(_cfg, 'image_token_id', None)
+            video_token_id = getattr(_cfg, 'video_token_id', None)
 
             per_frame_h = _extract_per_frame_video_hidden(
-                hidden_states, input_ids, video_token_id
+                hidden_states, input_ids, (image_token_id, video_token_id)
             )
+            if not _lfp_diag_state.get("shape_probed", False):
+                try:
+                    import torch.distributed as _dist
+                    _probe_rank0 = (not _dist.is_initialized()) or _dist.get_rank() == 0
+                except Exception:
+                    _probe_rank0 = True
+                if _probe_rank0:
+                    _lfp_diag_state["shape_probed"] = True
+                    _pf_shape = None if per_frame_h is None else tuple(per_frame_h.shape)
+                    print(
+                        f"[LFP PROBE] image_token_id={image_token_id}, "
+                        f"video_token_id={video_token_id}, "
+                        f"per_frame_h={_pf_shape}",
+                        flush=True,
+                    )
             if per_frame_h is not None:
                 source_bins, target_bins = _build_tokenshift_pairs(
                     cached_x_vis, per_frame_h, tubelet=2, spatial=196,
                 )
+                if not _lfp_diag_state.get("src_probed", False):
+                    try:
+                        import torch.distributed as _dist
+                        _probe_rank0 = (not _dist.is_initialized()) or _dist.get_rank() == 0
+                    except Exception:
+                        _probe_rank0 = True
+                    if _probe_rank0:
+                        _lfp_diag_state["src_probed"] = True
+                        _sb = None if source_bins is None else tuple(source_bins.shape)
+                        _tb = None if target_bins is None else tuple(target_bins.shape)
+                        print(
+                            f"[LFP PROBE] source_bins={_sb}, target_bins={_tb}",
+                            flush=True,
+                        )
                 if source_bins is not None and source_bins.shape[1] > 0:
                     B_ts, Km1, llm_dim = source_bins.shape
                     target_dim = target_bins.shape[-1]

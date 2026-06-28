@@ -14,11 +14,15 @@ Covers the spec §四 single-test requirements (state/analyses/
 Run:  python tests/test_tokenshift_lfp.py
 """
 
+import contextlib
 import importlib.util
+import io
 import os
 import re
+import types
 
 import torch
+import torch.nn as nn
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.join(_HERE, "..", "src")
@@ -179,6 +183,121 @@ def test_head_consumes_batched_source():
     print("ok  test_head_consumes_batched_source")
 
 
+def test_per_frame_extraction_image_tokens():
+    """Frames fed as IMAGE tokens (SPAR train path) extract correctly via id-set.
+
+    Regression for the E-16 no-DIAG bug: training converts <video> -> N <image>,
+    so frames are image_token_id (151655), not video_token_id (151656). The
+    extractor must accept a tuple of ids and segment on whichever is present.
+    """
+    image_id, video_id = 151655, 151656
+    B, L, D = 1, 200, 4
+    seg = [40, 40, 40, 40]  # 4 image frames
+    input_ids = _build_video_input_ids(seg, image_id, B, L)
+    hidden = torch.randn(B, L, D)
+    # Keyed on video id ALONE -> None (this was the bug).
+    assert mp._extract_per_frame_video_hidden(hidden, input_ids, video_id) is None
+    # Keyed on the (image, video) id set -> 4 frames.
+    out = mp._extract_per_frame_video_hidden(hidden, input_ids, (image_id, video_id))
+    assert out is not None and out.shape == (B, 4, D), None if out is None else out.shape
+    # None entries in the id set are ignored.
+    out2 = mp._extract_per_frame_video_hidden(hidden, input_ids, (image_id, None))
+    assert out2 is not None and out2.shape == (B, 4, D)
+    print("ok  test_per_frame_extraction_image_tokens")
+
+
+def test_integration_lfp_block_executes_with_image_tokens():
+    """End-to-end: with two patches' state in place + IMAGE tokens, the LFP term
+    is actually ADDED to the loss and [LFP DIAG]/[LFP PROBE] print.
+
+    Builds a minimal fake outer/inner mirroring the real wiring:
+      - inner.forward sets _mope_cached_x_vis (as the crossattn patch does) and
+        returns hidden_states = outputs[0];
+      - inner carries _mope_lfp_head;
+      - outer carries lm_head / loss_function / config;
+      - _patch_model_for_lfp wraps outer.forward.
+    Then we run with cfg.weight=0 (NTP only) vs cfg.weight>0 and assert the loss
+    differs -> the token-shift LFP block executed on the image-token layout.
+    """
+    image_id, video_id = 151655, 151656
+    vocab, llm_dim, target_dim = 16, 12, 8
+    spatial, n_bins = 196, 4
+    B, L = 2, 220
+    seg = [30, 30, 30, 30, 30]  # 5 image frames
+    input_ids = _build_video_input_ids(seg, image_id, B, L)
+    labels = input_ids.clone()  # non-None -> training branch
+    cached = torch.randn(B, spatial * n_bins, target_dim)
+
+    # Load MoPELFPHead.
+    _spec2 = importlib.util.spec_from_file_location(
+        "lfp_head_under_test2", os.path.join(_SRC, "model", "lfp_head.py")
+    )
+    lh = importlib.util.module_from_spec(_spec2)
+    _spec2.loader.exec_module(lh)
+
+    class FakeInner(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(image_id + 8, llm_dim)
+            self.config = types.SimpleNamespace(
+                image_token_id=image_id, video_token_id=video_id
+            )
+            self._cached = cached
+
+        def forward(self, input_ids=None, **kw):
+            # Mirror the crossattn patch: populate the frozen-latent cache.
+            self._mope_cached_x_vis = self._cached
+            return (self.embed(input_ids),)   # outputs[0] = hidden_states
+
+    class FakeOuter(nn.Module):
+        def __init__(self, inner):
+            super().__init__()
+            self.model = inner
+            self.lm_head = nn.Linear(llm_dim, vocab)
+            self.config = types.SimpleNamespace(
+                text_config=types.SimpleNamespace(vocab_size=vocab),
+                image_token_id=image_id, video_token_id=video_id,
+            )
+
+        def loss_function(self, logits, labels, vocab_size):
+            return logits.float().mean()   # deterministic stand-in for NTP CE
+
+        def forward(self, *a, **k):
+            raise RuntimeError("original_forward should not run in training branch")
+
+    def _make_cfg(weight):
+        return types.SimpleNamespace(
+            enable=True, weight=weight, mse_weight=1.0, cos_weight=1.0,
+            context_frames=4, target_pool="mean",
+            pred_source="per_frame_video", align_strategy="uniform",
+        )
+
+    def _run(weight):
+        torch.manual_seed(0)
+        inner = FakeInner()
+        outer = FakeOuter(inner)
+        head = lh.MoPELFPHead(llm_dim=llm_dim, hidden=16, target_dim=target_dim)
+        inner._mope_lfp_head = head
+        mp._patch_model_for_lfp(outer, _make_cfg(weight))
+        out = outer(input_ids=input_ids, labels=labels, pixel_values=torch.zeros(1))
+        loss = out[0] if isinstance(out, tuple) else out.loss
+        return float(loss.item())
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        loss_ntp_only = _run(0.0)   # weight=0 -> LFP term contributes nothing
+        loss_with_lfp = _run(0.5)   # weight>0 -> LFP term added
+    log = buf.getvalue()
+
+    assert "[LFP PROBE] entry:" in log, log
+    assert "per_frame_h=(2, 5," in log, "per-frame extraction must find 5 image frames:\n" + log
+    assert "[LFP DIAG]" in log, "LFP DIAG must print (block executed):\n" + log
+    assert abs(loss_with_lfp - loss_ntp_only) > 1e-6, (
+        f"LFP term not added: ntp={loss_ntp_only}, with_lfp={loss_with_lfp}"
+    )
+    print("ok  test_integration_lfp_block_executes_with_image_tokens")
+
+
 def test_byte_equivalence_guard_source():
     """Structural: _patch_model_for_lfp is only called under mope_lfp_enable.
 
@@ -220,5 +339,7 @@ if __name__ == "__main__":
     test_tokenshift_pairing()
     test_tokenshift_degenerate_single_bin()
     test_head_consumes_batched_source()
+    test_per_frame_extraction_image_tokens()
+    test_integration_lfp_block_executes_with_image_tokens()
     test_byte_equivalence_guard_source()
     print("\nALL TOKEN-SHIFT LFP TESTS PASSED")
