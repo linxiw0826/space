@@ -265,20 +265,23 @@ def test_integration_lfp_block_executes_with_image_tokens():
         def forward(self, *a, **k):
             raise RuntimeError("original_forward should not run in training branch")
 
-    def _make_cfg(weight):
+    def _make_cfg(weight, reg_weight=0.0, reg_normalize=True):
         return types.SimpleNamespace(
             enable=True, weight=weight, mse_weight=1.0, cos_weight=1.0,
             context_frames=4, target_pool="mean",
             pred_source="per_frame_video", align_strategy="uniform",
+            # E-16b reg fields (reg_weight=0.0 default -> reg branch NOT entered).
+            reg_weight=reg_weight, reg_type="vicreg", reg_var_hinge=1.0,
+            reg_cov_scale=1.0, reg_normalize=reg_normalize,
         )
 
-    def _run(weight):
+    def _run(weight, reg_weight=0.0):
         torch.manual_seed(0)
         inner = FakeInner()
         outer = FakeOuter(inner)
         head = lh.MoPELFPHead(llm_dim=llm_dim, hidden=16, target_dim=target_dim)
         inner._mope_lfp_head = head
-        mp._patch_model_for_lfp(outer, _make_cfg(weight))
+        mp._patch_model_for_lfp(outer, _make_cfg(weight, reg_weight=reg_weight))
         out = outer(input_ids=input_ids, labels=labels, pixel_values=torch.zeros(1))
         loss = out[0] if isinstance(out, tuple) else out.loss
         return float(loss.item())
@@ -296,6 +299,171 @@ def test_integration_lfp_block_executes_with_image_tokens():
         f"LFP term not added: ntp={loss_ntp_only}, with_lfp={loss_with_lfp}"
     )
     print("ok  test_integration_lfp_block_executes_with_image_tokens")
+
+
+def test_integration_reg_opt_in_and_byte_equiv():
+    """E-16b WARN-1/2: reg_weight=0 is byte-equal to no-reg; reg_weight>0 adds
+    L_reg and [LFP DIAG] prints reg_normalize + post-norm z std.
+
+    Reuses the minimal fake outer/inner wiring (image-token layout). The reg
+    target is the per-token GLOBAL visual hidden, decoupled from token-shift
+    pairing (WARN-2: the reg block sits right after the NTP loss).
+    """
+    image_id, video_id = 151655, 151656
+    vocab, llm_dim, target_dim = 16, 12, 8
+    spatial, n_bins = 196, 4
+    B, L = 2, 220
+    seg = [30, 30, 30, 30, 30]
+    input_ids = _build_video_input_ids(seg, image_id, B, L)
+    labels = input_ids.clone()
+    cached = torch.randn(B, spatial * n_bins, target_dim)
+
+    _spec2 = importlib.util.spec_from_file_location(
+        "lfp_head_under_test3", os.path.join(_SRC, "model", "lfp_head.py")
+    )
+    lh = importlib.util.module_from_spec(_spec2)
+    _spec2.loader.exec_module(lh)
+
+    class FakeInner(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(image_id + 8, llm_dim)
+            self.config = types.SimpleNamespace(
+                image_token_id=image_id, video_token_id=video_id
+            )
+            self._cached = cached
+
+        def forward(self, input_ids=None, **kw):
+            self._mope_cached_x_vis = self._cached
+            return (self.embed(input_ids),)
+
+    class FakeOuter(nn.Module):
+        def __init__(self, inner):
+            super().__init__()
+            self.model = inner
+            self.lm_head = nn.Linear(llm_dim, vocab)
+            self.config = types.SimpleNamespace(
+                text_config=types.SimpleNamespace(vocab_size=vocab),
+                image_token_id=image_id, video_token_id=video_id,
+            )
+
+        def loss_function(self, logits, labels, vocab_size):
+            return logits.float().mean()
+
+        def forward(self, *a, **k):
+            raise RuntimeError("original_forward should not run in training branch")
+
+    def _make_cfg(weight, reg_weight, reg_normalize=True):
+        return types.SimpleNamespace(
+            enable=True, weight=weight, mse_weight=1.0, cos_weight=1.0,
+            context_frames=4, target_pool="mean",
+            pred_source="per_frame_video", align_strategy="uniform",
+            reg_weight=reg_weight, reg_type="vicreg", reg_var_hinge=1.0,
+            reg_cov_scale=1.0, reg_normalize=reg_normalize,
+        )
+
+    def _run(weight, reg_weight, reg_normalize=True):
+        torch.manual_seed(0)
+        inner = FakeInner()
+        outer = FakeOuter(inner)
+        head = lh.MoPELFPHead(llm_dim=llm_dim, hidden=16, target_dim=target_dim)
+        inner._mope_lfp_head = head
+        mp._patch_model_for_lfp(outer, _make_cfg(weight, reg_weight, reg_normalize))
+        out = outer(input_ids=input_ids, labels=labels, pixel_values=torch.zeros(1))
+        loss = out[0] if isinstance(out, tuple) else out.loss
+        return float(loss.item()), out
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        loss_reg_off, _ = _run(0.5, reg_weight=0.0)   # beta=0 -> reg NOT added
+        loss_reg_on, _ = _run(0.5, reg_weight=1.0)    # beta>0 -> reg added
+    log = buf.getvalue()
+
+    # beta=0: byte-equal to the no-reg run (reg branch never entered).
+    loss_lfp_only, _ = _run(0.5, reg_weight=0.0)  # determinism re-check (no print)
+    assert loss_reg_off == loss_lfp_only, (loss_reg_off, loss_lfp_only)
+    # beta>0: loss strictly changes (L_reg added) and DIAG shows the new fields.
+    assert abs(loss_reg_on - loss_reg_off) > 1e-6, (loss_reg_on, loss_reg_off)
+    assert "reg_normalize=True" in log, "DIAG must print reg_normalize:\n" + log
+    assert "reg_z_std=" in log, "DIAG must print post-norm z std:\n" + log
+    assert "reg_target_N=" in log and "reg_target_N=0," not in log, (
+        "reg target must be the global visual hidden (N>0):\n" + log
+    )
+    print("ok  test_integration_reg_opt_in_and_byte_equiv")
+
+
+def test_vicreg_loss_helper():
+    """E-16b WARN-1: _vicreg_loss normalization + collapse sensitivity.
+
+    - normalize=True pulls the overall z std to ~1 (so the tau=1 variance hinge
+      can fire) while keeping the RELATIVE per-dim variance structure;
+    - normalize=False leaves the raw (>>1) scale -> the hinge saturates to 0;
+    - a collapsed input (near-constant dims) yields L_var clearly > 0;
+    - the function returns a 4-tuple with a detached, gradient-free z_std.
+    """
+    torch.manual_seed(0)
+    N, D = 512, 64
+    # LLM-like raw hidden: large per-dim std (>>1), heterogeneous across dims.
+    scale = torch.linspace(20.0, 60.0, D)
+    z = torch.randn(N, D) * scale + 5.0
+
+    # normalize=True -> overall std ~1.
+    l_var_n, l_cov_n, l_reg_n, z_std_n = mp._vicreg_loss(z, normalize=True)
+    assert abs(float(z_std_n) - 1.0) < 0.05, f"post-norm std should be ~1, got {float(z_std_n)}"
+    assert z_std_n.requires_grad is False, "z_std must be detached (diagnostic only)"
+    # On well-spread normalized data with tau=1, the per-dim std is < 1 (scale
+    # pulled to overall 1), so the variance hinge is active (non-trivial L_var).
+    assert float(l_var_n) > 0.0
+
+    # normalize=False -> raw scale (>>1) -> hinge saturates -> L_var == 0.
+    l_var_raw, _, _, z_std_raw = mp._vicreg_loss(z, normalize=False)
+    assert float(z_std_raw) > 10.0, f"raw std should be >>1, got {float(z_std_raw)}"
+    assert float(l_var_raw) == 0.0, (
+        f"raw-scale hinge must saturate to 0 (this is exactly the WARN-1 bug), "
+        f"got {float(l_var_raw)}"
+    )
+
+    # RELATIVE collapse, the exact WARN-1 case: half the dims keep a large std
+    # (~30), the other half are squeezed to std~2 -- still ABOVE tau=1, so the
+    # RAW hinge (no normalize) misses them entirely (relu(1-2)=0). After global
+    # normalization the overall scale -> 1, so the squeezed dims drop to std<<1
+    # and the hinge fires. This is precisely what WARN-1 fixes: tau=1 detects
+    # relative collapse on LLM-scale hidden where raw-scale is blind.
+    z_collapse = torch.randn(N, D) * 30.0
+    z_collapse[:, D // 2:] = 3.0 + torch.randn(N, D // 2) * 2.0   # squeezed half (std~2)
+    l_var_c, _, _, _ = mp._vicreg_loss(z_collapse, normalize=True)
+    assert float(l_var_c) > 0.3, f"relative collapse must give large L_var, got {float(l_var_c)}"
+    # Raw scale: squeezed dims still have std~2 (>tau) -> hinge saturates -> blind.
+    l_var_c_raw, _, _, _ = mp._vicreg_loss(z_collapse, normalize=False)
+    assert float(l_var_c_raw) == 0.0, (
+        f"raw scale misses relative collapse (WARN-1 bug), got {float(l_var_c_raw)}"
+    )
+
+    # Gradient flows through L_reg (regularizer can reshape the representation).
+    z_g = (torch.randn(N, D) * 30.0).requires_grad_(True)
+    _, _, l_reg_g, _ = mp._vicreg_loss(z_g, normalize=True)
+    l_reg_g.backward()
+    assert z_g.grad is not None and torch.isfinite(z_g.grad).all()
+    print("ok  test_vicreg_loss_helper")
+
+
+def test_extract_visual_token_hidden():
+    """E-16b reg target: flatten ALL visual-token hidden to [N, D] (not pooled)."""
+    image_id, video_id = 151655, 151656
+    B, L, D = 2, 200, 4
+    seg = [40, 40, 40, 40]  # 4 frames * 40 tokens = 160 visual tokens / row
+    input_ids = _build_video_input_ids(seg, image_id, B, L)
+    hidden = torch.randn(B, L, D, requires_grad=True)
+    out = mp._extract_visual_token_hidden(hidden, input_ids, (image_id, video_id))
+    assert out is not None
+    assert out.shape == (B * 160, D), out.shape   # N = all visual tokens, batch-flat
+    # gradient preserved (boolean-mask gather).
+    out.sum().backward()
+    assert hidden.grad is not None and float(hidden.grad.abs().sum()) > 0
+    # No visual tokens -> None.
+    text_only = torch.full((B, L), 7, dtype=torch.long)
+    assert mp._extract_visual_token_hidden(hidden, text_only, (image_id, video_id)) is None
+    print("ok  test_extract_visual_token_hidden")
 
 
 def test_byte_equivalence_guard_source():
@@ -341,5 +509,8 @@ if __name__ == "__main__":
     test_head_consumes_batched_source()
     test_per_frame_extraction_image_tokens()
     test_integration_lfp_block_executes_with_image_tokens()
+    test_integration_reg_opt_in_and_byte_equiv()
+    test_vicreg_loss_helper()
+    test_extract_visual_token_hidden()
     test_byte_equivalence_guard_source()
     print("\nALL TOKEN-SHIFT LFP TESTS PASSED")

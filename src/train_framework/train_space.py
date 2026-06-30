@@ -1029,6 +1029,15 @@ def train(attn_implementation="flash_attention_2"):
                 # Legacy distillation fields (back-compat; ignored by token-shift).
                 context_frames = int(mope_args.mope_lfp_context_frames)
                 target_pool = str(mope_args.mope_lfp_target_pool)
+                # E-16b anti-collapse regularizer (VICReg). reg_weight=0.0
+                # (default) -> branch not entered, byte-equivalent to E-16.
+                reg_weight = float(mope_args.mope_lfp_reg_weight)
+                reg_type = str(mope_args.mope_lfp_reg_type)
+                reg_var_hinge = float(mope_args.mope_lfp_reg_var_hinge)
+                reg_cov_scale = float(mope_args.mope_lfp_reg_cov_scale)
+                # WARN-1 fix: scale-normalize the VICReg target to O(1) so the
+                # variance hinge (tau=1) fires on LLM raw hidden. Default True.
+                reg_normalize = bool(mope_args.mope_lfp_reg_normalize)
 
             _patch_model_for_lfp(model, _LFPCfg)
 

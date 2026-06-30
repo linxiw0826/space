@@ -905,6 +905,130 @@ def _build_tokenshift_pairs(cached_x_vis, per_frame_hidden, tubelet=2, spatial=1
     return source_bins, target_bins
 
 
+# =============================================================================
+# E-16b: anti-collapse / decorrelation regularizer (VICReg, opt-in).
+#
+# Diagnosis (decisions.md / paper2_design.md §4.1, 2026-06-30): E-16
+# (feed+predict) drops VSI on 7/8 subtasks — the auxiliary motion target
+# GLOBALLY squeezes/flattens the LLM's spatial representation. E-16b adds a
+# single-variable anti-collapse regularizer that keeps the LLM's GLOBAL visual
+# representation spread out (variance hinge) and decorrelated (covariance), so
+# the auxiliary objective can no longer collapse it onto a low-rank subspace.
+#
+# Regularizer = VICReg (variance + covariance, NO invariance — single view):
+#     L_var = mean_d max(0, tau - sqrt(Var(z_d) + eps))
+#     L_cov = ( sum_{i!=j} Cov(z)_{ij}^2 ) / D
+#     L_reg = L_var + cov_scale * L_cov
+# computed in fp32 (the covariance is numerically delicate; z is centered
+# first). Total loss: L = L_NTP + lambda*L_lfp + beta*(L_var + cov_scale*L_cov).
+#
+# Regularization TARGET (decisions.md task note — NOT source_bins): the scope's
+# source_bins [B, K-1, llm_dim] has only B*(K-1) ~ 6 vectors per forward (B=2,
+# K=4) which is far too few to estimate a llm_dim-wide covariance. Instead we
+# regularize the per-token visual hidden states (the SAME visual tokens that
+# _extract_per_frame_video_hidden mean-pools into frames, but taken BEFORE that
+# pooling), flattened to [N, llm_dim]. N = (# visual tokens in the batch) ~
+# hundreds-to-thousands, the right sample count, and matches the "global"
+# diagnosis (spread out the GLOBAL visual representation, not just 6 bin
+# vectors). The tensor is the LLM inner-model output -> gradient flows back into
+# the LLM, which is exactly what we want the regularizer to reshape.
+# =============================================================================
+
+
+def _extract_visual_token_hidden(hidden_states, input_ids, visual_token_ids):
+    """Flatten ALL per-token visual hidden states to [N, llm_dim] (E-16b reg target).
+
+    Unlike ``_extract_per_frame_video_hidden`` (which mean-pools each frame into
+    ONE vector, giving only F~8 samples), this keeps EVERY visual token's hidden
+    state so the VICReg statistics are estimated over N = (# visual tokens in the
+    batch), typically several hundred to a few thousand. Gradient flows back into
+    the LLM (``hidden_states`` is the inner-model output), so the regularizer
+    pushes the LLM to keep its global visual representation spread out /
+    decorrelated.
+
+    Args:
+        hidden_states:    [B, L, llm_dim] LLM last hidden state.
+        input_ids:        [B, L] token ids.
+        visual_token_ids: int OR iterable of ints (image_token_id, video_token_id);
+                          None entries are ignored.
+
+    Returns:
+        [N, llm_dim] flattened visual-token hidden states (across the whole
+        batch), or None if there are no visual tokens / no valid id.
+    """
+    if input_ids is None or visual_token_ids is None:
+        return None
+    if isinstance(visual_token_ids, int):
+        id_list = [visual_token_ids]
+    else:
+        id_list = [t for t in visual_token_ids if t is not None]
+    if not id_list:
+        return None
+    is_video = torch.zeros_like(input_ids, dtype=torch.bool)   # [B, L]
+    for tid in id_list:
+        is_video |= (input_ids == tid)
+    if not bool(is_video.any()):
+        return None
+    D = hidden_states.shape[-1]
+    # Boolean [B, L] mask on [B, L, D] -> [N, D] (gradient preserved).
+    return hidden_states[is_video].reshape(-1, D)
+
+
+def _vicreg_loss(z, var_hinge=1.0, cov_scale=1.0, eps=1e-4, normalize=True):
+    """VICReg variance + covariance regularization on z [N, D] (E-16b).
+
+    No invariance term (single view). Computed in fp32 for numerical stability;
+    z is centered before the covariance.
+
+        L_var = mean_d max(0, tau - sqrt(Var(z_d) + eps))
+        L_cov = ( sum_{i!=j} Cov(z)_{ij}^2 ) / D
+        L_reg = L_var + cov_scale * L_cov
+
+    WARN-1 fix (scale mismatch): the variance hinge ``relu(tau - std)`` with the
+    default tau=1 was calibrated for O(1) features, but LLM raw hidden has
+    per-dim std >> 1, so the hinge saturates to ~0 — it only catches ABSOLUTE
+    collapse (std -> 0) and is blind to RELATIVE collapse. ``normalize=True``
+    (default) divides z by a SINGLE GLOBAL SCALAR std so the overall scale lands
+    at ~1 (tau=1 can fire) while the RELATIVE per-dim variance ratios — the
+    collapse signal — are preserved untouched. We deliberately do NOT do per-dim
+    standardization: forcing each dim's variance to exactly 1 would make L_var
+    identically 0 and defeat the whole regularizer. Normalization happens in
+    fp32, before centering.
+
+    Args:
+        z:         [N, D] representation (N samples, D dims). N must be > 1.
+        var_hinge: variance hinge threshold tau (per-dim std below tau is
+                   penalized).
+        cov_scale: covariance term weight.
+        eps:       added under the sqrt for numerical stability (VICReg default).
+        normalize: WARN-1 global-scalar-std normalization (default True). When
+                   False, z is used as-is (raw-hidden scale -> hinge saturates).
+
+    Returns:
+        (L_var, L_cov, L_reg, z_std) — the first three are fp32 scalar tensors
+        (gradient-carrying); ``z_std`` is a detached fp32 scalar = the overall
+        std of z AFTER normalization (diagnostic; should be ~1 when
+        ``normalize=True``, >>1 otherwise).
+    """
+    z = z.float()
+    N, D = z.shape
+    if normalize:
+        # WARN-1: single global SCALAR std -> overall scale ~1, relative per-dim
+        # variance structure preserved (NOT per-dim standardization).
+        z = z / (z.std() + eps)
+    z_std = z.std().detach()                                    # diagnostic (~1)
+    z_c = z - z.mean(dim=0, keepdim=True)                       # center
+    # variance hinge: penalize each dim whose std drops below tau.
+    std = torch.sqrt(z_c.var(dim=0, unbiased=True) + eps)       # [D]
+    l_var = F.relu(var_hinge - std).mean()                      # scalar
+    # covariance off-diagonal Frobenius / D (decorrelation).
+    cov = (z_c.T @ z_c) / (N - 1)                               # [D, D]
+    off_diag = cov - torch.diag(torch.diagonal(cov))
+    l_cov = off_diag.pow(2).sum() / D                           # scalar
+    l_reg = l_var + cov_scale * l_cov
+    return l_var, l_cov, l_reg, z_std
+
+
 def _patch_model_for_lfp(model, lfp_cfg) -> None:
     """Wrap the OUTER Qwen3VLForConditionalGeneration.forward with an LFP head.
 
@@ -932,6 +1056,14 @@ def _patch_model_for_lfp(model, lfp_cfg) -> None:
             - context_frames (int):   leading context frames (default 4)
             - target_pool (str):      "mean" | "token" (default "mean")
             - pred_source (str):      "last_answer" (default)
+            - reg_weight (float):     E-16b VICReg weight beta (default 0.0 =
+                                      OFF -> byte-equivalent E-16)
+            - reg_type (str):         "vicreg" (default)
+            - reg_var_hinge (float):  VICReg variance hinge tau (default 1.0)
+            - reg_cov_scale (float):  VICReg covariance term scale (default 1.0)
+            - reg_normalize (bool):   WARN-1 global-scalar-std normalization of
+                                      the reg target before VICReg (default
+                                      True; only consulted when reg_weight > 0)
     """
     outer = model
     original_forward = outer.forward
@@ -1049,6 +1181,46 @@ def _patch_model_for_lfp(model, lfp_cfg) -> None:
         )
 
         # ----------------------------------------------------------------
+        # E-16b anti-collapse regularizer (VICReg, OPT-IN).
+        # [WARN-2 scope]: placed HERE, right after the NTP loss, so it depends
+        # ONLY on (a) the training branch — labels != None, guaranteed because
+        # the labels-is-None eval/generate path already returned above — and
+        # (b) visual hidden availability (hidden_states + input_ids). It is
+        # fully DECOUPLED from whether the token-shift prediction pairing
+        # (per_frame_h / source_bins) succeeds. In E-16b (prediction always on)
+        # the pairing normally succeeds, so behavior is identical to before;
+        # the block now also survives a degenerate pairing.
+        # GENERATIVE byte-equivalence: when reg_weight == 0.0 (the default) this
+        # branch is NOT entered, no reg tensor is built, NO normalization
+        # happens, and ``loss`` is bit-for-bit the E-16 value. ReviewAgent
+        # checks this gate verbatim.
+        # Target = per-token GLOBAL visual hidden (NOT source_bins): flattened
+        # to [N, llm_dim] with N ~ hundreds-to-thousands, the right sample count
+        # for a llm_dim-wide covariance and the right object for the "global
+        # squeeze" diagnosis (see the _vicreg_loss block-comment). Gradient
+        # flows back into the LLM.
+        # ----------------------------------------------------------------
+        l_var = l_cov = l_reg = None
+        reg_target_N = 0
+        reg_z_std = None
+        if lfp_cfg.reg_weight > 0 and str(lfp_cfg.reg_type) == "vicreg":
+            _reg_cfg = getattr(self, 'config', None) or getattr(inner_model, 'config', None)
+            _reg_img_tid = getattr(_reg_cfg, 'image_token_id', None)
+            _reg_vid_tid = getattr(_reg_cfg, 'video_token_id', None)
+            reg_z = _extract_visual_token_hidden(
+                hidden_states, input_ids, (_reg_img_tid, _reg_vid_tid)
+            )
+            if reg_z is not None and reg_z.shape[0] > 1:
+                reg_target_N = reg_z.shape[0]
+                l_var, l_cov, l_reg, reg_z_std = _vicreg_loss(
+                    reg_z,
+                    var_hinge=lfp_cfg.reg_var_hinge,
+                    cov_scale=lfp_cfg.reg_cov_scale,
+                    normalize=lfp_cfg.reg_normalize,
+                )
+                loss = loss + lfp_cfg.reg_weight * l_reg
+
+        # ----------------------------------------------------------------
         # LFP auxiliary loss (spec S2 + S3, risk-1/4/7/8).
         # ----------------------------------------------------------------
         lfp_head = getattr(inner_model, '_mope_lfp_head', None)
@@ -1158,6 +1330,18 @@ def _patch_model_for_lfp(model, lfp_cfg) -> None:
                         _diag_rank0 = True
                     if _lfp_diag_state["calls"] < 3 and _diag_rank0:
                         _lfp_diag_state["calls"] += 1
+                        # E-16b reg fields (NA when reg OFF / no target).
+                        if l_reg is not None:
+                            _reg_str = (
+                                f"L_var={l_var.item():.4f}, "
+                                f"L_cov={l_cov.item():.4f}, "
+                                f"beta*L_reg={lfp_cfg.reg_weight * l_reg.item():.4f}, "
+                                f"reg_target_N={reg_target_N}, "
+                                f"reg_normalize={bool(lfp_cfg.reg_normalize)}, "
+                                f"reg_z_std={reg_z_std.item():.4f}"
+                            )
+                        else:
+                            _reg_str = f"reg=OFF(beta={lfp_cfg.reg_weight})"
                         print(
                             f"[LFP DIAG] step={_lfp_diag_state['calls']}: "
                             f"mse_per_bin={mse_per.mean().item():.4f}, "
@@ -1165,7 +1349,8 @@ def _patch_model_for_lfp(model, lfp_cfg) -> None:
                             f"L_lfp={L_lfp.item():.4f}, "
                             f"L_ntp={loss_ntp.item():.4f}, "
                             f"ratio_L_lfp/L_ntp={(L_lfp.item() / max(loss_ntp.item(), 1e-8)):.4f}, "
-                            f"lambda*L_lfp={lfp_cfg.weight * L_lfp.item():.4f}",
+                            f"lambda*L_lfp={lfp_cfg.weight * L_lfp.item():.4f}, "
+                            f"{_reg_str}",
                             flush=True,
                         )
 

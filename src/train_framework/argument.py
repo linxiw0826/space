@@ -344,6 +344,67 @@ class MoPEArguments:
                           "while MoPE always uses 8 frames). Reserved knob; only 'uniform' is "
                           "currently implemented."},
     )
+    # -----------------------------------------------------------------------
+    # E-16b: anti-collapse / decorrelation regularizer (VICReg) on top of the
+    # token-shift LFP objective. ALL fields default to OFF / zero-impact (the
+    # same opt-in pattern as the E-10b anti-collapse bundle). When
+    # ``mope_lfp_reg_weight=0.0`` (the default) the regularizer branch is NOT
+    # entered, no reg tensor is built, and the loss is BYTE-FOR-BYTE identical
+    # to E-16. Diagnosis (decisions.md / paper2_design.md §4.1, 2026-06-30):
+    # E-16 globally squeezes the LLM's spatial representation; the regularizer
+    # keeps the GLOBAL per-token visual hidden spread out (variance hinge) and
+    # decorrelated (covariance). NOT a PENDING marker: the method (VICReg),
+    # target (per-token visual hidden), and defaults are all fully specified.
+    # -----------------------------------------------------------------------
+    mope_lfp_reg_weight: float = field(
+        default=0.0,
+        metadata={"help": "E-16b anti-collapse regularization weight beta in "
+                          "L = L_NTP + lambda*L_lfp + beta*(L_var + cov_scale*L_cov) "
+                          "(VICReg on the per-token GLOBAL visual hidden). Default 0.0 "
+                          "(regularizer OFF -> byte-for-byte identical to E-16; opt-in, "
+                          "no baseline pollution). Set to a non-zero value (e.g. 1.0) to "
+                          "enable. Tune per run by reading the rank0 '[LFP DIAG]' print "
+                          "(first 3 steps): keep beta*L_reg ~0.05-0.2 of L_ntp so it "
+                          "reshapes without swamping the LM objective. Only meaningful "
+                          "when mope_lfp_enable=True."},
+    )
+    mope_lfp_reg_type: str = field(
+        default="vicreg",
+        metadata={"help": "E-16b regularization type. 'vicreg' (default, only type "
+                          "implemented) = variance hinge + covariance decorrelation, no "
+                          "invariance (single view). Only active when "
+                          "mope_lfp_reg_weight > 0."},
+    )
+    mope_lfp_reg_var_hinge: float = field(
+        default=1.0,
+        metadata={"help": "E-16b VICReg variance hinge threshold tau in "
+                          "L_var = mean_d max(0, tau - sqrt(Var(z_d)+eps)). Default 1.0 "
+                          "(VICReg standard). Raise (e.g. 2.0) if per-dim std stays low; "
+                          "lower (e.g. 0.5) if it overshoots. Only used when "
+                          "mope_lfp_reg_type='vicreg' and mope_lfp_reg_weight > 0."},
+    )
+    mope_lfp_reg_cov_scale: float = field(
+        default=1.0,
+        metadata={"help": "E-16b VICReg covariance term scale in "
+                          "L_reg = L_var + cov_scale*L_cov, where "
+                          "L_cov = (sum_{i!=j} Cov_{ij}^2)/D. Default 1.0. Only used when "
+                          "mope_lfp_reg_type='vicreg' and mope_lfp_reg_weight > 0."},
+    )
+    mope_lfp_reg_normalize: bool = field(
+        default=True,
+        metadata={"help": "E-16b WARN-1 fix: scale-normalize the VICReg target "
+                          "before the variance/covariance terms. LLM raw hidden has "
+                          "per-dim std >> 1, which saturates the variance hinge "
+                          "relu(tau - std) (tau=1, tuned for O(1) features) so it only "
+                          "catches absolute collapse, not relative collapse. True "
+                          "(default) divides the target by a SINGLE global scalar std "
+                          "(overall scale -> ~1, relative per-dim variance ratios kept) "
+                          "so tau=1 fires. NOT per-dim standardization (that would make "
+                          "L_var identically 0). Set False to use raw-hidden scale. "
+                          "Only consulted when mope_lfp_reg_weight > 0 (when beta=0 the "
+                          "reg branch is not entered and no normalization happens -> "
+                          "byte-for-byte E-16)."},
+    )
     mope_feed_features: bool = field(
         default=True,
         metadata={"help": "paper-2 Stage 1 feed-features bypass (orthogonal to mope_lfp_enable). "
