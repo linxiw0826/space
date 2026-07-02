@@ -417,6 +417,20 @@ class MoPEArguments:
                           "prediction-only (feed=F, lfp=T) / E-16 both (feed=T, lfp=T). Default "
                           "True keeps E-03a/E-10/E-10b byte-for-byte unchanged."},
     )
+    mope_feed_causal_mask: bool = field(
+        default=False,
+        metadata={"help": "E-16e feed cross-attn causal-over-bins mask (the SINGLE new "
+                          "variable vs E-16). False (default) = the feed cross-attn is "
+                          "bidirectional, byte-for-byte identical to E-16 (no mask built). "
+                          "True = an image token of frame f attends ONLY to MoPE K/V of "
+                          "time-bins <= b_f (future-bin K/V masked with -inf), so future-bin "
+                          "motion can no longer leak backward into earlier frames "
+                          "(V-CORE / Video-CCAM finding). The frame->bin mapping reuses the "
+                          "SAME faithful bin ranges as the LFP head (_group_llm_frames_to_bins), "
+                          "so the feed mask and the LFP target are temporally consistent. Only "
+                          "active on the feed path (mope_feed_features=True); no effect when "
+                          "feed_features=False (no residual fusion to mask)."},
+    )
 
 
 # ---------------------------------------------------------------------------

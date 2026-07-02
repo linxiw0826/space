@@ -50,6 +50,25 @@ from model.mope_patch import (  # noqa: E402
 )
 
 
+def _read_feed_causal_mask() -> bool:
+    """Read the E-16e feed-causal-mask eval switch from the environment.
+
+    Returns True when ``MOPE_FEED_CAUSAL_MASK`` is set truthy (``1``/``true``,
+    case-insensitive), else False. UNSET or ``0``/``false`` -> False, in which
+    case the crossattn patch is called WITHOUT ``feed_causal_mask`` and the eval
+    is byte-for-byte identical to the pre-E-16e path (bidirectional feed
+    cross-attn = E-03a / E-16 / E-16b).
+
+    Why this MUST be set for E-16e: E-16e TRAINS with a causal feed mask
+    (``--mope_feed_causal_mask``), and the feed cross-attn also runs at
+    inference. Leaving it OFF at eval would run the feed bidirectional ->
+    train/test mismatch -> invalid E-16e scores. Set ``MOPE_FEED_CAUSAL_MASK=1``
+    ONLY when evaluating an E-16e checkpoint; leave it unset for every other
+    checkpoint (E-03a/E-16/E-16b) so their eval stays byte-equivalent.
+    """
+    return os.environ.get("MOPE_FEED_CAUSAL_MASK", "0").strip().lower() in ("1", "true")
+
+
 def _load_mope_weights_from_pretrained(inner_model, pretrained_path: str) -> bool:
     """从 E-02a checkpoint 提取并加载 _mope_encoder / _mope_projector 权重。
 
@@ -523,10 +542,20 @@ class Qwen3_VL_MoPE_CrossAttn(Qwen3_VL_MoPE):
         inner._mope_projector.to(device=ref_param.device, dtype=ref_param.dtype)
 
         if success:
-            _patch_model_for_mope_crossattn(self._model)
+            # E-16e: the feed cross-attn also runs at inference, so an E-16e
+            # checkpoint (trained with --mope_feed_causal_mask) MUST be evaluated
+            # with the SAME causal-over-bins feed mask, else the model trains
+            # causal but evaluates bidirectional (train/test mismatch -> invalid
+            # scores). Gated by MOPE_FEED_CAUSAL_MASK=1; unset/0 -> feed_causal_mask
+            # False, byte-for-byte the original bidirectional E-03a/E-16 eval.
+            _feed_causal_mask = _read_feed_causal_mask()
+            _patch_model_for_mope_crossattn(
+                self._model, feed_causal_mask=_feed_causal_mask
+            )
             print(
                 f"[Qwen3_VL_MoPE_CrossAttn] MoPE cross-attn patch applied. "
-                f"mope_all_frames={self.mope_all_frames}, llm_dim={llm_dim}"
+                f"mope_all_frames={self.mope_all_frames}, llm_dim={llm_dim}, "
+                f"feed_causal_mask={_feed_causal_mask}"
             )
         else:
             print(
@@ -630,11 +659,18 @@ class Qwen3_VL_MoPE_Router(Qwen3_VL_MoPE_CrossAttn):
         inner._mope_projector.to(device=ref_param.device, dtype=ref_param.dtype)
 
         if success:
-            _patch_model_for_mope_crossattn(self._model)
+            # E-16e: mirror the crossattn eval — an E-16e checkpoint whose feed
+            # cross-attn was trained causal must also be evaluated causal
+            # (train/test consistency). Gated by MOPE_FEED_CAUSAL_MASK=1;
+            # unset/0 -> False, byte-for-byte the original bidirectional E-10 eval.
+            _feed_causal_mask = _read_feed_causal_mask()
+            _patch_model_for_mope_crossattn(
+                self._model, feed_causal_mask=_feed_causal_mask
+            )
             print(
                 f"[Qwen3_VL_MoPE_Router] MoPE cross-attn + content-driven gate patch applied. "
                 f"mope_all_frames={self.mope_all_frames}, gate_mode={self.mope_gate_mode}, "
-                f"llm_dim={llm_dim}"
+                f"llm_dim={llm_dim}, feed_causal_mask={_feed_causal_mask}"
             )
         else:
             print(

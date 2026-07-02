@@ -349,7 +349,177 @@ def _patch_model_for_mope_concat(model) -> None:
     print("[Space Sensing] Patched inner_model.forward() with MoPE concat injection (E-02b).")
 
 
-def _patch_model_for_mope_crossattn(model, feed_features: bool = True) -> None:
+# E-16e: MoPE K/V tokens per time-bin (spatial tokens per frame on the K/V side,
+# 196 for ViT-B / tubelet-2). ``n_bins = n_mope // _FEED_SPATIAL`` (784 = 4 x 196).
+_FEED_SPATIAL = 196
+
+
+def _frames_to_bins(num_frames, n_bins, device):
+    """Assign each of ``num_frames`` frames to a time-bin via the SAME faithful
+    base ranges as the LFP head (``_group_llm_frames_to_bins``): bin b covers
+    frames ``[b*F//n_bins, (b+1)*F//n_bins)``. The union over b partitions
+    ``[0, num_frames)`` so every frame gets exactly one bin (empty bins for
+    ``num_frames < n_bins`` simply cover no frame). Returns ``[num_frames]`` long.
+    """
+    frame_bin = torch.zeros(num_frames, dtype=torch.long, device=device)
+    for b in range(n_bins):
+        s = (b * num_frames) // n_bins
+        e = ((b + 1) * num_frames) // n_bins
+        frame_bin[s:e] = b
+    return frame_bin
+
+
+def _build_feed_causal_mask(num_frames, n_mope, device, dtype, spatial=196):
+    """Build the E-16e feed-causal additive mask [num_frames, n_mope] (0 / -inf).
+
+    The feed cross-attn is applied PER IMAGE SHARD (one shard = one video frame,
+    ``get_image_features`` splits by grid_thw), so every query token of a shard
+    belongs to the SAME frame f and therefore the SAME time-bin b_f. A single
+    mask ROW over the K/V (MoPE) axis is thus sufficient per shard — unlike
+    Video-CCAM's ``get_ccam`` which kron-expands because all query groups share
+    one attention call. This returns the full [F, n_mope] table; row f is the
+    additive mask for the shard of frame f.
+
+    Layouts (VERIFIED against the LFP path, mope_patch._build_tokenshift_pairs):
+      - K/V (MoPE) side: ``mope_feats`` is TIME-MAJOR, ``[:, t*196:(t+1)*196]`` is
+        time-bin t (spec F3 / cached_x_vis.view(B, n_bins, 196, D)). So K/V token
+        j belongs to bin ``j // spatial`` and ``n_bins = n_mope // spatial``
+        (784 = 4 bins x 196 for 8 frames / tubelet-2 / ViT-B — confirmed).
+      - Query side: frame f -> bin b_f via the SAME faithful mapping the LFP head
+        uses (``_group_llm_frames_to_bins``): bin b covers frames
+        ``[b*F//n_bins, (b+1)*F//n_bins)``. This reduces to ``b_f = f // 2`` when
+        F == 8 (tubelet-2), and generalises when the LLM frame count F != 8.
+
+    Causal rule (Video-CCAM get_ccam, adapted): frame f may attend ONLY to K/V of
+    bins ``<= b_f``; future-bin K/V is set to -inf. Bin 0 is always visible
+    (kv_bin 0 <= any b_f), so no row is ever fully masked (softmax is safe).
+
+    Args:
+        num_frames: F, number of image shards / video frames for this sample.
+        n_mope:     N_mope, number of MoPE K/V tokens (784 = 4 bins x 196).
+        device:     target device.
+        dtype:      target dtype for the additive mask.
+        spatial:    tokens per time-bin on the K/V side (196 for ViT-B).
+
+    Returns:
+        mask: [num_frames, n_mope] additive mask (0 visible / -inf masked), or
+              None if the K/V layout has < 1 bin (defensive; mask disabled).
+    """
+    n_bins = n_mope // spatial
+    if n_bins < 1:
+        return None
+    # K/V token -> bin (time-major layout: token j in bin j // spatial).
+    kv_bin = torch.arange(n_mope, device=device) // spatial            # [n_mope]
+    # frame -> bin: faithful base ranges of _group_llm_frames_to_bins (shared
+    # helper _frames_to_bins).
+    frame_bin = _frames_to_bins(num_frames, n_bins, device)
+    # Visible where K/V bin <= query frame's bin; -inf otherwise.
+    allowed = kv_bin.unsqueeze(0) <= frame_bin.unsqueeze(1)           # [F, n_mope] bool
+    mask = torch.zeros(num_frames, n_mope, dtype=dtype, device=device)
+    mask.masked_fill_(~allowed, float("-inf"))
+    return mask
+
+
+def _build_feed_causal_mask_tokens(
+    n_tokens, frames_in_shard, frame_offset, total_frames, n_mope, device, dtype, spatial=196
+):
+    """Per-QUERY-TOKEN feed-causal additive mask for ONE shard [n_tokens, n_mope].
+
+    UNIFIED construction, correct for BOTH shard layouts without a train/eval
+    special-case (everything is derived from the shard's ``grid_thw`` temporal
+    axis + token count):
+
+      - TRAIN (data_processor <video> -> N <image>): each shard is ONE frame
+        (``frames_in_shard == 1``), so S = n_tokens and every query token of the
+        shard shares one global frame ``frame_offset`` -> one bin. This reduces
+        EXACTLY to ``_build_feed_causal_mask``'s row ``frame_offset``.
+      - EVAL single ``<video>`` block: one shard carries ``frames_in_shard = T``
+        frames and ``n_tokens = T * S`` query tokens ordered FRAME-MAJOR, so
+        query token k belongs to within-shard frame ``k // S`` (S = n_tokens // T)
+        -> GLOBAL frame ``frame_offset + k // S``. The mask then becomes the full
+        per-token causal mask instead of the inert all-zeros of a per-frame-row
+        broadcast over a single T=F shard.
+
+    The GLOBAL frame -> bin map uses the SAME faithful base ranges over
+    ``total_frames`` (the sample's TOTAL frame count = the LFP head's
+    ``_group_llm_frames_to_bins`` denominator F), so the feed mask and the LFP
+    target line up for both train (T=1 per shard, total_frames = #shards) and
+    eval (T=F in one shard, total_frames = F). Query token k may attend to K/V
+    bins ``<= its bin``; future-bin K/V is ``-inf`` (Video-CCAM get_ccam rule).
+
+    Returns ``[n_tokens, n_mope]`` additive mask (0 visible / -inf masked), or
+    None if the K/V layout has < 1 bin (defensive; mask disabled).
+    """
+    n_bins = n_mope // spatial
+    if n_bins < 1:
+        return None
+    frames_in_shard = max(1, int(frames_in_shard))
+    total_frames = max(1, int(total_frames))
+    # spatial tokens per frame WITHIN this shard (frame-major ordering).
+    S = max(1, n_tokens // frames_in_shard)
+    tok = torch.arange(n_tokens, device=device)
+    # global frame index of each query token; clamp guards ragged token counts.
+    global_frame = torch.clamp(frame_offset + (tok // S), max=total_frames - 1)   # [n_tokens]
+    frame_bin_table = _frames_to_bins(total_frames, n_bins, device)               # [total_frames]
+    query_bin = frame_bin_table[global_frame]                                     # [n_tokens]
+    kv_bin = torch.arange(n_mope, device=device) // spatial                       # [n_mope]
+    allowed = kv_bin.unsqueeze(0) <= query_bin.unsqueeze(1)                       # [n_tokens, n_mope]
+    mask = torch.zeros(n_tokens, n_mope, dtype=dtype, device=device)
+    mask.masked_fill_(~allowed, float("-inf"))
+    return mask
+
+
+# E-16e defense-in-depth (inert-mask guard) diagnostic state. Module-level so the
+# "print once / warn once" survives across the per-shard calls; rank-0 only.
+_FEED_MASK_DIAG_STATE = {"printed": False, "warned_inert": False}
+
+
+def _feed_mask_is_rank0():
+    try:
+        import torch.distributed as dist
+        return (not dist.is_initialized()) or dist.get_rank() == 0
+    except Exception:
+        return True
+
+
+def _feed_mask_diag(n_bins, imgs_per_sample, shard_tokens, frames_slice, any_masked):
+    """E-16e defense-in-depth for the feed-causal mask:
+
+      1. print the shard geometry (imgs_per_sample / shard token count / frames
+         per shard) ONCE at the first feed-causal call, so the eval-time shard
+         structure is visible in the logs; and
+      2. if the mask is multi-bin (``n_bins > 1``) yet masks NOTHING (all-zero ->
+         the feed cross-attn is silently BIDIRECTIONAL), warn LOUDLY ONCE. This
+         is the exact E-16e inert-mask failure (single-shard-per-clip -> every
+         query token falls in the last bin -> allowed=all-True). Non-fatal (an
+         eval must still run), just no longer silent.
+    """
+    if not _feed_mask_is_rank0():
+        return
+    if not _FEED_MASK_DIAG_STATE["printed"]:
+        _FEED_MASK_DIAG_STATE["printed"] = True
+        print(
+            f"[Space Sensing][E-16e] feed_causal_mask ON: n_bins={n_bins}, "
+            f"imgs_per_sample={imgs_per_sample}, shard0_tokens={shard_tokens}, "
+            f"frames_per_shard={frames_slice}, total_frames={int(sum(frames_slice))}",
+            flush=True,
+        )
+    if n_bins > 1 and not any_masked and not _FEED_MASK_DIAG_STATE["warned_inert"]:
+        _FEED_MASK_DIAG_STATE["warned_inert"] = True
+        logger.warning(
+            "[E-16e] feed causal mask is INERT (all-zero, masks nothing) even though "
+            "n_bins=%d > 1: every query token fell in the LAST bin, so the feed "
+            "cross-attn is effectively BIDIRECTIONAL for this sample "
+            "(imgs_per_sample=%d, frames_per_shard=%s). This is the train/eval "
+            "feed mismatch E-16e must avoid — the eval still runs, but E-16e vs "
+            "E-16 is CONFOUNDED for such single-frame samples.",
+            n_bins, imgs_per_sample, frames_slice,
+        )
+
+
+def _patch_model_for_mope_crossattn(
+    model, feed_features: bool = True, feed_causal_mask: bool = False
+) -> None:
     """E-02c: per-shard cross-attention fusion at the get_image_features call site.
 
     Injection point is identical to E-02a (_patch_model_for_mope): wraps
@@ -380,6 +550,24 @@ def _patch_model_for_mope_crossattn(model, feed_features: bool = True) -> None:
     the cache is still populated for the LFP path. In both cases the NTP path
     is unaffected by the cache (it is a detached no_grad tensor from the
     frozen encoder).
+
+    E-16e: feed-causal mask (single new variable vs E-16)
+    -----------------------------------------------------
+    ``feed_causal_mask=False`` (default) leaves the feed cross-attn exactly
+    bidirectional — byte-for-byte E-02c/E-03a/E-16 (no mask is built, the
+    projector is called without ``attn_mask``). ``feed_causal_mask=True`` builds
+    a per-shard, per-QUERY-TOKEN additive mask via
+    ``_build_feed_causal_mask_tokens`` so that each image query token (its frame f
+    derived from the shard's grid_thw temporal axis T) attends ONLY to MoPE K/V of
+    bins ``<= b_f`` (future-bin motion can no longer leak backward). ONE code path
+    handles BOTH the train layout (each shard = 1 frame, T=1) AND a single
+    ``<video>`` shard at eval (T=F), derived entirely from grid_thw / the shard
+    shape — no train/eval special-case. The frame->bin mapping reuses the SAME
+    faithful bin ranges as the LFP head (``_group_llm_frames_to_bins``, denominator
+    F = total frames of the sample) so the feed mask and the LFP target are
+    temporally consistent. Only active on the
+    feed path (``feed_features=True``); with ``feed_features=False`` there is no
+    residual fusion to mask.
     """
     inner_model = model.model
     original_forward = inner_model.forward
@@ -440,6 +628,23 @@ def _patch_model_for_mope_crossattn(model, feed_features: bool = True) -> None:
                     return image_embeds_list, deepstack
                 imgs_per_sample = n_total // B_mope
                 _use_gate = getattr(_mope_projector, 'use_gate', False)
+                # E-16e: the feed-causal mask is built PER SHARD, PER QUERY TOKEN
+                # (see _build_feed_causal_mask_tokens) from the shard's grid_thw
+                # temporal axis T + token count, so ONE code path is correct for
+                # BOTH the train layout (each shard = 1 frame, T=1) AND a single
+                # <video> shard at eval (T=F). No train/eval special-case is made:
+                # everything is derived from grid_thw / the shard shape. OFF
+                # (feed_causal_mask=False) -> attn_mask stays None -> byte-for-byte
+                # the bidirectional E-16 attention.
+                n_mope_tokens = mope_feats.shape[1]
+                _feed_n_bins = n_mope_tokens // _FEED_SPATIAL
+                # Frames per shard from grid_thw temporal axis (T). At train each
+                # shard is one frame (T=1); at eval a single <video> shard has T=F.
+                # Fallback (grid_thw None): assume one frame per shard.
+                if feed_causal_mask and grid_thw is not None:
+                    _shard_frames = grid_thw[:, 0].tolist()
+                else:
+                    _shard_frames = [1] * n_total
                 new_embeds = []
                 for b in range(B_mope):
                     mf = mope_feats[b:b+1]   # [1, N_mope, 768]
@@ -447,15 +652,60 @@ def _patch_model_for_mope_crossattn(model, feed_features: bool = True) -> None:
                     cond_b = None
                     if _use_gate and pooled_text is not None:
                         cond_b = pooled_text[b:b+1]   # [1, llm_dim]
-                    for e in image_embeds_list[b * imgs_per_sample:(b + 1) * imgs_per_sample]:
+                    shard_slice = image_embeds_list[
+                        b * imgs_per_sample:(b + 1) * imgs_per_sample
+                    ]
+                    frames_slice = _shard_frames[
+                        b * imgs_per_sample:(b + 1) * imgs_per_sample
+                    ]
+                    # Total frames for THIS sample = sum of the shards' temporal
+                    # extents (== the LFP head's denominator F, so bins line up).
+                    total_frames = int(sum(frames_slice)) if frames_slice else 0
+                    frame_offset = 0
+                    sample_any_masked = False
+                    for f, e in enumerate(shard_slice):
+                        T_f = int(frames_slice[f]) if f < len(frames_slice) else 1
+                        # E-16e: per-query-token additive mask [1, N_img_i, N_mope]
+                        # (broadcasts over the batch axis of the attention logits),
+                        # or None when the mask is disabled.
+                        mask_f = None
+                        if feed_causal_mask:
+                            m = _build_feed_causal_mask_tokens(
+                                n_tokens=e.shape[0],
+                                frames_in_shard=T_f,
+                                frame_offset=frame_offset,
+                                total_frames=total_frames,
+                                n_mope=n_mope_tokens,
+                                device=mope_feats.device,
+                                dtype=mope_feats.dtype,
+                                spatial=_FEED_SPATIAL,
+                            )
+                            if m is not None:
+                                mask_f = m.unsqueeze(0)   # [1, N_img_i, N_mope]
+                                if torch.isinf(m).any():
+                                    sample_any_masked = True
                         if _use_gate:
                             new_e = _mope_projector(
-                                mf, e.unsqueeze(0), cond_text=cond_b
+                                mf, e.unsqueeze(0), cond_text=cond_b, attn_mask=mask_f
                             ).squeeze(0)            # [N_img_i, llm_dim]
                         else:
-                            # Ungated E-02c/E-03a path — identical to before.
-                            new_e = _mope_projector(mf, e.unsqueeze(0)).squeeze(0)
+                            # Ungated E-02c/E-03a path — identical to before when
+                            # mask_f is None (attn_mask defaults to no-op).
+                            new_e = _mope_projector(
+                                mf, e.unsqueeze(0), attn_mask=mask_f
+                            ).squeeze(0)
                         new_embeds.append(new_e)
+                        frame_offset += T_f
+                    # E-16e defense-in-depth: print shard geometry once + warn
+                    # loudly (once) if a multi-bin mask ended up inert (all-zero).
+                    if feed_causal_mask:
+                        _feed_mask_diag(
+                            _feed_n_bins,
+                            imgs_per_sample,
+                            int(shard_slice[0].shape[0]) if shard_slice else 0,
+                            frames_slice,
+                            sample_any_masked,
+                        )
                 return new_embeds, deepstack
 
             self.get_image_features = _mope_get_image_features

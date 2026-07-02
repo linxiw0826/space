@@ -989,8 +989,14 @@ def train(attn_implementation="flash_attention_2"):
             # (LLM no longer sees MoPE features injected) but still cache the
             # frozen-encoder latent for the LFP target path. Orthogonal to
             # mope_lfp_enable.
+            # E-16e: mope_feed_causal_mask (default False) adds a causal-over-bins
+            # mask to the feed cross-attn so frame f only attends to MoPE K/V of
+            # bins <= b_f. False = byte-for-byte E-16 (no mask). Only active when
+            # feed_features=True.
             _patch_model_for_mope_crossattn(
-                model, feed_features=mope_args.mope_feed_features
+                model,
+                feed_features=mope_args.mope_feed_features,
+                feed_causal_mask=mope_args.mope_feed_causal_mask,
             )
         elif mope_args.mope_fusion_mode == "qformer":
             _patch_model_for_mope_qformer(model)

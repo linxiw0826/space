@@ -429,6 +429,7 @@ class MoPEProjectorCrossAttn(nn.Module):
         mope_features: torch.Tensor,
         image_embeds: torch.Tensor,
         cond_text: Optional[torch.Tensor] = None,
+        attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Apply single-head cross-attention and residual-add to image_embeds.
 
@@ -437,6 +438,12 @@ class MoPEProjectorCrossAttn(nn.Module):
             image_embeds:  Float tensor [B, N_img, llm_dim].
             cond_text:     Float tensor [B, llm_dim] pooled text repr for the
                            E-10 gate, or None.  Ignored when use_gate=False.
+            attn_mask:     Optional additive attention mask (E-16e feed-causal
+                           mask) broadcastable to the pre-softmax attention
+                           logits [B, N_img, N_mope]. ``0`` = visible, ``-inf`` =
+                           masked. When None (default) the attention is exactly
+                           the original bidirectional E-02c/E-03a/E-16 attention
+                           (byte-for-byte unchanged — no mask term added).
 
         Returns:
             updated_embeds: Float tensor [B, N_img, llm_dim].
@@ -447,7 +454,15 @@ class MoPEProjectorCrossAttn(nn.Module):
         Q = image_embeds                                               # [B, N_img,  llm_dim]
 
         scale = Q.shape[-1] ** -0.5
-        attn = torch.softmax(Q @ K.transpose(-2, -1) * scale, dim=-1) # [B, N_img, N_mope]
+        if attn_mask is None:
+            # Byte-for-byte the original bidirectional attention.
+            attn = torch.softmax(Q @ K.transpose(-2, -1) * scale, dim=-1)  # [B, N_img, N_mope]
+        else:
+            # E-16e: causal-over-bins mask ADDED to the logits before softmax
+            # (Video-CCAM get_ccam convention: -inf masks future-bin K/V).
+            scores = Q @ K.transpose(-2, -1) * scale                   # [B, N_img, N_mope]
+            scores = scores + attn_mask.to(scores.dtype)
+            attn = torch.softmax(scores, dim=-1)                       # [B, N_img, N_mope]
         out = attn @ V                                                 # [B, N_img, llm_dim]
         out = self.out_proj(out)                                       # [B, N_img, llm_dim]
         out = out.to(image_embeds.dtype)
