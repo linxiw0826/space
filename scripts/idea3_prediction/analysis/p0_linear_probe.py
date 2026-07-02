@@ -23,6 +23,17 @@
 #     同时差"辅助头"和"MoPE feed 注入"两项 confound；其低可还原度可能部分来自
 #     MoPE-off 而非辅助头。故"位置擦除"的定案以 E-16 vs E-03a 为准，E-15 仅参考。
 #
+# ★ 坍缩诊断解读规则（本次新增字段，用于"E-16 相对 E-03a 是否表征坍缩"定案）★
+#   在每帧 mean-pool 的 hidden 矩阵 X 上另算 5 个直接指标（stable_rank /
+#   effective_rank / frac_low_var_dims / vicreg_var_term / vicreg_cov_term）：
+#     - E-16 的 stable_rank / effective_rank ≈ E-03a、frac_low_var_dims 不升、
+#       vicreg 两项 ≈ E-03a  ==>  E-16 相对 E-03a **无额外坍缩** ==> E-16b
+#       （VICReg 防坍缩正则）**不需要**，可放弃。
+#     - 反之（E-16 的 stable_rank / effective_rank 明显 < E-03a、frac_low_var_dims
+#       明显升高、或 vicreg 两项明显大于 E-03a）才说明发生坍缩，E-16b 才需要。
+#     判据方向：stable_rank / effective_rank 低 = 坍缩；frac_low_var_dims 高 =
+#     维度坍缩；vicreg_var_term / vicreg_cov_term 大 = VICReg 会重罚（=坍缩迹象）。
+#
 # --------------------------------------------------------------------------
 # 方法（忠实复用训练期 LFP 头的切帧 + 分 bin 逻辑）
 # --------------------------------------------------------------------------
@@ -468,6 +479,76 @@ def run_probes(X, y_bin, y_pos, groups, n_bins, seed):
     }
 
 
+# ---------------------------------------------------------------------------
+# Collapse diagnostics (ADD-ONLY; additive to the P-0 probe, does not touch the
+# bin_acc / macro_f1 / pos_r2 logic or fields). Computed on the SAME per-frame
+# hidden matrix X [N_frames_total, D] the probes use, in fp32.
+#
+# Fields written:
+#   stable_rank        = ||X_c||_F^2 / ||X_c||_2^2   (X_c = column-mean-centered;
+#                        = sum(sigma_i^2) / max(sigma_i)^2). LOW  => collapse.
+#   effective_rank     = exp(-sum_i p_i ln p_i), p_i = sigma_i / sum_j sigma_j
+#                        (entropy rank of the singular-value distribution).
+#                        LOW  => collapse.
+#   frac_low_var_dims  = fraction of dims whose per-dim std is
+#                        < 0.01 * median(all per-dim std). HIGH => dim collapse.
+#   vicreg_var_term    = VICReg variance hinge term  (L_var)  ] byte-identical to
+#   vicreg_cov_term    = VICReg covariance off-diag term (L_cov) ] mope_patch.
+#                        _vicreg_loss (the SAME function is imported & called,
+#                        var_hinge=1.0, cov_scale=1.0, eps=1e-4, normalize=True
+#                        -> its global-scalar std normalization z=z/(z.std()+eps)
+#                        is applied inside). These are exactly the quantities the
+#                        E-16b regularizer would penalize.
+#                        CAVEAT (input granularity): E-16b penalizes per-VISUAL-
+#                        TOKEN hidden (_extract_visual_token_hidden), whereas here
+#                        X is per-FRAME mean-pooled hidden. The var/cov DEFINITION
+#                        is identical (same function); only the row set differs.
+#                        Both var/cov are read off the exact same operator, so the
+#                        E-03a vs E-16 comparison on X is apples-to-apples.
+#   vicreg_z_std       = overall std of z after normalization (~1 diagnostic).
+#   hidden_mean_std    = mean of per-dim std (raw hidden scale).
+#   D                  = hidden dimension (== hidden_dim; added for readability).
+# ---------------------------------------------------------------------------
+def collapse_diagnostics(X: np.ndarray, low_var_ratio: float = 0.01) -> dict:
+    import torch
+    from model.mope_patch import _vicreg_loss  # SAME function E-16b trains with
+
+    Xt = torch.from_numpy(np.ascontiguousarray(X)).float()  # [N, D] fp32
+    N, D = Xt.shape
+
+    # --- spectral diagnostics on the COLUMN-mean-centered matrix -------------
+    Xc = Xt - Xt.mean(dim=0, keepdim=True)
+    sv = torch.linalg.svdvals(Xc)                 # singular values, descending >=0
+    sv = sv[sv > 0]                               # drop numerical zeros (entropy)
+    sv2 = sv.pow(2)
+    stable_rank = float(sv2.sum() / (sv2.max() + 1e-12))
+    p = sv / (sv.sum() + 1e-12)                    # p_i = sigma_i / sum_j sigma_j
+    entropy = float(-(p * torch.log(p)).sum())
+    effective_rank = float(np.exp(entropy))
+
+    # --- per-dim std (raw hidden) diagnostics -------------------------------
+    dim_std = Xt.std(dim=0, unbiased=True)         # [D]
+    med = float(dim_std.median())
+    frac_low_var_dims = float((dim_std < low_var_ratio * med).float().mean())
+    hidden_mean_std = float(dim_std.mean())
+
+    # --- VICReg var/cov terms (byte-aligned with mope_patch._vicreg_loss) ---
+    l_var, l_cov, _, z_std = _vicreg_loss(
+        Xt, var_hinge=1.0, cov_scale=1.0, eps=1e-4, normalize=True,
+    )
+
+    return {
+        "stable_rank": stable_rank,
+        "effective_rank": effective_rank,
+        "frac_low_var_dims": frac_low_var_dims,
+        "vicreg_var_term": float(l_var),
+        "vicreg_cov_term": float(l_cov),
+        "vicreg_z_std": float(z_std),
+        "hidden_mean_std": hidden_mean_std,
+        "D": int(D),
+    }
+
+
 def main():
     ap = argparse.ArgumentParser(description="P-0 linear-probe: absolute time-bin recoverability from LLM per-frame hidden.")
     ap.add_argument("--checkpoint", required=True, help="checkpoint dir (pretrained=)")
@@ -571,6 +652,15 @@ def main():
 
     probe = run_probes(X, y_bin, y_pos, groups, args.n_bins, args.seed)
 
+    # ADD-ONLY: representation-collapse diagnostics on the same X (see the
+    # collapse_diagnostics block-comment). Does not alter the probe fields.
+    collapse = collapse_diagnostics(X)
+    logger.info("Collapse diag: stable_rank=%.2f effective_rank=%.2f "
+                "frac_low_var_dims=%.4f vicreg_var=%.4f vicreg_cov=%.4f",
+                collapse["stable_rank"], collapse["effective_rank"],
+                collapse["frac_low_var_dims"], collapse["vicreg_var_term"],
+                collapse["vicreg_cov_term"])
+
     result = {
         "checkpoint": args.checkpoint,
         "model_type": args.model_type,
@@ -582,6 +672,7 @@ def main():
         "seed": int(args.seed),
         "is_mope_on": bool(is_mope),
         **probe,
+        **collapse,
     }
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output)) or ".", exist_ok=True)

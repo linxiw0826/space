@@ -147,6 +147,25 @@ for r in rows:
           f"{r.get('n_videos',0):6d} {r.get('n_frames_total',0):7d} "
           f"{r.get('bin_acc',float('nan')):8.4f} {r.get('bin_macro_f1',float('nan')):8.4f} "
           f"{r.get('pos_r2',float('nan')):8.4f} {r.get('chance_acc',0.25):7.4f}")
+
+# --- collapse diagnostics sub-table (ADD-ONLY; backward compatible) ---------
+print()
+print("=== Collapse diagnostics (E-16 vs E-03a; on per-frame hidden X) ===")
+hdr2 = (f"{'checkpoint':40s} {'stbl_rank':>9s} {'eff_rank':>9s} "
+        f"{'frac_lowvar':>11s} {'vicreg_var':>10s} {'vicreg_cov':>10s} {'mean_std':>9s}")
+print(hdr2); print("-" * len(hdr2))
+for r in rows:
+    ck = r.get('checkpoint', '')
+    ck = ck if len(ck) <= 40 else "..." + ck[-37:]
+    print(f"{ck:40s} {r.get('stable_rank',float('nan')):9.3f} "
+          f"{r.get('effective_rank',float('nan')):9.3f} "
+          f"{r.get('frac_low_var_dims',float('nan')):11.4f} "
+          f"{r.get('vicreg_var_term',float('nan')):10.4f} "
+          f"{r.get('vicreg_cov_term',float('nan')):10.4f} "
+          f"{r.get('hidden_mean_std',float('nan')):9.3f}")
+print("坍缩解读: E-16 的 stable_rank/effective_rank ≈ E-03a、frac_lowvar 不升、")
+print("          vicreg 两项 ≈ E-03a => 无额外坍缩 => E-16b(VICReg 防坍缩)不需要;")
+print("          反之(rank 明显更低 / frac_lowvar 升高 / vicreg 两项更大)才需要 E-16b。")
 print()
 print("解读(干净判据 = E-16 vs E-03a, 二者都 MoPE-ON, 唯一变量=辅助头):")
 print("  E-16 的 bin_acc/pos_r2 显著 < E-03a (且 E-16 接近 chance=0.25) => 位置擦除 => E-16c;")
