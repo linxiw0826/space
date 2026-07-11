@@ -69,6 +69,58 @@ def _read_feed_causal_mask() -> bool:
     return os.environ.get("MOPE_FEED_CAUSAL_MASK", "0").strip().lower() in ("1", "true")
 
 
+def _read_temporal_pe() -> bool:
+    """Read the E-16t feed temporal-PE eval switch from the environment.
+
+    Returns True when ``MOPE_FEED_TEMPORAL_PE`` is set truthy (``1``/``true``,
+    case-insensitive), else False. UNSET or ``0``/``false`` -> False, so the
+    crossattn projector is built WITHOUT the temporal encoding and the eval is
+    byte-for-byte identical to the pre-E-16t path (E-03a / E-16 / E-16e).
+
+    Why this MUST be set for E-16t: an E-16t checkpoint TRAINS with
+    ``--mope_feed_temporal_pe`` and the feed cross-attn (with the temporal code)
+    also runs at inference. Leaving it OFF at eval would drop the temporal code
+    at test time -> train/test mismatch. Set ``MOPE_FEED_TEMPORAL_PE=1`` ONLY
+    when evaluating an E-16t checkpoint; leave it unset otherwise.
+    """
+    return os.environ.get("MOPE_FEED_TEMPORAL_PE", "0").strip().lower() in ("1", "true")
+
+
+def _read_encoder_type() -> str:
+    """Read the frozen-encoder backbone selection from the environment.
+
+    Returns ``MOPE_ENCODER_TYPE`` lower-cased ('mope' default, or 'videomae').
+    UNSET -> 'mope', byte-for-byte the original MoPE eval. This MUST match the
+    encoder the checkpoint was TRAINED with (--mope_encoder_type): the frozen
+    encoder weights are restored from the checkpoint's ``_mope_encoder.*`` keys
+    with strict=False, so a mismatch (e.g. building the MoE MoPE encoder for a
+    VideoMAE checkpoint) would silently fail to load the block MLP weights and
+    produce a wrong (random-MLP) encoder. Set ``MOPE_ENCODER_TYPE=videomae``
+    when evaluating an E-03a_vmae / E-16_vmae checkpoint.
+    """
+    val = os.environ.get("MOPE_ENCODER_TYPE", "mope").strip().lower()
+    if val not in ("mope", "videomae"):
+        raise ValueError(
+            f"MOPE_ENCODER_TYPE='{val}' invalid; must be 'mope' or 'videomae'."
+        )
+    return val
+
+
+def _build_mope_encoder(all_frames: int):
+    """Build the frozen encoder (architecture only) per MOPE_ENCODER_TYPE.
+
+    Weights are restored from the fine-tuned checkpoint's ``_mope_encoder.*``
+    keys by the caller (``_load_mope_weights_from_pretrained``), exactly like the
+    original MoPE path — so both branches pass ``checkpoint_path=None`` here.
+    """
+    encoder_type = _read_encoder_type()
+    if encoder_type == "videomae":
+        from model.mope_encoder import VideoMAEEncoder
+        return VideoMAEEncoder(checkpoint_path=None, all_frames=all_frames)
+    from model.mope_encoder import MoPEEncoder
+    return MoPEEncoder(checkpoint_path=None, all_frames=all_frames)
+
+
 def _load_mope_weights_from_pretrained(inner_model, pretrained_path: str) -> bool:
     """从 E-02a checkpoint 提取并加载 _mope_encoder / _mope_projector 权重。
 
@@ -526,11 +578,16 @@ class Qwen3_VL_MoPE_CrossAttn(Qwen3_VL_MoPE):
         inner = self._model.model
         llm_dim = self._model.config.text_config.hidden_size
 
-        from model.mope_encoder import MoPEEncoder
         from model.mope_projector import MoPEProjectorCrossAttn
 
-        encoder = MoPEEncoder(checkpoint_path=None, all_frames=self.mope_all_frames)
-        projector = MoPEProjectorCrossAttn(mope_dim=768, llm_dim=llm_dim)
+        # Encoder backbone per MOPE_ENCODER_TYPE (mope default / videomae for
+        # E-03a_vmae / E-16_vmae); MUST match the checkpoint's trained encoder.
+        encoder = _build_mope_encoder(self.mope_all_frames)
+        # E-16t: build the temporal-PE projector when MOPE_FEED_TEMPORAL_PE=1
+        # (must match the checkpoint); default OFF -> byte-for-byte E-16/E-03a.
+        projector = MoPEProjectorCrossAttn(
+            mope_dim=768, llm_dim=llm_dim, use_temporal_pe=_read_temporal_pe()
+        )
 
         inner.add_module("_mope_encoder", encoder)
         inner.add_module("_mope_projector", projector)
@@ -613,16 +670,19 @@ class Qwen3_VL_MoPE_Router(Qwen3_VL_MoPE_CrossAttn):
         inner = self._model.model
         llm_dim = self._model.config.text_config.hidden_size
 
-        from model.mope_encoder import MoPEEncoder
         from model.mope_projector import MoPEProjectorCrossAttn
 
-        encoder = MoPEEncoder(checkpoint_path=None, all_frames=self.mope_all_frames)
+        # Encoder backbone per MOPE_ENCODER_TYPE (must match the checkpoint).
+        encoder = _build_mope_encoder(self.mope_all_frames)
         # E-10: gated projector — must match the checkpoint so gate weights load.
+        # E-16t (CONCERN-5): temporal-PE wired here TOO so a router checkpoint
+        # trained with temporal PE stays consistent; default OFF = byte-for-byte E-10.
         projector = MoPEProjectorCrossAttn(
             mope_dim=768,
             llm_dim=llm_dim,
             use_gate=True,
             gate_mode=self.mope_gate_mode,
+            use_temporal_pe=_read_temporal_pe(),
         )
 
         inner.add_module("_mope_encoder", encoder)

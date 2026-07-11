@@ -425,16 +425,34 @@ def _attach_mope_to_model(model, mope_args: MoPEArguments):
     Qwen3VLModel / Qwen2_5_VLModel) so that they are accessible inside the
     patched forward method as ``self._mope_encoder`` / ``self._mope_projector``.
     """
-    from model.mope_encoder import MoPEEncoder
     from model.mope_projector import MoPEProjector
 
     inner_model = model.model  # Qwen3VLModel / Qwen2_5_VLModel
 
-    rank0_print("[Space Sensing] Attaching MoPEEncoder (frozen) ...")
-    encoder = MoPEEncoder(
-        checkpoint_path=mope_args.mope_checkpoint_path,
-        all_frames=mope_args.mope_all_frames,
-    )
+    # Encoder backbone selection (paper-2 D-26/D-27 drop-in). Default 'mope' is
+    # byte-for-byte identical to every prior experiment; 'videomae' swaps in a
+    # frozen plain VideoMAE ViT-B stand-in (E-03a_vmae / E-16_vmae). Both emit
+    # [B,784,768] time-major latents, so nothing downstream changes.
+    _encoder_type = getattr(mope_args, "mope_encoder_type", "mope")
+    if _encoder_type == "videomae":
+        from model.mope_encoder import VideoMAEEncoder
+        rank0_print("[Space Sensing] Attaching VideoMAEEncoder (frozen, drop-in) ...")
+        encoder = VideoMAEEncoder(
+            checkpoint_path=mope_args.mope_checkpoint_path,
+            all_frames=mope_args.mope_all_frames,
+        )
+    elif _encoder_type == "mope":
+        from model.mope_encoder import MoPEEncoder
+        rank0_print("[Space Sensing] Attaching MoPEEncoder (frozen) ...")
+        encoder = MoPEEncoder(
+            checkpoint_path=mope_args.mope_checkpoint_path,
+            all_frames=mope_args.mope_all_frames,
+        )
+    else:
+        raise ValueError(
+            f"Unknown --mope_encoder_type '{_encoder_type}'. "
+            f"Must be 'mope' (default) or 'videomae'."
+        )
     # Register as sub-modules so they participate in .to(device), .parameters(), etc.
     inner_model.add_module("_mope_encoder", encoder)
 
@@ -471,6 +489,8 @@ def _attach_mope_to_model(model, mope_args: MoPEArguments):
         # E-10b A1: gate_init_bias defaults to 0.0 (g≈0.5, non-saturated) so the
         # gate starts in its maximal-slope regime instead of the E-10 saturated
         # +4.0 (g≈0.98). E-10 behaviour is recoverable with --mope_gate_init_bias 4.0.
+        # E-16t: enable the Cosmos-style per-bin temporal PE on the feed K/V when
+        # --mope_feed_temporal_pe is set. Default False -> no module, byte-for-byte E-16.
         projector = MoPEProjectorCrossAttn(
             mope_dim=768,
             llm_dim=llm_dim,
@@ -478,6 +498,7 @@ def _attach_mope_to_model(model, mope_args: MoPEArguments):
             gate_mode=mope_args.mope_gate_mode,
             gate_init_bias=mope_args.mope_gate_init_bias,
             gate_lastw_std=mope_args.mope_gate_lastw_std,
+            use_temporal_pe=getattr(mope_args, "mope_feed_temporal_pe", False),
         )
     elif mope_args.mope_fusion_mode == "qformer":
         from model.mope_projector import MoPEProjectorQFormer

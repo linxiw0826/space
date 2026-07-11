@@ -122,6 +122,19 @@ class MoPEArguments:
         metadata={"help": "Number of video frames passed to MoPEEncoder. "
                           "Must be consistent with data preprocessing."},
     )
+    mope_encoder_type: str = field(
+        default="mope",
+        metadata={"help": "Frozen encoder backbone selection (paper-2 D-26/D-27 "
+                          "encoder drop-in). 'mope' (default) = the current MoPE "
+                          "ViT-B (VideoMAEv2 + MoE), byte-for-byte identical to "
+                          "every existing experiment (E-03a/E-16/...). 'videomae' "
+                          "= a plain (no-MoE) VideoMAE ViT-B/16 tubelet-2 encoder "
+                          "used as a frozen drop-in stand-in while MoPE V2 is not "
+                          "ready (E-03a_vmae / E-16_vmae). BOTH produce [B,784,768] "
+                          "time-major latents so the projector / feed / LFP head are "
+                          "unchanged — the encoder is the ONLY variable. Default "
+                          "'mope' keeps all prior experiments bit-identical."},
+    )
     mope_fusion_mode: str = field(
         default="add",
         metadata={"help": "MoPE fusion strategy. "
@@ -430,6 +443,23 @@ class MoPEArguments:
                           "so the feed mask and the LFP target are temporally consistent. Only "
                           "active on the feed path (mope_feed_features=True); no effect when "
                           "feed_features=False (no residual fusion to mask)."},
+    )
+    mope_feed_temporal_pe: bool = field(
+        default=False,
+        metadata={"help": "E-16t Cosmos-style per-bin temporal position encoding on "
+                          "the feed cross-attn K/V (the SINGLE new variable vs E-16). "
+                          "False (default) = NO temporal encoding added; the projector "
+                          "is byte-for-byte identical to E-16/E-03a (no module built, "
+                          "state_dict unchanged). True = a parameter-free 1-D sinusoidal "
+                          "code indexed by MoPE time-bin (token j -> bin j//196) is ADDED "
+                          "to the normed MoPE features before k_proj/v_proj, so all 196 "
+                          "spatial tokens of a bin share the same temporal vector (spatial "
+                          "axis zeroed = Cosmos 'time-only' semantics). Gives the feed "
+                          "cross-attn an explicit, disentangled time axis. The bin split "
+                          "(//196) is identical to the LFP head's, so feed temporal PE and "
+                          "the LFP target are temporally consistent. Only active on the "
+                          "feed path (mope_feed_features=True); no effect when "
+                          "feed_features=False (no residual fusion to encode)."},
     )
 
 

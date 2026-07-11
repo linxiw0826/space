@@ -182,6 +182,12 @@ class MoPEProjectorCrossAttn(nn.Module):
         gate_hidden:    Hidden width of the gate MLP (default: 256).
         gate_init_bias: Final-layer bias of the gate MLP (default: +4.0 →
                         g ≈ 0.982). Use +2.2 for g ≈ 0.9.
+        use_temporal_pe: Enable the E-16t Cosmos-style per-bin temporal position
+                        encoding on the K/V (default: False = byte-for-byte E-16;
+                        no module built, no state_dict change).
+        temporal_spatial: Spatial tokens per MoPE time-bin (default: 196, ViT-B/16
+                        224²). token j -> bin j//temporal_spatial. Only used when
+                        use_temporal_pe=True.
 
     Forward:
         mope_features: [B, N_mope, mope_dim]  — MoPE encoder output (N_mope=784)
@@ -199,6 +205,8 @@ class MoPEProjectorCrossAttn(nn.Module):
         gate_hidden: int = 256,
         gate_init_bias: float = 4.0,
         gate_lastw_std: float = 1e-3,
+        use_temporal_pe: bool = False,
+        temporal_spatial: int = 196,
     ):
         super().__init__()
         self.mope_dim = mope_dim
@@ -207,6 +215,25 @@ class MoPEProjectorCrossAttn(nn.Module):
         self.gate_mode = gate_mode
         self.gate_init_bias = gate_init_bias
         self.gate_lastw_std = gate_lastw_std
+        # ---------------------------------------------------------------
+        # E-16t Cosmos-style per-bin temporal position encoding (default OFF).
+        # When use_temporal_pe=False NOTHING is built and forward skips the
+        # encoding entirely, so this module is BYTE-FOR-BYTE identical to
+        # E-16/E-03a (no new parameters, state_dict unchanged). The encoding is
+        # parameter-free (fixed 1-D sinusoidal indexed by MoPE time-bin), so
+        # even when ON there are no extra trainable weights / state_dict keys —
+        # only a non-persistent per-(n_bins,dim) cache. temporal_spatial (196)
+        # is the number of spatial tokens per time-bin (ViT-B/16, 224^2), used
+        # to map token j -> bin j//temporal_spatial, IDENTICAL to the LFP head's
+        # split so feed temporal PE and the LFP target stay temporally aligned.
+        # ---------------------------------------------------------------
+        self.use_temporal_pe = use_temporal_pe
+        self.temporal_spatial = temporal_spatial
+        # Non-persistent cache of the sinusoidal table keyed by n_bins; holds a
+        # CPU fp32 [n_bins, mope_dim] tensor, cast/moved per-call. NOT a
+        # registered buffer/parameter -> invisible to state_dict / optimizer /
+        # FSDP, zero impact on the disabled path.
+        self._tpe_cache = {}
 
         self.norm = nn.LayerNorm(mope_dim)
         self.k_proj = nn.Linear(mope_dim, llm_dim)
@@ -424,6 +451,29 @@ class MoPEProjectorCrossAttn(nn.Module):
         if not self.training:
             self._eval_gate_log.append(float(g.detach().float().mean().item()))
 
+    def _temporal_pe(
+        self, n_bins: int, dim: int, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor:
+        """Return a fixed 1-D sinusoidal per-bin temporal code [n_bins, dim].
+
+        Parameter-free (no autograd, no state_dict). Uses the SAME sinusoidal
+        formula as the MoPE encoder's ``get_sinusoid_encoding_table`` so the
+        added time axis is on the encoder's native footing. Cached per n_bins in
+        a plain dict (non-persistent); n_bins is tiny (4) so the cost is
+        negligible even if recomputed.
+        """
+        cached = self._tpe_cache.get(n_bins)
+        if cached is None:
+            pos = torch.arange(n_bins, dtype=torch.float32).unsqueeze(1)      # [n_bins, 1]
+            j = torch.arange(dim, dtype=torch.float32)                        # [dim]
+            div = torch.pow(10000.0, 2.0 * torch.div(j, 2, rounding_mode="floor") / dim)
+            table = pos / div                                                 # [n_bins, dim]
+            table[:, 0::2] = torch.sin(table[:, 0::2])
+            table[:, 1::2] = torch.cos(table[:, 1::2])
+            cached = table                                                    # CPU fp32
+            self._tpe_cache[n_bins] = cached
+        return cached.to(device=device, dtype=dtype)
+
     def forward(
         self,
         mope_features: torch.Tensor,
@@ -449,6 +499,28 @@ class MoPEProjectorCrossAttn(nn.Module):
             updated_embeds: Float tensor [B, N_img, llm_dim].
         """
         x = self.norm(mope_features)                                   # [B, N_mope, mope_dim]
+
+        # E-16t: add a Cosmos-style per-bin temporal position encoding to the
+        # normed MoPE features BEFORE k_proj/v_proj (so K and V share the same
+        # explicit time axis). token j -> bin j//temporal_spatial; the 196
+        # spatial tokens of a bin all receive the SAME temporal vector (spatial
+        # axis carries no time coordinate = Cosmos 'time-only'). When
+        # use_temporal_pe=False this whole block is skipped -> byte-for-byte E-16.
+        if self.use_temporal_pe:
+            N_mope = x.shape[1]
+            spatial = self.temporal_spatial
+            assert N_mope % spatial == 0, (
+                f"[E-16t] N_mope={N_mope} not divisible by temporal_spatial="
+                f"{spatial}; token layout is not [n_bins x {spatial}] time-major "
+                f"— temporal PE bins would be misaligned with the LFP head."
+            )
+            n_bins = N_mope // spatial
+            tpe = self._temporal_pe(n_bins, x.shape[-1], x.device, x.dtype)  # [n_bins, mope_dim]
+            # Expand each bin's vector over its `spatial` tokens (time-major):
+            # [n_bins, D] -> [n_bins*spatial, D] = [N_mope, D], broadcast over B.
+            tpe = tpe.repeat_interleave(spatial, dim=0).unsqueeze(0)         # [1, N_mope, mope_dim]
+            x = x + tpe
+
         K = self.k_proj(x)                                             # [B, N_mope, llm_dim]
         V = self.v_proj(x)                                             # [B, N_mope, llm_dim]
         Q = image_embeds                                               # [B, N_img,  llm_dim]
