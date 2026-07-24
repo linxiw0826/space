@@ -3,9 +3,10 @@
 
 import argparse
 import json
+import os
 import random
 import zipfile
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import cv2
@@ -84,8 +85,10 @@ def frame_count(path):
 
 def read_matrix(path):
     matrix = np.loadtxt(path)
-    if matrix.shape != (4, 4) or not np.isfinite(matrix).all():
-        raise ValueError(f"Invalid 4x4 matrix: {path} shape={matrix.shape}")
+    if matrix.shape != (4, 4):
+        raise ValueError(f"Invalid matrix shape: {path} shape={matrix.shape}")
+    if not np.isfinite(matrix).all():
+        raise ValueError(f"Non-finite matrix values: {path}")
     return matrix.tolist()
 
 
@@ -164,6 +167,55 @@ def selected_visibility(record, exact_mapping):
     return result
 
 
+def validate_scene_geometry(
+    scene,
+    records,
+    video_root,
+    geometry_root,
+):
+    video_path = video_root / f"{scene}.mp4"
+    n_frames = frame_count(video_path)
+    if n_frames is None:
+        return None, "invalid_video"
+    if n_frames != len(records):
+        return None, "video_npy_frame_count_mismatch"
+
+    pose_dir = geometry_root / scene / "video_pose"
+    pose_ids = sorted(int(path.stem) for path in pose_dir.glob("*.txt"))
+    if len(pose_ids) != 32:
+        return None, "candidate_pose_count_not_32"
+
+    step = n_frames / 8
+    sft_indices = [int(step * index + step / 2) for index in range(8)]
+    expected_positions = list(range(2, 32, 4))
+    if [pose_ids[index] for index in expected_positions] != sft_indices:
+        return None, "sft_8of32_mapping_mismatch"
+
+    intrinsic_path = (
+        geometry_root / scene / "intrinsic" / "intrinsic_color.txt"
+    )
+    try:
+        read_matrix(intrinsic_path)
+    except Exception as error:
+        return None, f"invalid_intrinsic:{type(error).__name__}"
+
+    for source_frame_index in pose_ids:
+        pose_path = pose_dir / f"{source_frame_index}.txt"
+        try:
+            read_matrix(pose_path)
+        except Exception as error:
+            return (
+                None,
+                f"invalid_candidate_pose:{type(error).__name__}",
+            )
+
+    return {
+        "video_frame_count": n_frames,
+        "pose_ids": pose_ids,
+        "sft_indices": sft_indices,
+    }, None
+
+
 def build_scene(
     scene,
     qa_rows,
@@ -173,25 +225,22 @@ def build_scene(
     geometry_root,
 ):
     video_path = video_root / f"{scene}.mp4"
-    n_frames = frame_count(video_path)
-    if n_frames is None or n_frames != len(records):
-        raise ValueError(
-            f"{scene}: video frames={n_frames}, NPY records={len(records)}"
-        )
-
     exact, rejected, conflicts, fully_exact = exact_category_mapping(
         scene_meta, records
     )
-    pose_dir = geometry_root / scene / "video_pose"
-    pose_ids = sorted(int(path.stem) for path in pose_dir.glob("*.txt"))
-    if len(pose_ids) != 32:
-        raise ValueError(f"{scene}: expected 32 video poses, got {len(pose_ids)}")
+    geometry, geometry_error = validate_scene_geometry(
+        scene=scene,
+        records=records,
+        video_root=video_root,
+        geometry_root=geometry_root,
+    )
+    if geometry_error:
+        raise ValueError(f"{scene}: {geometry_error}")
 
-    step = n_frames / 8
-    sft_indices = [int(step * index + step / 2) for index in range(8)]
-    expected_positions = list(range(2, 32, 4))
-    if [pose_ids[index] for index in expected_positions] != sft_indices:
-        raise ValueError(f"{scene}: 8-of-32 mapping mismatch")
+    n_frames = geometry["video_frame_count"]
+    pose_dir = geometry_root / scene / "video_pose"
+    pose_ids = geometry["pose_ids"]
+    sft_indices = geometry["sft_indices"]
 
     intrinsic_path = (
         geometry_root / scene / "intrinsic" / "intrinsic_color.txt"
@@ -249,6 +298,8 @@ def main():
 
     eligible = []
     scene_audit = {}
+    geometry_rejection_counts = Counter()
+    geometry_rejection_examples = defaultdict(list)
     for scene in sorted(qa_by_scene):
         if scene not in metadata or scene not in frame_info:
             continue
@@ -262,7 +313,23 @@ def main():
             "conflicts": len(conflicts),
             "qa_rows": len(qa_by_scene[scene]),
         }
-        if fully_exact or not args.require_fully_exact:
+        geometry, geometry_error = validate_scene_geometry(
+            scene=scene,
+            records=frame_info[scene],
+            video_root=args.video_root,
+            geometry_root=args.geometry_root,
+        )
+        scene_audit[scene]["geometry_valid"] = geometry_error is None
+        scene_audit[scene]["geometry_error"] = geometry_error
+        if geometry_error:
+            geometry_rejection_counts[geometry_error] += 1
+            if len(geometry_rejection_examples[geometry_error]) < 30:
+                geometry_rejection_examples[geometry_error].append(scene)
+
+        if (
+            geometry_error is None
+            and (fully_exact or not args.require_fully_exact)
+        ):
             eligible.append(scene)
 
     rng = random.Random(args.seed)
@@ -273,21 +340,27 @@ def main():
         selected = sorted(eligible)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    temporary_output = args.output.with_name(args.output.name + ".tmp")
     total_qa = 0
     total_nodes = 0
-    with args.output.open("w", encoding="utf-8") as handle:
-        for scene in selected:
-            item = build_scene(
-                scene=scene,
-                qa_rows=qa_by_scene[scene],
-                scene_meta=metadata[scene],
-                records=frame_info[scene],
-                video_root=args.video_root,
-                geometry_root=args.geometry_root,
-            )
-            total_qa += len(item["qa"])
-            total_nodes += len(item["nodes"])
-            handle.write(json.dumps(item, ensure_ascii=False) + "\n")
+    try:
+        with temporary_output.open("w", encoding="utf-8") as handle:
+            for scene in selected:
+                item = build_scene(
+                    scene=scene,
+                    qa_rows=qa_by_scene[scene],
+                    scene_meta=metadata[scene],
+                    records=frame_info[scene],
+                    video_root=args.video_root,
+                    geometry_root=args.geometry_root,
+                )
+                total_qa += len(item["qa"])
+                total_nodes += len(item["nodes"])
+                handle.write(json.dumps(item, ensure_ascii=False) + "\n")
+        os.replace(temporary_output, args.output)
+    except Exception:
+        temporary_output.unlink(missing_ok=True)
+        raise
 
     summary = {
         "schema_version": "scannet_parta_manifest_summary_v1",
@@ -299,6 +372,8 @@ def main():
         "selected_scenes": len(selected),
         "selected_qa_rows": total_qa,
         "selected_nodes": total_nodes,
+        "geometry_rejection_counts": dict(geometry_rejection_counts),
+        "geometry_rejection_examples": dict(geometry_rejection_examples),
         "output": str(args.output),
         "selected_scene_ids": selected,
         "scene_audit": scene_audit,
@@ -308,7 +383,11 @@ def main():
         json.dump(summary, handle, indent=2, ensure_ascii=False)
     print(json.dumps({
         key: value for key, value in summary.items()
-        if key not in {"selected_scene_ids", "scene_audit"}
+        if key not in {
+            "selected_scene_ids",
+            "scene_audit",
+            "geometry_rejection_examples",
+        }
     }, indent=2, ensure_ascii=False))
 
 
