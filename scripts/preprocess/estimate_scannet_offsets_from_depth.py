@@ -96,7 +96,16 @@ def reconstruct_scene_points(scene_root, args):
                 "reason": "invalid_depth",
             })
             continue
-        camera_to_world = read_matrix(pose_path)
+        try:
+            camera_to_world = read_matrix(pose_path)
+        except Exception as error:
+            skipped_frames.append({
+                "frame_id": frame_id,
+                "reason": (
+                    f"invalid_pose:{type(error).__name__}"
+                ),
+            })
+            continue
         height, width = depth_raw.shape
         rows = np.arange(
             args.pixel_stride // 2, height, args.pixel_stride
