@@ -24,6 +24,11 @@ def parse_args():
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--num-scenes", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--pc-means",
+        type=Path,
+        help="Optional scene-to-translation JSON applied to bbox centroids.",
+    )
     return parser.parse_args()
 
 
@@ -62,18 +67,18 @@ def candidate_position(view):
     return matrix[:3, 3]
 
 
-def add_frame_panel(axis, image, view):
+def add_frame_panel(axis, image, view, node_positions, intrinsic):
     axis.imshow(image)
     axis.axis("off")
-    visible = view["visible_nodes"]
-    labels = [item["node_id"] for item in visible[:7]]
+    visible_nodes = view["visible_nodes"]
+    labels = [item["node_id"] for item in visible_nodes[:7]]
     suffix = "\n".join(labels)
-    if len(visible) > 7:
-        suffix += f"\n+{len(visible) - 7} more"
+    if len(visible_nodes) > 7:
+        suffix += f"\n+{len(visible_nodes) - 7} more"
     title = (
         f"candidate={view['candidate_index']} "
         f"frame={view['mp4_frame_index']} "
-        f"visible={len(visible)}"
+        f"visible={len(visible_nodes)}"
     )
     axis.set_title(title, fontsize=9)
     axis.text(
@@ -87,6 +92,34 @@ def add_frame_panel(axis, image, view):
         color="white",
         bbox={"facecolor": "black", "alpha": 0.55, "pad": 2},
     )
+    world_to_camera = np.linalg.inv(
+        np.asarray(view["camera_to_world"], dtype=float)
+    )
+    height, width = image.shape[:2]
+    for visible in visible_nodes:
+        position = node_positions.get(visible["node_id"])
+        if position is None:
+            continue
+        camera_point = world_to_camera @ np.r_[position, 1.0]
+        if camera_point[2] <= 1e-6:
+            continue
+        pixel = intrinsic @ camera_point
+        u = pixel[0] / pixel[2]
+        v = pixel[1] / pixel[2]
+        if not (0 <= u < width and 0 <= v < height):
+            continue
+        axis.scatter(
+            [u], [v], s=35, marker="x", linewidths=1.5,
+            color="#ff00ff",
+        )
+        axis.annotate(
+            visible["node_id"],
+            (u, v),
+            xytext=(3, 3),
+            textcoords="offset points",
+            fontsize=6,
+            color="#ff00ff",
+        )
 
 
 def add_projection(axis, camera_positions, sft_mask, node_positions, nodes, dims):
@@ -159,7 +192,7 @@ def add_visibility_matrix(axis, item):
     axis.set_yticks(list(range(0, 32, 4)))
 
 
-def visualize_scene(item, output_path):
+def visualize_scene(item, output_path, offset):
     sft_views = [
         view for view in item["candidate_views"] if view["is_sft_view"]
     ]
@@ -175,9 +208,14 @@ def visualize_scene(item, output_path):
     ])
     nodes = item["nodes"]
     node_positions = (
-        np.stack([node_centroid(node) for node in nodes])
+        np.stack([node_centroid(node) + offset for node in nodes])
         if nodes else np.empty((0, 3))
     )
+    node_position_lookup = {
+        node["node_id"]: node_positions[index]
+        for index, node in enumerate(nodes)
+    }
+    intrinsic = np.asarray(item["intrinsic_color"], dtype=float)
 
     figure = plt.figure(figsize=(20, 13), constrained_layout=True)
     grid = figure.add_gridspec(3, 4)
@@ -188,6 +226,8 @@ def visualize_scene(item, output_path):
             axis,
             frames[view["mp4_frame_index"]],
             view,
+            node_position_lookup,
+            intrinsic,
         )
 
     for projection_index, dims in enumerate(PROJECTIONS):
@@ -206,7 +246,8 @@ def visualize_scene(item, output_path):
 
     figure.suptitle(
         f"{item['scene_id']} | QA={len(item['qa'])} "
-        f"| nodes={len(nodes)} | frames={item['video_frame_count']}",
+        f"| nodes={len(nodes)} | frames={item['video_frame_count']} "
+        f"| offset={np.round(offset, 3).tolist()}",
         fontsize=15,
     )
     figure.savefig(output_path, dpi=140)
@@ -216,6 +257,10 @@ def visualize_scene(item, output_path):
 def main():
     args = parse_args()
     items = load_manifest(args.manifest)
+    pc_means = {}
+    if args.pc_means:
+        with args.pc_means.open("r", encoding="utf-8") as handle:
+            pc_means = json.load(handle)
     rng = random.Random(args.seed)
     selected = list(items)
     rng.shuffle(selected)
@@ -226,6 +271,7 @@ def main():
         "manifest": str(args.manifest),
         "seed": args.seed,
         "requested_scenes": args.num_scenes,
+        "pc_means": str(args.pc_means) if args.pc_means else None,
         "selected_scene_ids": [],
         "outputs": [],
         "errors": [],
@@ -234,7 +280,11 @@ def main():
         scene = item["scene_id"]
         output_path = args.output_dir / f"{scene}_qc.png"
         try:
-            visualize_scene(item, output_path)
+            offset = np.asarray(
+                pc_means.get(scene, [0.0, 0.0, 0.0]),
+                dtype=float,
+            ).reshape(3)
+            visualize_scene(item, output_path, offset)
             report["selected_scene_ids"].append(scene)
             report["outputs"].append(str(output_path))
             print(f"OK {scene}: {output_path}")
