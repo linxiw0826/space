@@ -25,6 +25,11 @@ def parse_args():
     parser.add_argument("--num-scenes", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--scene-ids",
+        nargs="*",
+        help="Optional explicit scene IDs; overrides random sampling.",
+    )
+    parser.add_argument(
         "--pc-means",
         type=Path,
         help="Optional scene-to-translation JSON applied to bbox centroids.",
@@ -262,15 +267,31 @@ def main():
         with args.pc_means.open("r", encoding="utf-8") as handle:
             pc_means = json.load(handle)
     rng = random.Random(args.seed)
-    selected = list(items)
-    rng.shuffle(selected)
-    selected = selected[: args.num_scenes]
+    if args.scene_ids:
+        by_scene = {item["scene_id"]: item for item in items}
+        missing = [
+            scene for scene in args.scene_ids
+            if scene not in by_scene
+        ]
+        if missing:
+            raise ValueError(
+                f"Requested scene IDs absent from manifest: {missing}"
+            )
+        selected = [by_scene[scene] for scene in args.scene_ids]
+    else:
+        selected = list(items)
+        rng.shuffle(selected)
+        selected = selected[: args.num_scenes]
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     report = {
         "manifest": str(args.manifest),
         "seed": args.seed,
-        "requested_scenes": args.num_scenes,
+        "requested_scenes": (
+            len(args.scene_ids)
+            if args.scene_ids else args.num_scenes
+        ),
+        "requested_scene_ids": args.scene_ids,
         "pc_means": str(args.pc_means) if args.pc_means else None,
         "selected_scene_ids": [],
         "outputs": [],
