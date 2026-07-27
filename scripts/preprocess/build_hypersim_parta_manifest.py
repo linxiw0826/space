@@ -286,7 +286,8 @@ def main() -> None:
                     "visible_instances": visible,
                     "qa": qas,
                     "source_files": {
-                        name: str(path) for name, path in paths.items()
+                        name: str(path.relative_to(args.hypersim_root))
+                        for name, path in paths.items()
                     },
                     "supervision_tier": "gold",
                     "identity_join": "direct",
