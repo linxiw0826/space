@@ -72,3 +72,17 @@ def test_identical_signatures_are_marked_ambiguous():
     assert all(
         item["mapping_status"] == "ambiguous" for item in assignments
     )
+
+
+def test_singleton_mapping_is_verified_independent_of_trajectory_score():
+    assignments, _, _ = MODULE.match_category(
+        "microwave",
+        {8: np.asarray([0, 0, 1], dtype=float)},
+        [{}],
+        [make_features(np.asarray([1, 0, 0], dtype=float))],
+        Args(),
+    )
+
+    assert assignments[0]["mapping_status"] == "verified_singleton"
+    assert assignments[0]["mapping_confidence"] == "high"
+    assert assignments[0]["mapping_source"] == "category_count_unique"

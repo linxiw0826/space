@@ -271,12 +271,23 @@ def match_category(
             alternatives = np.delete(score_matrix[row], col)
             second = float(alternatives.max()) if alternatives.size else 0.0
             margin = score - second
-            confidence = classify(score, margin, args)
-            status = "matched" if confidence != "low" else "ambiguous"
+            singleton = len(instance_ids) == 1 and len(boxes) == 1
+            if singleton:
+                confidence = "high"
+                status = "verified_singleton"
+                source = "category_count_unique"
+            else:
+                confidence = classify(score, margin, args)
+                status = "matched" if confidence != "low" else "ambiguous"
+                source = "temporal_geometry_estimate"
             assignments.append({
                 "category": category,
                 "instance_id": instance_ids[row],
                 "bbox_index": col,
+                "assignment_scope": (
+                    "singleton" if singleton else "multi_instance"
+                ),
+                "mapping_source": source,
                 "match_score": score,
                 "match_margin": margin,
                 "second_best_score": second,
@@ -379,7 +390,10 @@ def main():
     errors = {}
     confidence_counts = Counter()
     status_counts = Counter()
+    scope_counts = defaultdict(Counter)
     category_counts = defaultdict(Counter)
+    multi_scores = []
+    multi_margins = []
     for item in items:
         scene = item["scene_id"]
         try:
@@ -392,7 +406,12 @@ def main():
                 status = assignment["mapping_status"]
                 confidence_counts[confidence] += 1
                 status_counts[status] += 1
+                scope = assignment["assignment_scope"]
+                scope_counts[scope][confidence] += 1
                 category_counts[assignment["category"]][confidence] += 1
+                if scope == "multi_instance":
+                    multi_scores.append(assignment["match_score"])
+                    multi_margins.append(assignment["match_margin"])
         except Exception as error:
             errors[scene] = f"{type(error).__name__}: {error}"
 
@@ -415,6 +434,12 @@ def main():
         },
         "assignment_status_counts": dict(status_counts),
         "assignment_confidence_counts": dict(confidence_counts),
+        "scope_confidence_counts": {
+            scope: dict(counts)
+            for scope, counts in sorted(scope_counts.items())
+        },
+        "multi_instance_score_quantiles": quantiles(multi_scores),
+        "multi_instance_margin_quantiles": quantiles(multi_margins),
         "category_confidence_counts": {
             category: dict(counts)
             for category, counts in sorted(category_counts.items())
@@ -426,6 +451,21 @@ def main():
         encoding="utf-8",
     )
     print(json.dumps(summary, indent=2, ensure_ascii=False))
+
+
+def quantiles(values):
+    if not values:
+        return {}
+    array = np.asarray(values, dtype=np.float64)
+    return {
+        "min": float(array.min()),
+        "p10": float(np.percentile(array, 10)),
+        "p25": float(np.percentile(array, 25)),
+        "median": float(np.median(array)),
+        "p75": float(np.percentile(array, 75)),
+        "p90": float(np.percentile(array, 90)),
+        "max": float(array.max()),
+    }
 
 
 if __name__ == "__main__":
