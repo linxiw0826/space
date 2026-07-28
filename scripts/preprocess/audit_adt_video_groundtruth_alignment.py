@@ -7,6 +7,7 @@ import argparse
 import csv
 import io
 import json
+import subprocess
 import zipfile
 from collections import Counter
 from pathlib import Path
@@ -83,6 +84,35 @@ def video_info(path):
         "height": int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)),
     }
     capture.release()
+    probe = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format_tags=description",
+            "-of",
+            "json",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    probe_data = json.loads(probe.stdout)
+    description = (
+        probe_data.get("format", {})
+        .get("tags", {})
+        .get("description")
+    )
+    frame_timestamps = (
+        json.loads(description) if description is not None else []
+    )
+    if not isinstance(frame_timestamps, list):
+        raise ValueError(f"Invalid MP4 timestamp description: {path}")
+    result["_frame_timestamps_ns"] = [
+        int(value) for value in frame_timestamps
+    ]
     result["duration_seconds"] = (
         result["frame_count"] / result["fps"]
         if result["fps"] > 0
@@ -116,6 +146,7 @@ def main():
             if not video.is_file():
                 raise FileNotFoundError(f"Missing video: {video}")
             info = video_info(video)
+            frame_timestamps = info.pop("_frame_timestamps_ns")
             with zipfile.ZipFile(candidates[0]) as archive:
                 trajectory = csv_rows(archive, "aria_trajectory.csv")
                 boxes_2d = csv_rows(archive, "2d_bounding_box.csv")
@@ -140,11 +171,20 @@ def main():
             differences = nearest_differences(
                 trajectory_timestamps, bbox_timestamps
             )
+            frame_trajectory_differences = nearest_differences(
+                frame_timestamps, trajectory_timestamps
+            )
+            frame_bbox_differences = nearest_differences(
+                frame_timestamps, bbox_timestamps
+            )
             nearest_all.extend(differences.tolist())
             frame_count = info["frame_count"]
             trajectory_count = len(trajectory_timestamps)
             bbox_time_count = len(bbox_timestamps)
-            if frame_count == trajectory_count:
+            frame_timestamp_count = len(frame_timestamps)
+            if frame_timestamp_count == frame_count:
+                alignment = "mp4_device_timestamps_available"
+            elif frame_count == trajectory_count:
                 alignment = "video_equals_trajectory"
             elif frame_count == bbox_time_count:
                 alignment = "video_equals_bbox_timestamps"
@@ -157,6 +197,11 @@ def main():
                 **info,
                 "trajectory_timestamps": trajectory_count,
                 "bbox_timestamps": bbox_time_count,
+                "frame_timestamp_count": frame_timestamp_count,
+                "frame_timestamp_count_matches_video": (
+                    frame_timestamp_count == frame_count
+                ),
+                "frame_time": timestamp_summary(frame_timestamps),
                 "trajectory_time": trajectory_time,
                 "bbox_time": bbox_time,
                 "video_trajectory_duration_ratio": (
@@ -185,6 +230,42 @@ def main():
                 "nearest_bbox_trajectory_ns_max": (
                     int(differences.max()) if len(differences) else None
                 ),
+                "nearest_trajectory_frame_ns_median": (
+                    float(np.median(frame_trajectory_differences))
+                    if len(frame_trajectory_differences)
+                    else None
+                ),
+                "nearest_trajectory_frame_ns_max": (
+                    int(frame_trajectory_differences.max())
+                    if len(frame_trajectory_differences)
+                    else None
+                ),
+                "nearest_bbox_frame_ns_median": (
+                    float(np.median(frame_bbox_differences))
+                    if len(frame_bbox_differences)
+                    else None
+                ),
+                "nearest_bbox_frame_ns_max": (
+                    int(frame_bbox_differences.max())
+                    if len(frame_bbox_differences)
+                    else None
+                ),
+                "trajectory_timestamps_inside_video_span": (
+                    sum(
+                        frame_timestamps[0] <= value <= frame_timestamps[-1]
+                        for value in trajectory_timestamps
+                    )
+                    if frame_timestamps
+                    else 0
+                ),
+                "bbox_timestamps_inside_video_span": (
+                    sum(
+                        frame_timestamps[0] <= value <= frame_timestamps[-1]
+                        for value in bbox_timestamps
+                    )
+                    if frame_timestamps
+                    else 0
+                ),
                 "alignment": alignment,
             }
         except Exception as error:
@@ -197,6 +278,16 @@ def main():
         item["video_trajectory_duration_ratio"]
         for item in results.values()
         if item["video_trajectory_duration_ratio"] is not None
+    ])
+    trajectory_frame_medians = np.asarray([
+        item["nearest_trajectory_frame_ns_median"]
+        for item in results.values()
+        if item["nearest_trajectory_frame_ns_median"] is not None
+    ])
+    bbox_frame_medians = np.asarray([
+        item["nearest_bbox_frame_ns_median"]
+        for item in results.values()
+        if item["nearest_bbox_frame_ns_median"] is not None
     ])
     report = {
         "schema_version": "adt_video_groundtruth_alignment_audit_v1",
@@ -233,6 +324,32 @@ def main():
                 else None
             ),
         },
+        "mp4_device_timestamp_alignment": {
+            "frame_count_match_scenes": sum(
+                item["frame_timestamp_count_matches_video"]
+                for item in results.values()
+            ),
+            "trajectory_nearest_frame_ns_scene_median": (
+                float(np.median(trajectory_frame_medians))
+                if len(trajectory_frame_medians)
+                else None
+            ),
+            "bbox_nearest_frame_ns_scene_median": (
+                float(np.median(bbox_frame_medians))
+                if len(bbox_frame_medians)
+                else None
+            ),
+            "all_trajectory_timestamps_inside_video_span_scenes": sum(
+                item["trajectory_timestamps_inside_video_span"]
+                == item["trajectory_timestamps"]
+                for item in results.values()
+            ),
+            "all_bbox_timestamps_inside_video_span_scenes": sum(
+                item["bbox_timestamps_inside_video_span"]
+                == item["bbox_timestamps"]
+                for item in results.values()
+            ),
+        },
         "errors": errors,
         "results": results,
     }
@@ -247,6 +364,7 @@ def main():
         "status",
         "nearest_bbox_trajectory_ns",
         "video_trajectory_duration_ratio",
+        "mp4_device_timestamp_alignment",
         "errors",
     )}, indent=2, ensure_ascii=False))
 
