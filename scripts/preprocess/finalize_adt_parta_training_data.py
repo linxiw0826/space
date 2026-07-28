@@ -31,6 +31,12 @@ def parse_args():
     parser.add_argument("--archive-output", required=True, type=Path)
     parser.add_argument("--candidate-frames", type=int, default=32)
     parser.add_argument("--knn", type=int, default=8)
+    parser.add_argument(
+        "--max-trajectory-error-ns", type=int, default=5_000_000
+    )
+    parser.add_argument(
+        "--max-calibration-error-ns", type=int, default=50_000_000
+    )
     parser.add_argument("--sequence-limit", type=int)
     return parser.parse_args()
 
@@ -105,16 +111,50 @@ def mp4_timestamps(path):
     return [int(value) for value in values]
 
 
-def select_candidate_indices(timestamps, low, high, count):
-    valid = [
-        index
-        for index, timestamp in enumerate(timestamps)
-        if low <= timestamp <= high
-    ]
+def select_candidate_indices(
+    timestamps,
+    trajectory_timestamps,
+    calibration_timestamps,
+    count,
+    max_trajectory_error_ns,
+    max_calibration_error_ns,
+):
+    valid = []
+    rejected = Counter()
+    for index, timestamp in enumerate(timestamps):
+        if not (
+            trajectory_timestamps[0]
+            <= timestamp
+            <= trajectory_timestamps[-1]
+        ):
+            rejected["outside_trajectory_span"] += 1
+            continue
+        trajectory_index = nearest_index(
+            trajectory_timestamps, timestamp
+        )
+        trajectory_error = abs(
+            trajectory_timestamps[trajectory_index] - timestamp
+        )
+        if trajectory_error > max_trajectory_error_ns:
+            rejected["trajectory_time_gap"] += 1
+            continue
+        calibration_index = nearest_index(
+            calibration_timestamps, timestamp
+        )
+        calibration_error = abs(
+            calibration_timestamps[calibration_index] - timestamp
+        )
+        if calibration_error > max_calibration_error_ns:
+            rejected["calibration_time_gap"] += 1
+            continue
+        valid.append(index)
     if not valid:
-        raise ValueError("No video frames overlap the ground-truth interval")
+        raise ValueError("No video frames pass temporal alignment thresholds")
     positions = np.linspace(0, len(valid) - 1, min(count, len(valid)))
-    return [valid[int(round(position))] for position in positions]
+    return (
+        [valid[int(round(position))] for position in positions],
+        rejected,
+    )
 
 
 def load_qa(path):
@@ -379,12 +419,18 @@ def main():
                     trajectory_timestamps = [
                         item["timestamp_ns"] for item in trajectory
                     ]
-                    candidate_indices = select_candidate_indices(
+                    (
+                        candidate_indices,
+                        temporal_rejections,
+                    ) = select_candidate_indices(
                         frame_timestamps,
-                        trajectory_timestamps[0],
-                        trajectory_timestamps[-1],
+                        trajectory_timestamps,
+                        calibration_timestamps,
                         args.candidate_frames,
+                        args.max_trajectory_error_ns,
+                        args.max_calibration_error_ns,
                     )
+                    stats.update(temporal_rejections)
                     candidate_timestamps = [
                         frame_timestamps[index] for index in candidate_indices
                     ]
@@ -603,6 +649,8 @@ def main():
             ),
             "rgb_stream_id": RGB_STREAM_ID,
             "out_of_video_gt_policy": "discard_without_extrapolation",
+            "max_trajectory_error_ns": args.max_trajectory_error_ns,
+            "max_calibration_error_ns": args.max_calibration_error_ns,
         },
         "files": [
             scene_path.name,

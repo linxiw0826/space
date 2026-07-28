@@ -18,6 +18,12 @@ def parse_args():
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--expected-scenes", type=int)
     parser.add_argument("--expected-candidate-frames", type=int, default=32)
+    parser.add_argument(
+        "--max-trajectory-error-ns", type=int, default=5_000_000
+    )
+    parser.add_argument(
+        "--max-calibration-error-ns", type=int, default=50_000_000
+    )
     return parser.parse_args()
 
 
@@ -91,8 +97,19 @@ def main():
         )
         if translation.shape != (3,) or not np.isfinite(translation).all():
             errors.append(f"invalid camera translation: {frame_key}")
-        trajectory_errors.append(row["trajectory_timestamp_error_ns"])
-        calibration_errors.append(row["calibration_timestamp_error_ns"])
+        trajectory_error = row["trajectory_timestamp_error_ns"]
+        calibration_error = row["calibration_timestamp_error_ns"]
+        trajectory_errors.append(trajectory_error)
+        calibration_errors.append(calibration_error)
+        if trajectory_error > args.max_trajectory_error_ns:
+            errors.append(
+                f"trajectory timestamp error: {frame_key}={trajectory_error}"
+            )
+        if calibration_error > args.max_calibration_error_ns:
+            errors.append(
+                f"calibration timestamp error: "
+                f"{frame_key}={calibration_error}"
+            )
         for visible in row["visible_nodes"]:
             stats["visible_node_observations"] += 1
             if visible["object_id"] not in known_nodes:
@@ -191,6 +208,10 @@ def main():
             "object_pose_median": percentile(object_pose_errors, 50),
             "object_pose_p99": percentile(object_pose_errors, 99),
             "object_pose_max": max(object_pose_errors, default=None),
+        },
+        "timestamp_thresholds_ns": {
+            "trajectory": args.max_trajectory_error_ns,
+            "calibration": args.max_calibration_error_ns,
         },
         "errors": errors[:1000],
         "error_count": len(errors),
