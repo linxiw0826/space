@@ -44,6 +44,34 @@ def nearest_differences(reference, query):
     )
 
 
+def timestamp_summary(values):
+    values = np.asarray(sorted(values), dtype=np.int64)
+    if not len(values):
+        return {
+            "count": 0,
+            "min_ns": None,
+            "max_ns": None,
+            "span_seconds": None,
+            "median_interval_ns": None,
+            "estimated_hz": None,
+        }
+    differences = np.diff(values)
+    positive = differences[differences > 0]
+    median_interval = (
+        float(np.median(positive)) if len(positive) else None
+    )
+    return {
+        "count": int(len(values)),
+        "min_ns": int(values[0]),
+        "max_ns": int(values[-1]),
+        "span_seconds": float((values[-1] - values[0]) / 1e9),
+        "median_interval_ns": median_interval,
+        "estimated_hz": (
+            float(1e9 / median_interval) if median_interval else None
+        ),
+    }
+
+
 def video_info(path):
     capture = cv2.VideoCapture(str(path))
     if not capture.isOpened():
@@ -55,6 +83,11 @@ def video_info(path):
         "height": int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)),
     }
     capture.release()
+    result["duration_seconds"] = (
+        result["frame_count"] / result["fps"]
+        if result["fps"] > 0
+        else None
+    )
     return result
 
 
@@ -98,6 +131,8 @@ def main():
             bbox_timestamps = {
                 int(row["timestamp[ns]"]) for row in boxes_2d
             }
+            trajectory_time = timestamp_summary(trajectory_timestamps)
+            bbox_time = timestamp_summary(bbox_timestamps)
             bbox_uids = {row["object_uid"] for row in boxes_2d}
             object_ids = set(objects)
             bbox3d_uids = {row["object_uid"] for row in boxes_3d}
@@ -122,6 +157,19 @@ def main():
                 **info,
                 "trajectory_timestamps": trajectory_count,
                 "bbox_timestamps": bbox_time_count,
+                "trajectory_time": trajectory_time,
+                "bbox_time": bbox_time,
+                "video_trajectory_duration_ratio": (
+                    info["duration_seconds"]
+                    / trajectory_time["span_seconds"]
+                    if trajectory_time["span_seconds"]
+                    else None
+                ),
+                "video_bbox_duration_ratio": (
+                    info["duration_seconds"] / bbox_time["span_seconds"]
+                    if bbox_time["span_seconds"]
+                    else None
+                ),
                 "instances": len(object_ids),
                 "bbox3d_uids": len(bbox3d_uids),
                 "object_pose_uids": len(pose_uids),
@@ -145,6 +193,11 @@ def main():
         print(f"[{index}/{len(sequences)}] {sequence}", flush=True)
 
     nearest_all = np.asarray(nearest_all, dtype=np.int64)
+    duration_ratios = np.asarray([
+        item["video_trajectory_duration_ratio"]
+        for item in results.values()
+        if item["video_trajectory_duration_ratio"] is not None
+    ])
     report = {
         "schema_version": "adt_video_groundtruth_alignment_audit_v1",
         "requested_sequences": len(sequences),
@@ -162,6 +215,24 @@ def main():
             ),
             "max": int(nearest_all.max()) if len(nearest_all) else None,
         },
+        "video_trajectory_duration_ratio": {
+            "count": int(len(duration_ratios)),
+            "median": (
+                float(np.median(duration_ratios))
+                if len(duration_ratios)
+                else None
+            ),
+            "p01": (
+                float(np.percentile(duration_ratios, 1))
+                if len(duration_ratios)
+                else None
+            ),
+            "p99": (
+                float(np.percentile(duration_ratios, 99))
+                if len(duration_ratios)
+                else None
+            ),
+        },
         "errors": errors,
         "results": results,
     }
@@ -175,6 +246,7 @@ def main():
         "audited_sequences",
         "status",
         "nearest_bbox_trajectory_ns",
+        "video_trajectory_duration_ratio",
         "errors",
     )}, indent=2, ensure_ascii=False))
 
