@@ -248,29 +248,80 @@ def _state_digest(state: dict[str, torch.Tensor]) -> str:
     return stable_sha256(records)
 
 
-def _validate_manifest_sampling(path: Path, expected_base_interval: float) -> dict[str, object]:
+def _validate_manifest_sampling(
+    path: Path, source: str, expected_base_interval: float
+) -> dict[str, object]:
+    if source not in {"adt", "hypersim"}:
+        raise ValueError(f"unsupported manifest source: {source}")
     rows = 0
     binding_hashes = []
     with path.open(encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, 1):
             row = json.loads(line)
-            actual = row.get("sampling_base_interval")
-            if actual is None:
-                actual = row.get("sampling_parameters", {}).get("base_interval")
-            if actual is None or float(actual) != expected_base_interval:
-                raise RuntimeError(
-                    f"manifest base_interval mismatch at {path}:{line_number}: {actual}"
-                )
+            location = f"{path}:{line_number}"
+            if row.get("source_dataset") != source:
+                raise RuntimeError(f"manifest source mismatch at {location}")
+            frame_indices = row.get("actual_frame_indices")
+            if source == "adt":
+                actual = row.get("sampling_base_interval")
+                if actual is None:
+                    actual = row.get("sampling_parameters", {}).get("base_interval")
+                if actual is None or float(actual) != expected_base_interval:
+                    raise RuntimeError(
+                        f"manifest base_interval mismatch at {location}: {actual}"
+                    )
+                if (
+                    row.get("media_kind") != "video"
+                    or not isinstance(frame_indices, list)
+                    or not 16 <= len(frame_indices) <= 32
+                ):
+                    raise RuntimeError(f"ADT exact video frame contract mismatch at {location}")
+            else:
+                top_level_interval = row.get("sampling_base_interval")
+                sampling_parameters = row.get("sampling_parameters")
+                if sampling_parameters is None:
+                    nested_interval = None
+                elif isinstance(sampling_parameters, dict):
+                    nested_interval = sampling_parameters.get("base_interval")
+                else:
+                    raise RuntimeError(
+                        f"Hypersim sampling_parameters contract mismatch at {location}"
+                    )
+                if top_level_interval is not None or nested_interval is not None:
+                    raise RuntimeError(
+                        f"Hypersim base_interval is inapplicable at {location}: "
+                        f"top_level={top_level_interval}, nested={nested_interval}"
+                    )
+                if (
+                    row.get("media_kind") != "image"
+                    or not isinstance(frame_indices, list)
+                    or len(frame_indices) != 1
+                ):
+                    raise RuntimeError(f"Hypersim single-frame contract mismatch at {location}")
+                evidence = row.get("evidence_frame_indices")
+                if (
+                    row.get("qa_evidence_scope") != "frame_verified"
+                    or row.get("qa_visual_support_verified") is not True
+                    or evidence != frame_indices
+                ):
+                    raise RuntimeError(
+                        f"Hypersim frame-verified evidence contract mismatch at {location}"
+                    )
             binding = row.get("frame_binding_sha256")
             if not isinstance(binding, str) or len(binding) != 64:
-                raise RuntimeError(f"manifest binding provenance missing at {path}:{line_number}")
+                raise RuntimeError(f"manifest binding provenance missing at {location}")
             binding_hashes.append(binding)
             rows += 1
     if rows == 0:
         raise RuntimeError(f"empty exact manifest: {path}")
     return {
         "path": str(path.resolve()), "rows": rows,
-        "base_interval": expected_base_interval,
+        "source_dataset": source,
+        "sampling_contract": (
+            "guide_video_base_interval_v1" if source == "adt"
+            else "single_frame_verified_v1"
+        ),
+        "base_interval": expected_base_interval if source == "adt" else None,
         "content_sha256": sha256_file(path),
         "ordered_binding_sha256": stable_sha256(binding_hashes),
     }
@@ -385,7 +436,7 @@ def main() -> None:
         atomic_json_dump(config, args.output / "resolved_config.json")
         manifest_provenance = {
             source: _validate_manifest_sampling(
-                root / "qa_manifest_exact_verified.jsonl", config["base_interval"]
+                root / "qa_manifest_exact_verified.jsonl", source, config["base_interval"]
             )
             for source, root in (("adt", args.adt_root), ("hypersim", args.hypersim_root))
         }

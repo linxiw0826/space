@@ -230,10 +230,17 @@ def test_successful_fake_cli_is_transactional_and_runs_real_gates(tmp_path, monk
     roots = {name: tmp_path / name for name in ("adt", "hypersim", "media", "model", "vggt")}
     for root in roots.values():
         root.mkdir()
-    for name in ("adt", "hypersim"):
-        (roots[name] / "qa_manifest_exact_verified.jsonl").write_text(json.dumps({
-            "sampling_base_interval": 1.0, "frame_binding_sha256": "a" * 64,
-        }) + "\n")
+    (roots["adt"] / "qa_manifest_exact_verified.jsonl").write_text(json.dumps({
+        "source_dataset": "adt", "media_kind": "video",
+        "actual_frame_indices": list(range(16)), "sampling_base_interval": 1.0,
+        "frame_binding_sha256": "a" * 64,
+    }) + "\n")
+    (roots["hypersim"] / "qa_manifest_exact_verified.jsonl").write_text(json.dumps({
+        "source_dataset": "hypersim", "media_kind": "image",
+        "actual_frame_indices": [7], "evidence_frame_indices": [7],
+        "qa_evidence_scope": "frame_verified", "qa_visual_support_verified": True,
+        "sampling_base_interval": None, "frame_binding_sha256": "a" * 64,
+    }) + "\n")
     (roots["model"] / "model.bin").write_bytes(b"fake-guide")
     (roots["model"] / "config.json").write_text('{"model":"guide"}\n')
     (roots["vggt"] / "vggt.bin").write_bytes(b"fake-vggt")
@@ -290,6 +297,8 @@ def test_successful_fake_cli_is_transactional_and_runs_real_gates(tmp_path, monk
     assert json.loads((output / "run_status.json").read_text())["status"] == "complete"
     assert resolved["seed"] == 42 and resolved["base_interval"] == 1.0
     assert provenance["manifest_provenance"]["adt"]["base_interval"] == 1.0
+    assert provenance["manifest_provenance"]["hypersim"]["base_interval"] is None
+    assert provenance["manifest_provenance"]["hypersim"]["sampling_contract"] == "single_frame_verified_v1"
     assert provenance["a1_checkpoint_artifact"]["ordered_shards"][0]["sha256"]
     for key in ("guide_checkpoint_artifact", "vggt_checkpoint_artifact"):
         assert provenance[key]["mode"] == "no_index_explicit_manifest"
@@ -382,3 +391,45 @@ def test_no_index_checkpoint_manifest_binds_config_and_rejects_unindexed_shards(
     (checkpoint / "second.safetensors").write_bytes(b"second")
     with pytest.raises(RuntimeError, match="sharded checkpoint requires an index JSON"):
         runner._checkpoint_artifact_provenance(checkpoint)
+
+
+def test_manifest_sampling_is_source_aware_and_fail_closed(tmp_path):
+    _, runner = load_runner_module()
+    path = tmp_path / "manifest.jsonl"
+
+    hypersim = {
+        "source_dataset": "hypersim", "media_kind": "image",
+        "actual_frame_indices": [38], "evidence_frame_indices": [38],
+        "qa_evidence_scope": "frame_verified", "qa_visual_support_verified": True,
+        "sampling_base_interval": None, "frame_binding_sha256": "b" * 64,
+    }
+    path.write_text(json.dumps(hypersim) + "\n")
+    result = runner._validate_manifest_sampling(path, "hypersim", 1.0)
+    assert result["base_interval"] is None
+    assert result["sampling_contract"] == "single_frame_verified_v1"
+
+    for field, value, match in (
+        ("actual_frame_indices", [38, 39], "single-frame"),
+        ("qa_evidence_scope", "scene_associated_unlocalized", "frame-verified evidence"),
+        ("qa_visual_support_verified", False, "frame-verified evidence"),
+        ("evidence_frame_indices", [39], "frame-verified evidence"),
+        ("sampling_base_interval", 1.0, "base_interval is inapplicable"),
+        ("sampling_parameters", {"base_interval": 1.0}, "base_interval is inapplicable"),
+    ):
+        attacked = dict(hypersim)
+        attacked[field] = value
+        path.write_text(json.dumps(attacked) + "\n")
+        with pytest.raises(RuntimeError, match=match):
+            runner._validate_manifest_sampling(path, "hypersim", 1.0)
+
+    adt = {
+        "source_dataset": "adt", "media_kind": "video",
+        "actual_frame_indices": list(range(16)), "sampling_base_interval": 1.0,
+        "frame_binding_sha256": "c" * 64,
+    }
+    path.write_text(json.dumps(adt) + "\n")
+    assert runner._validate_manifest_sampling(path, "adt", 1.0)["base_interval"] == 1.0
+    adt["sampling_base_interval"] = None
+    path.write_text(json.dumps(adt) + "\n")
+    with pytest.raises(RuntimeError, match="base_interval mismatch"):
+        runner._validate_manifest_sampling(path, "adt", 1.0)
