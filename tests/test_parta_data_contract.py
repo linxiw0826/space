@@ -1,4 +1,5 @@
 import copy
+import importlib.util
 import json
 import subprocess
 import sys
@@ -8,16 +9,30 @@ import pytest
 
 from src.parta_data_contract import (
     ContractError,
+    GUIDE_EXACT_SAMPLING_POLICY,
     T0_FIXTURES,
     adapt_frame,
     adapt_qa,
     adapt_scene,
     build_manifest_rows,
     canonical_category,
+    frame_binding_sha256,
     guide_frame_indices,
+    guide_sampling_binding_sha256,
     source_visibility_contract,
     validate_records,
 )
+
+PROJECT = Path(__file__).resolve().parents[1]
+FINALIZER_PATH = (
+    PROJECT / "scripts/preprocess/finalize_adt_parta_training_data.py"
+)
+FINALIZER_SPEC = importlib.util.spec_from_file_location(
+    "finalize_adt_parta_training_data", FINALIZER_PATH
+)
+FINALIZER = importlib.util.module_from_spec(FINALIZER_SPEC)
+assert FINALIZER_SPEC.loader is not None
+FINALIZER_SPEC.loader.exec_module(FINALIZER)
 
 
 def raw_records(scene_id="Apartment_release_clean_seq131_M1292"):
@@ -59,7 +74,26 @@ def raw_records(scene_id="Apartment_release_clean_seq131_M1292"):
         "question_type": "relative_direction_object",
         "conversations": [],
         "loss_masks": {"scene_geometry": True},
+        "sampling_policy": GUIDE_EXACT_SAMPLING_POLICY,
+        "total_frames": 16,
+        "fps": 1.0,
+        "base_interval": 1.0,
+        "min_frames": 16,
+        "max_frames": 32,
     }
+    qa["sampling_binding_sha256"] = guide_sampling_binding_sha256(
+        source_dataset="adt",
+        scene_id=scene_id,
+        vsi_media=qa["vsi_media"],
+        frame_keys=qa["candidate_frame_keys"],
+        frame_indices=qa["candidate_frame_indices"],
+        total_frames=qa["total_frames"],
+        fps=qa["fps"],
+        base_interval=qa["base_interval"],
+        min_frames=qa["min_frames"],
+        max_frames=qa["max_frames"],
+        sampling_policy=qa["sampling_policy"],
+    )
     return scene, frames, qa
 
 
@@ -71,6 +105,25 @@ def canonical():
     lookup = {("adt", row["frame_key"]): row for row in frames}
     manifest = list(build_manifest_rows([qa], lookup))
     return [scene], frames, manifest
+
+
+def rehash_canonical_qa(row):
+    row["source_sampling_binding_sha256"] = (
+        guide_sampling_binding_sha256(
+            source_dataset=row["source_dataset"],
+            scene_id=row["scene_id"],
+            vsi_media=row["vsi_media"],
+            frame_keys=row["actual_frame_keys"],
+            frame_indices=row["actual_frame_indices"],
+            total_frames=row["video_total_frames"],
+            fps=row["video_fps"],
+            base_interval=row["sampling_base_interval"],
+            min_frames=row["sampling_min_frames"],
+            max_frames=row["sampling_max_frames"],
+            sampling_policy=row["sampling_policy"],
+        )
+    )
+    row["frame_binding_sha256"] = frame_binding_sha256(row)
 
 
 def test_valid_contract_null_and_mask():
@@ -86,6 +139,7 @@ def test_valid_contract_null_and_mask():
 def test_reference_error_fails():
     scenes, frames, qa = canonical()
     qa[0]["actual_frame_keys"][0] = "missing"
+    rehash_canonical_qa(qa[0])
     with pytest.raises(ContractError, match="missing frame"):
         validate_records(scenes, frames, qa)
 
@@ -110,7 +164,8 @@ def test_bad_video_frame_count_fails():
     scenes, frames, qa = canonical()
     qa[0]["actual_frame_keys"] = qa[0]["actual_frame_keys"][:8]
     qa[0]["actual_frame_indices"] = qa[0]["actual_frame_indices"][:8]
-    with pytest.raises(ContractError, match="16-32"):
+    rehash_canonical_qa(qa[0])
+    with pytest.raises(ContractError, match="non-GUIDE raw frame IDs"):
         validate_records(scenes, frames, qa)
 
 
@@ -127,6 +182,95 @@ def test_sampling_is_deterministic_and_bounded():
     assert first == second
     assert len(first) == 30
     assert first[0] == 0 and first[-1] == 899
+
+
+def test_guide_exact_sampling_contract_examples():
+    assert guide_frame_indices(480, 30.0) == [
+        0, 31, 63, 95, 127, 159, 191, 223,
+        255, 287, 319, 351, 383, 415, 447, 479,
+    ]
+    assert len(guide_frame_indices(100, 30.0)) == 16
+    long = guide_frame_indices(3000, 30.0)
+    assert len(long) == 32
+    assert long[0] == 0 and long[-1] == 2999
+
+
+def test_exact_raw_ids_fail_without_substitution():
+    timestamps = list(range(0, 480_000_000, 1_000_000))
+    selected = guide_frame_indices(480, 30.0)
+    trajectory = list(timestamps)
+    calibration = list(timestamps)
+    trajectory.remove(timestamps[selected[5]])
+    with pytest.raises(ValueError, match=str(selected[5])):
+        FINALIZER.validate_exact_indices(
+            timestamps,
+            selected,
+            trajectory,
+            calibration,
+            max_trajectory_error_ns=100_000,
+            max_calibration_error_ns=100_000,
+        )
+    # The neighboring frame would pass but must never replace the selected ID.
+    assert selected[5] - 1 in range(len(timestamps))
+
+
+def test_exact_raw_ids_preserve_order_and_identity():
+    timestamps = list(range(0, 480_000_000, 1_000_000))
+    selected = guide_frame_indices(480, 30.0)
+    diagnostics = FINALIZER.validate_exact_indices(
+        timestamps,
+        selected,
+        timestamps,
+        timestamps,
+        max_trajectory_error_ns=5_000_000,
+        max_calibration_error_ns=50_000_000,
+    )
+    assert [row["frame_index"] for row in diagnostics] == selected
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("sampling_policy", None),
+        ("sampling_policy", "legacy_valid_frame_linspace_v1"),
+        ("sampling_policy", "unknown_policy"),
+        ("actual_frame_indices", list(range(1, 17))),
+        ("source_sampling_binding_sha256", "0" * 64),
+        ("video_total_frames", 17),
+        ("video_fps", 2.0),
+        ("sampling_base_interval", 2.0),
+        ("sampling_min_frames", 15),
+        ("sampling_max_frames", 31),
+    ],
+)
+def test_adt_sampling_contract_tampering_fails(field, value):
+    scenes, frames, qa = canonical()
+    qa[0][field] = value
+    with pytest.raises(
+        ContractError,
+        match="sampling_policy|sampling binding",
+    ):
+        validate_records(scenes, frames, qa)
+
+
+def test_tampered_final_frame_binding_fails():
+    scenes, frames, qa = canonical()
+    qa[0]["frame_binding_sha256"] = "f" * 64
+    with pytest.raises(ContractError, match="final frame binding SHA256"):
+        validate_records(scenes, frames, qa)
+
+
+def test_rehashed_non_guide_binding_still_fails():
+    scenes, frames, qa = canonical()
+    qa[0]["actual_frame_indices"][0:2] = reversed(
+        qa[0]["actual_frame_indices"][0:2]
+    )
+    qa[0]["actual_frame_keys"][0:2] = reversed(
+        qa[0]["actual_frame_keys"][0:2]
+    )
+    rehash_canonical_qa(qa[0])
+    with pytest.raises(ContractError, match="non-GUIDE raw frame IDs"):
+        validate_records(scenes, frames, qa)
 
 
 def test_mask_value_mismatch_fails():
@@ -149,7 +293,7 @@ def test_object_ids_are_namespaced_by_scene():
 
 def test_exact_key_index_mismatch_fails():
     scenes, frames, qa = canonical()
-    qa[0]["actual_frame_indices"][3] = 999
+    frames[3]["frame_index"] = 999
     with pytest.raises(ContractError, match="key/index mismatch"):
         validate_records(scenes, frames, qa)
 
@@ -314,6 +458,21 @@ def test_canonical_and_exact_manifest_cli_e2e(tmp_path):
         row["frame_key"] for row in raw_frames
     ]
     raw_qa["candidate_frame_indices"] = exact_indices
+    raw_qa["total_frames"] = 480
+    raw_qa["fps"] = 30.0
+    raw_qa["sampling_binding_sha256"] = guide_sampling_binding_sha256(
+        source_dataset="adt",
+        scene_id=raw_qa["scene_id"],
+        vsi_media=raw_qa["vsi_media"],
+        frame_keys=raw_qa["candidate_frame_keys"],
+        frame_indices=raw_qa["candidate_frame_indices"],
+        total_frames=raw_qa["total_frames"],
+        fps=raw_qa["fps"],
+        base_interval=raw_qa["base_interval"],
+        min_frames=raw_qa["min_frames"],
+        max_frames=raw_qa["max_frames"],
+        sampling_policy=raw_qa["sampling_policy"],
+    )
     source_dir = tmp_path / "source"
     canonical_dir = tmp_path / "canonical"
     source_dir.mkdir()
@@ -361,6 +520,95 @@ def test_canonical_and_exact_manifest_cli_e2e(tmp_path):
     assert row["actual_frame_indices"] == exact_indices
     assert len(row["frame_binding_sha256"]) == 64
     assert json.loads(report.read_text())["qa"] == 1
+
+    second_output = tmp_path / "exact_second.jsonl"
+    second_report = tmp_path / "exact_second_report.json"
+    subprocess.run(
+        [
+            sys.executable,
+            str(project / "scripts/preprocess/build_parta_exact_frame_manifest.py"),
+            "--scenes", str(canonical_dir / "scene_states.jsonl"),
+            "--frames", str(canonical_dir / "frame_states.jsonl"),
+            "--qa", str(output),
+            "--video-metadata", str(metadata),
+            "--output", str(second_output),
+            "--report-output", str(second_report),
+            "--expected-source", "adt",
+        ],
+        check=True,
+    )
+    assert second_output.read_bytes() == output.read_bytes()
+
+    for field, value, expected_errors in [
+        (
+            "video_total_frames",
+            481,
+            ("non-GUIDE raw frame IDs", "total-frame provenance mismatch"),
+        ),
+        (
+            "video_fps",
+            29.0,
+            ("non-GUIDE raw frame IDs", "FPS provenance mismatch"),
+        ),
+        ("sampling_base_interval", 2.0, ("base_interval mismatch",)),
+        ("sampling_min_frames", 15, ("min_frames mismatch",)),
+        ("sampling_max_frames", 31, ("max_frames mismatch",)),
+    ]:
+        tampered = copy.deepcopy(row)
+        tampered[field] = value
+        rehash_canonical_qa(tampered)
+        tampered_path = tmp_path / f"tampered_{field}.jsonl"
+        _write_jsonl(tampered_path, [tampered])
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(
+                    project
+                    / "scripts/preprocess/build_parta_exact_frame_manifest.py"
+                ),
+                "--scenes", str(canonical_dir / "scene_states.jsonl"),
+                "--frames", str(canonical_dir / "frame_states.jsonl"),
+                "--qa", str(tampered_path),
+                "--video-metadata", str(metadata),
+                "--output", str(tmp_path / f"out_{field}.jsonl"),
+                "--report-output", str(tmp_path / f"report_{field}.json"),
+                "--expected-source", "adt",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode != 0
+        assert any(error in result.stderr for error in expected_errors)
+
+    reordered = copy.deepcopy(row)
+    reordered["actual_frame_indices"][0:2] = reversed(
+        reordered["actual_frame_indices"][0:2]
+    )
+    reordered["actual_frame_keys"][0:2] = reversed(
+        reordered["actual_frame_keys"][0:2]
+    )
+    rehash_canonical_qa(reordered)
+    reordered_path = tmp_path / "tampered_reordered_ids.jsonl"
+    _write_jsonl(reordered_path, [reordered])
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(project / "scripts/preprocess/build_parta_exact_frame_manifest.py"),
+            "--scenes", str(canonical_dir / "scene_states.jsonl"),
+            "--frames", str(canonical_dir / "frame_states.jsonl"),
+            "--qa", str(reordered_path),
+            "--video-metadata", str(metadata),
+            "--output", str(tmp_path / "out_reordered.jsonl"),
+            "--report-output", str(tmp_path / "report_reordered.json"),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert (
+        "non-GUIDE raw frame IDs" in result.stderr
+        or "differ from recomputed GUIDE IDs" in result.stderr
+    )
 
 
 def test_exact_manifest_cli_missing_raw_frame_state_fails(tmp_path):

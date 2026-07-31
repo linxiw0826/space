@@ -8,6 +8,7 @@ import csv
 import io
 import json
 import subprocess
+import sys
 import tarfile
 import zipfile
 from bisect import bisect_left
@@ -16,8 +17,19 @@ from pathlib import Path
 
 import numpy as np
 
+PROJECT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT))
+
+from src.parta_data_contract import (
+    GUIDE_EXACT_SAMPLING_POLICY,
+    guide_frame_indices,
+    guide_sampling_binding_sha256,
+)
+
 
 RGB_STREAM_ID = "214-1"
+GUIDE_EXACT_POLICY = GUIDE_EXACT_SAMPLING_POLICY
+LEGACY_POLICY = "legacy_valid_frame_linspace_v1"
 
 
 def parse_args():
@@ -29,7 +41,19 @@ def parse_args():
     parser.add_argument("--video-root", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--archive-output", required=True, type=Path)
+    parser.add_argument(
+        "--sampling-policy",
+        choices=(GUIDE_EXACT_POLICY, LEGACY_POLICY),
+        default=GUIDE_EXACT_POLICY,
+        help=(
+            "Part A defaults to exact GUIDE raw MP4 frame IDs. The legacy "
+            "policy is retained only to reproduce old 32-candidate artifacts."
+        ),
+    )
     parser.add_argument("--candidate-frames", type=int, default=32)
+    parser.add_argument("--base-interval", type=float, default=1.0)
+    parser.add_argument("--min-frames", type=int, default=16)
+    parser.add_argument("--max-frames", type=int, default=32)
     parser.add_argument("--knn", type=int, default=8)
     parser.add_argument(
         "--max-trajectory-error-ns", type=int, default=5_000_000
@@ -111,6 +135,31 @@ def mp4_timestamps(path):
     return [int(value) for value in values]
 
 
+def mp4_video_metadata(path):
+    probe = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=nb_frames,avg_frame_rate",
+            "-of",
+            "json",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    stream = json.loads(probe.stdout)["streams"][0]
+    numerator, denominator = map(int, stream["avg_frame_rate"].split("/"))
+    if denominator == 0:
+        raise ValueError(f"Invalid MP4 frame rate: {path}")
+    return int(stream["nb_frames"]), numerator / denominator
+
+
 def select_candidate_indices(
     timestamps,
     trajectory_timestamps,
@@ -155,6 +204,74 @@ def select_candidate_indices(
         [valid[int(round(position))] for position in positions],
         rejected,
     )
+
+
+def validate_exact_indices(
+    frame_timestamps,
+    selected_indices,
+    trajectory_timestamps,
+    calibration_timestamps,
+    max_trajectory_error_ns,
+    max_calibration_error_ns,
+):
+    """Validate preselected raw IDs without replacing or resampling any ID."""
+    failures = []
+    diagnostics = []
+    for frame_index in selected_indices:
+        if frame_index < 0 or frame_index >= len(frame_timestamps):
+            failures.append({
+                "frame_index": frame_index,
+                "reason": "raw_frame_out_of_range",
+            })
+            continue
+        timestamp = frame_timestamps[frame_index]
+        if not (
+            trajectory_timestamps[0]
+            <= timestamp
+            <= trajectory_timestamps[-1]
+        ):
+            failures.append({
+                "frame_index": frame_index,
+                "device_timestamp_ns": timestamp,
+                "reason": "outside_trajectory_span",
+            })
+            continue
+        trajectory_index = nearest_index(trajectory_timestamps, timestamp)
+        calibration_index = nearest_index(calibration_timestamps, timestamp)
+        trajectory_error = abs(
+            trajectory_timestamps[trajectory_index] - timestamp
+        )
+        calibration_error = abs(
+            calibration_timestamps[calibration_index] - timestamp
+        )
+        reasons = []
+        if trajectory_error > max_trajectory_error_ns:
+            reasons.append("trajectory_time_gap")
+        if calibration_error > max_calibration_error_ns:
+            reasons.append("calibration_time_gap")
+        if reasons:
+            failures.append({
+                "frame_index": frame_index,
+                "device_timestamp_ns": timestamp,
+                "reason": "+".join(reasons),
+                "trajectory_timestamp_error_ns": trajectory_error,
+                "calibration_timestamp_error_ns": calibration_error,
+            })
+            continue
+        diagnostics.append({
+            "frame_index": frame_index,
+            "device_timestamp_ns": timestamp,
+            "trajectory_timestamp_error_ns": trajectory_error,
+            "calibration_timestamp_error_ns": calibration_error,
+        })
+    if failures:
+        raise ValueError(
+            "Exact GUIDE raw frames failed temporal alignment; "
+            f"failures={json.dumps(failures, ensure_ascii=False)}"
+        )
+    if [item["frame_index"] for item in diagnostics] != list(selected_indices):
+        raise AssertionError("Exact raw frame validation changed selected IDs")
+    return diagnostics
 
 
 def load_qa(path):
@@ -394,6 +511,10 @@ def main():
     ):
         for sequence_index, sequence in enumerate(sequences, 1):
             try:
+                sequence_stats = Counter()
+                scene_buffer = io.StringIO()
+                frame_buffer = io.StringIO()
+                qa_buffer = io.StringIO()
                 video_path = (
                     args.video_root / f"ADT_{sequence}_preview_rgb.mp4"
                 )
@@ -410,6 +531,13 @@ def main():
                 if len(calibration_files) != 1:
                     raise ValueError("Expected one calibration ZIP")
                 frame_timestamps = mp4_timestamps(video_path)
+                total_frames, fps = mp4_video_metadata(video_path)
+                if len(frame_timestamps) != total_frames:
+                    raise ValueError(
+                        "MP4 device timestamp count does not match raw frame "
+                        f"count: timestamps={len(frame_timestamps)}, "
+                        f"frames={total_frames}"
+                    )
                 calibrations = load_calibrations(calibration_files[0])
                 calibration_timestamps = [
                     item["timestamp_ns"] for item in calibrations
@@ -419,18 +547,35 @@ def main():
                     trajectory_timestamps = [
                         item["timestamp_ns"] for item in trajectory
                     ]
-                    (
-                        candidate_indices,
-                        temporal_rejections,
-                    ) = select_candidate_indices(
-                        frame_timestamps,
-                        trajectory_timestamps,
-                        calibration_timestamps,
-                        args.candidate_frames,
-                        args.max_trajectory_error_ns,
-                        args.max_calibration_error_ns,
-                    )
-                    stats.update(temporal_rejections)
+                    if args.sampling_policy == GUIDE_EXACT_POLICY:
+                        candidate_indices = guide_frame_indices(
+                            total_frames,
+                            fps,
+                            base_interval=args.base_interval,
+                            min_frames=args.min_frames,
+                            max_frames=args.max_frames,
+                        )
+                        validate_exact_indices(
+                            frame_timestamps,
+                            candidate_indices,
+                            trajectory_timestamps,
+                            calibration_timestamps,
+                            args.max_trajectory_error_ns,
+                            args.max_calibration_error_ns,
+                        )
+                    else:
+                        (
+                            candidate_indices,
+                            temporal_rejections,
+                        ) = select_candidate_indices(
+                            frame_timestamps,
+                            trajectory_timestamps,
+                            calibration_timestamps,
+                            args.candidate_frames,
+                            args.max_trajectory_error_ns,
+                            args.max_calibration_error_ns,
+                        )
+                        sequence_stats.update(temporal_rejections)
                     candidate_timestamps = [
                         frame_timestamps[index] for index in candidate_indices
                     ]
@@ -453,7 +598,7 @@ def main():
                         reference_pose,
                     ))
                 node_ids = {node["object_id"] for node in nodes}
-                scene_out.write(json.dumps({
+                scene_buffer.write(json.dumps({
                     "schema_version": "adt_scene_state_v1",
                     "scene_id": sequence,
                     "vsi_media": (
@@ -465,12 +610,33 @@ def main():
                     "supervision_tier": "gold",
                     "identity_source": "adt_object_uid_direct_join",
                 }, ensure_ascii=False) + "\n")
-                stats["scenes"] += 1
-                stats["nodes"] += len(nodes)
-                stats["dynamic_nodes"] += sum(
+                sequence_stats["scenes"] += 1
+                sequence_stats["nodes"] += len(nodes)
+                sequence_stats["dynamic_nodes"] += sum(
                     node["motion_type"] != "static" for node in nodes
                 )
                 frame_keys = []
+                sampling_provenance = {
+                    "sampling_policy": args.sampling_policy,
+                    "total_frames": total_frames,
+                    "fps": fps,
+                    "base_interval": (
+                        args.base_interval
+                        if args.sampling_policy == GUIDE_EXACT_POLICY
+                        else None
+                    ),
+                    "min_frames": (
+                        args.min_frames
+                        if args.sampling_policy == GUIDE_EXACT_POLICY
+                        else None
+                    ),
+                    "max_frames": (
+                        args.max_frames
+                        if args.sampling_policy == GUIDE_EXACT_POLICY
+                        else None
+                    ),
+                    "raw_frame_indices": candidate_indices,
+                }
 
                 for candidate_rank, (frame_index, timestamp) in enumerate(
                     zip(candidate_indices, candidate_timestamps)
@@ -508,7 +674,7 @@ def main():
                     for visible in rgb_boxes.get(timestamp, []):
                         object_id = visible["object_id"]
                         if object_id not in node_ids:
-                            stats["visible_unknown_node"] += 1
+                            sequence_stats["visible_unknown_node"] += 1
                             continue
                         pose, pose_error = object_pose_at(
                             poses[object_id], timestamp
@@ -537,7 +703,7 @@ def main():
                         })
                     frame_key = f"{sequence}/{frame_index:06d}"
                     frame_keys.append(frame_key)
-                    frame_out.write(json.dumps({
+                    frame_buffer.write(json.dumps({
                         "schema_version": "adt_frame_state_v1",
                         "frame_key": frame_key,
                         "scene_id": sequence,
@@ -585,11 +751,32 @@ def main():
                         "visible_nodes": visible_nodes,
                         "supervision_tier": "gold",
                     }, ensure_ascii=False) + "\n")
-                    stats["frames"] += 1
-                    stats["visible_node_observations"] += len(visible_nodes)
+                    sequence_stats["frames"] += 1
+                    sequence_stats["visible_node_observations"] += len(
+                        visible_nodes
+                    )
 
+                sampling_provenance["sampling_binding_sha256"] = (
+                    guide_sampling_binding_sha256(
+                        source_dataset="adt",
+                        scene_id=sequence,
+                        vsi_media=(
+                            f"adt/ADT_{sequence}_preview_rgb.mp4"
+                        ),
+                        frame_keys=frame_keys,
+                        frame_indices=candidate_indices,
+                        total_frames=total_frames,
+                        fps=fps,
+                        base_interval=args.base_interval,
+                        min_frames=args.min_frames,
+                        max_frames=args.max_frames,
+                        sampling_policy=args.sampling_policy,
+                    )
+                    if args.sampling_policy == GUIDE_EXACT_POLICY
+                    else None
+                )
                 for qa in qa_by_scene.get(sequence, []):
-                    qa_out.write(json.dumps({
+                    qa_buffer.write(json.dumps({
                         "schema_version": "adt_qa_train_v1",
                         "vsi_row_index": qa["vsi_row_index"],
                         "scene_id": sequence,
@@ -608,10 +795,15 @@ def main():
                                 for node in nodes
                             ),
                         },
+                        **sampling_provenance,
                     }, ensure_ascii=False) + "\n")
-                    stats["qa_rows"] += 1
+                    sequence_stats["qa_rows"] += 1
                 if sequence not in qa_by_scene:
-                    stats["scenes_without_qa"] += 1
+                    sequence_stats["scenes_without_qa"] += 1
+                scene_out.write(scene_buffer.getvalue())
+                frame_out.write(frame_buffer.getvalue())
+                qa_out.write(qa_buffer.getvalue())
+                stats.update(sequence_stats)
             except Exception as error:
                 stats["scene_errors"] += 1
                 errors.append({
@@ -627,6 +819,7 @@ def main():
         "schema_version": "adt_alignment_report_v1",
         **dict(stats),
         "requested_sequences": len(sequences),
+        "completed_sequences": stats["scenes"],
         "adt_qa_rows_in_source": sum(
             len(rows) for rows in qa_by_scene.values()
         ),
@@ -643,10 +836,15 @@ def main():
             "timestamps": "device_time_nanoseconds",
         },
         "selection": {
-            "candidate_frames_per_scene": args.candidate_frames,
-            "policy": (
-                "uniform over MP4 frames inside the GT trajectory span"
+            "policy": args.sampling_policy,
+            "candidate_frames_per_scene": (
+                args.candidate_frames
+                if args.sampling_policy == LEGACY_POLICY
+                else None
             ),
+            "base_interval": args.base_interval,
+            "min_frames": args.min_frames,
+            "max_frames": args.max_frames,
             "rgb_stream_id": RGB_STREAM_ID,
             "out_of_video_gt_policy": "discard_without_extrapolation",
             "max_trajectory_error_ns": args.max_trajectory_error_ns,
@@ -662,11 +860,16 @@ def main():
         json.dumps(report, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+    if args.sampling_policy == GUIDE_EXACT_POLICY and errors:
+        raise SystemExit(
+            f"{len(errors)} scenes failed exact raw-frame alignment; "
+            f"no archive was created; see {report_path}"
+        )
     args.archive_output.parent.mkdir(parents=True, exist_ok=True)
     with tarfile.open(args.archive_output, "w:gz") as archive:
         for path in (scene_path, frame_path, qa_path, report_path):
             archive.add(path, arcname=path.name)
-    print(json.dumps(report, indent=2, ensure_ascii=False))
     print(f"Archive: {args.archive_output}")
 
 

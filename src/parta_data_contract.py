@@ -18,6 +18,7 @@ import numpy as np
 
 
 SCHEMA_VERSION = "parta_canonical_v1"
+GUIDE_EXACT_SAMPLING_POLICY = "guide_exact_raw_mp4_v1"
 T0_FIXTURES = {
     "adt": (
         "Apartment_release_clean_seq131_M1292",
@@ -147,6 +148,129 @@ def guide_frame_indices(
             f"total={total_frames}, sampled={len(indices)}"
         )
     return [int(index) for index in indices]
+
+
+def guide_sampling_payload(
+    *,
+    source_dataset: str,
+    scene_id: str,
+    vsi_media: str,
+    frame_keys: Sequence[str],
+    frame_indices: Sequence[int],
+    total_frames: int,
+    fps: float,
+    base_interval: float,
+    min_frames: int,
+    max_frames: int,
+    sampling_policy: str,
+) -> dict[str, Any]:
+    """Return the unique stable payload for exact GUIDE frame binding.
+
+    Floats use their exact IEEE-754 hexadecimal representation so every
+    producer and consumer hashes one unambiguous value.
+    """
+    fps = float(fps)
+    base_interval = float(base_interval)
+    if not math.isfinite(fps) or not math.isfinite(base_interval):
+        raise ContractError("Sampling FPS/base interval must be finite")
+    return {
+        "source_dataset": str(source_dataset),
+        "scene_id": str(scene_id),
+        "vsi_media": str(vsi_media),
+        "sampling_policy": str(sampling_policy),
+        "frame_keys": [str(value) for value in frame_keys],
+        "frame_indices": [int(value) for value in frame_indices],
+        "total_frames": int(total_frames),
+        "fps_hex": fps.hex(),
+        "base_interval_hex": base_interval.hex(),
+        "min_frames": int(min_frames),
+        "max_frames": int(max_frames),
+    }
+
+
+def guide_sampling_binding_sha256(**kwargs: Any) -> str:
+    return content_sha256(guide_sampling_payload(**kwargs))
+
+
+def frame_binding_payload(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "source_dataset": row["source_dataset"],
+        "scene_id": row["scene_id"],
+        "vsi_media": row["vsi_media"],
+        "frame_keys": list(row["actual_frame_keys"]),
+        "frame_indices": [int(value) for value in row["actual_frame_indices"]],
+    }
+
+
+def frame_binding_sha256(row: Mapping[str, Any]) -> str:
+    return content_sha256(frame_binding_payload(row))
+
+
+def validate_guide_sampling_binding(row: Mapping[str, Any]) -> None:
+    """Fail closed unless a QA row carries a valid exact GUIDE binding."""
+    policy = row.get("sampling_policy")
+    if policy != GUIDE_EXACT_SAMPLING_POLICY:
+        raise ContractError(
+            "ADT sampling_policy must be exactly "
+            f"{GUIDE_EXACT_SAMPLING_POLICY}, got {policy!r}"
+        )
+    field_map = {
+        "frame_keys": row.get(
+            "actual_frame_keys", row.get("candidate_frame_keys")
+        ),
+        "frame_indices": row.get(
+            "actual_frame_indices", row.get("candidate_frame_indices")
+        ),
+        "total_frames": row.get(
+            "video_total_frames", row.get("total_frames")
+        ),
+        "fps": row.get("video_fps", row.get("fps")),
+        "base_interval": row.get(
+            "sampling_base_interval", row.get("base_interval")
+        ),
+        "min_frames": row.get(
+            "sampling_min_frames", row.get("min_frames")
+        ),
+        "max_frames": row.get(
+            "sampling_max_frames", row.get("max_frames")
+        ),
+    }
+    missing = [key for key, value in field_map.items() if value is None]
+    if missing:
+        raise ContractError(f"Missing GUIDE sampling fields: {missing}")
+    expected = guide_sampling_binding_sha256(
+        source_dataset=row.get("source_dataset", "adt"),
+        scene_id=row["scene_id"],
+        vsi_media=row["vsi_media"],
+        sampling_policy=policy,
+        **field_map,
+    )
+    actual = row.get(
+        "source_sampling_binding_sha256",
+        row.get("sampling_binding_sha256"),
+    )
+    if actual != expected:
+        raise ContractError(
+            "Invalid GUIDE source sampling binding SHA256: "
+            f"expected={expected}, actual={actual}"
+        )
+    recomputed_indices = guide_frame_indices(
+        int(field_map["total_frames"]),
+        float(field_map["fps"]),
+        base_interval=float(field_map["base_interval"]),
+        min_frames=int(field_map["min_frames"]),
+        max_frames=int(field_map["max_frames"]),
+    )
+    if list(field_map["frame_indices"]) != recomputed_indices:
+        raise ContractError(
+            "Source sampling binding contains non-GUIDE raw frame IDs: "
+            f"source={list(field_map['frame_indices'])}, "
+            f"guide={recomputed_indices}"
+        )
+    if len(field_map["frame_keys"]) != len(recomputed_indices):
+        raise ContractError(
+            "Source sampling frame key/index lengths differ"
+        )
 
 
 def _source_object_id(source: str, scene_id: str, object_id: Any) -> str:
@@ -370,6 +494,7 @@ def adapt_frame(source: str, raw: Mapping[str, Any]) -> dict[str, Any]:
 
 def adapt_qa(source: str, raw: Mapping[str, Any]) -> dict[str, Any]:
     if source == "adt":
+        validate_guide_sampling_binding(raw)
         keys = list(raw["candidate_frame_keys"])
         indices = [int(value) for value in raw["candidate_frame_indices"]]
         media_kind = "video"
@@ -377,7 +502,7 @@ def adapt_qa(source: str, raw: Mapping[str, Any]) -> dict[str, Any]:
         keys = [raw["frame_key"]]
         indices = [int(raw.get("frame_index", 0))]
         media_kind = "image"
-    return {
+    row = {
         "schema_version": SCHEMA_VERSION,
         "record_type": "qa",
         "source_dataset": source,
@@ -402,6 +527,20 @@ def adapt_qa(source: str, raw: Mapping[str, Any]) -> dict[str, Any]:
         },
         "source_schema_version": raw.get("schema_version"),
     }
+    if source == "adt":
+        row.update({
+            "sampling_policy": raw.get("sampling_policy"),
+            "video_total_frames": raw.get("total_frames"),
+            "video_fps": raw.get("fps"),
+            "sampling_base_interval": raw.get("base_interval"),
+            "sampling_min_frames": raw.get("min_frames"),
+            "sampling_max_frames": raw.get("max_frames"),
+            "source_sampling_binding_sha256": raw.get(
+                "sampling_binding_sha256"
+            ),
+        })
+        validate_guide_sampling_binding(row)
+    return row
 
 
 @dataclass
@@ -530,10 +669,20 @@ def validate_records(
         scene_key = (qa["source_dataset"], qa["scene_id"])
         if scene_key not in scene_map:
             raise ContractError(f"QA references missing scene {scene_key}")
+        if qa["source_dataset"] == "adt":
+            validate_guide_sampling_binding(qa)
         keys = list(qa["actual_frame_keys"])
         indices = list(qa["actual_frame_indices"])
         if len(keys) != len(indices) or len(set(indices)) != len(indices):
             raise ContractError(f"Invalid exact frame binding {qa['qa_id']}")
+        declared_frame_binding = qa.get("frame_binding_sha256")
+        expected_frame_binding = frame_binding_sha256(qa)
+        if declared_frame_binding != expected_frame_binding:
+            raise ContractError(
+                "Invalid final frame binding SHA256 "
+                f"for {qa['qa_id']}: expected={expected_frame_binding}, "
+                f"actual={declared_frame_binding}"
+            )
         if qa["media_kind"] == "video" and not 16 <= len(keys) <= 32:
             raise ContractError(f"Video QA must bind 16-32 frames: {qa['qa_id']}")
         if qa["media_kind"] == "image" and len(keys) != 1:
@@ -647,13 +796,5 @@ def build_manifest_rows(
         row = dict(qa)
         row["actual_visible_object_ids"] = visible_ids
         row["empty_gt"] = not visible_ids
-        row["frame_binding_sha256"] = content_sha256(
-            {
-                "source_dataset": qa["source_dataset"],
-                "scene_id": qa["scene_id"],
-                "vsi_media": qa["vsi_media"],
-                "frame_keys": qa["actual_frame_keys"],
-                "frame_indices": qa["actual_frame_indices"],
-            }
-        )
+        row["frame_binding_sha256"] = frame_binding_sha256(row)
         yield row
