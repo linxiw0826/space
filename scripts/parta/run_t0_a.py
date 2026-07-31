@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import traceback
@@ -51,6 +52,32 @@ from parta.training import attach_a1o_state_head, run_a1o_side_branch  # noqa: E
 from parta_data_contract import CANONICAL_CATEGORIES  # noqa: E402
 from qwenvl.model.modeling_qwen3_vl import Qwen3VLForConditionalGeneration  # noqa: E402
 from qwenvl.model.processing_qwen3_vl import Qwen3VLProcessor  # noqa: E402
+from qwenvl.model.geometry_encoders.vggt_encoder import VGGTEncoder  # noqa: E402
+
+GUIDE_MIN_PIXELS = 8192
+GUIDE_MAX_PIXELS = 268324
+
+
+def _geometry_encoder_contract(config) -> dict[str, str]:
+    explicit = getattr(config, "geometry_encoder_type", None)
+    if explicit is None:
+        return {
+            "geometry_encoder_type_effective": "vggt",
+            "geometry_encoder_type_source": "model_default_missing_legacy_field",
+        }
+    if str(explicit).lower() != "vggt":
+        raise RuntimeError(f"Part A requires VGGT geometry encoder, got {explicit!r}")
+    return {
+        "geometry_encoder_type_effective": "vggt",
+        "geometry_encoder_type_source": "config_explicit",
+    }
+
+
+def _geometry_encoder_module(model):
+    encoder = getattr(model, "geometry_encoder", None)
+    if encoder is None and getattr(model, "model", None) is not None:
+        encoder = getattr(model.model, "geometry_encoder", None)
+    return encoder
 
 
 def parse_args() -> argparse.Namespace:
@@ -78,6 +105,7 @@ def _load_local(model_path: Path, vggt_path: Path, dtype: torch.dtype, device: s
     if not resolved_vggt.is_dir():
         raise FileNotFoundError(f"local VGGT checkpoint directory required: {resolved_vggt}")
     config = AutoConfig.from_pretrained(resolved, local_files_only=True)
+    geometry_contract = _geometry_encoder_contract(config)
     required = {
         "use_geometry_encoder": True,
         "use_feature_fusion_module": True,
@@ -88,7 +116,6 @@ def _load_local(model_path: Path, vggt_path: Path, dtype: torch.dtype, device: s
         ],
         "use_deepstack_importance_gate": "all",
         "use_deepstack_global_gate": "all",
-        "geometry_encoder_type": "vggt",
     }
     wrong = {
         name: getattr(config, name, None)
@@ -102,6 +129,17 @@ def _load_local(model_path: Path, vggt_path: Path, dtype: torch.dtype, device: s
     if not getattr(config, "geometry_deepstack_indexes_pro", None):
         raise RuntimeError("GUIDE checkpoint lacks geometry_deepstack_indexes_pro")
     processor = Qwen3VLProcessor.from_pretrained(resolved, local_files_only=True)
+    image_processor = processor.image_processor
+    pixel_sources = {}
+    for name, expected in (("min_pixels", GUIDE_MIN_PIXELS), ("max_pixels", GUIDE_MAX_PIXELS)):
+        actual = getattr(image_processor, name, None)
+        if actual is None:
+            setattr(image_processor, name, expected)
+            pixel_sources[name] = "runner_frozen_missing_artifact_field"
+        elif int(actual) != expected:
+            raise RuntimeError(f"GUIDE processor {name} mismatch: {actual} != {expected}")
+        else:
+            pixel_sources[name] = "processor_artifact_explicit"
     model = Qwen3VLForConditionalGeneration.from_pretrained(
         resolved,
         config=config,
@@ -114,8 +152,69 @@ def _load_local(model_path: Path, vggt_path: Path, dtype: torch.dtype, device: s
         raise RuntimeError(f"unexpected model class module: {model.__class__.__module__}")
     if getattr(model.config, "_attn_implementation", None) != "flash_attention_2":
         raise RuntimeError("T0-A requires GUIDE's flash_attention_2 implementation")
+    if not isinstance(_geometry_encoder_module(model), VGGTEncoder):
+        raise RuntimeError("loaded GUIDE geometry encoder is not VGGTEncoder")
     model.to(torch.device(device))
-    return processor, model
+    return processor, model, {
+        **geometry_contract,
+        "processor_min_pixels": GUIDE_MIN_PIXELS,
+        "processor_max_pixels": GUIDE_MAX_PIXELS,
+        "processor_pixel_field_sources": pixel_sources,
+    }
+
+
+def _startup_resource_preflight(
+    output_parent: Path,
+    guide_artifact: dict[str, object],
+    vggt_artifact: dict[str, object],
+    device: str,
+) -> dict[str, object]:
+    weight_bytes = sum(
+        int(item["size_bytes"])
+        for artifact in (guide_artifact, vggt_artifact)
+        for item in artifact["ordered_shards"]
+    )
+    required_disk = weight_bytes + max(weight_bytes // 20, 512 * 1024**2)
+    disk_free = shutil.disk_usage(output_parent).free
+    failures = []
+    if disk_free < required_disk:
+        failures.append(
+            f"insufficient disk: free={disk_free}, required={required_disk}"
+        )
+    if not device.startswith("cuda") or not torch.cuda.is_available():
+        failures.append("T0-A requires an available CUDA device")
+        index, capability, free_cuda, total_cuda = None, None, None, None
+    else:
+        cuda_device = torch.device(device)
+        index = cuda_device.index if cuda_device.index is not None else torch.cuda.current_device()
+        if index >= torch.cuda.device_count():
+            failures.append(f"CUDA device index out of range: {index}")
+            capability, free_cuda, total_cuda = None, None, None
+        else:
+            capability = torch.cuda.get_device_capability(index)
+            free_cuda, total_cuda = torch.cuda.mem_get_info(index)
+            if capability[0] < 8:
+                failures.append(f"CUDA capability {capability} is below required major 8")
+            if free_cuda <= 0:
+                failures.append("selected CUDA device reports no free memory")
+    try:
+        import flash_attn
+        flash_version = getattr(flash_attn, "__version__", "unknown")
+    except Exception as error:
+        flash_version = None
+        failures.append(f"FlashAttention2 import failed: {error}")
+    return {
+        "passed": not failures,
+        "failures": failures,
+        "estimated_smoke_checkpoint_bytes": weight_bytes,
+        "required_transaction_disk_bytes": required_disk,
+        "disk_free_bytes": disk_free,
+        "cuda_device_index": index,
+        "cuda_capability": list(capability) if capability is not None else None,
+        "cuda_memory_free_bytes": free_cuda,
+        "cuda_memory_total_bytes": total_cuda,
+        "flash_attn_version": flash_version,
+    }
 
 
 def _checkpoint_state(path: Path) -> dict[str, torch.Tensor]:
@@ -207,8 +306,8 @@ def _checkpoint_artifact_provenance(path: Path) -> dict[str, object]:
     weight_map = index.get("weight_map")
     if not isinstance(weight_map, dict) or not weight_map:
         raise RuntimeError("A1 checkpoint index has no nonempty weight_map")
-    if list(weight_map) != sorted(weight_map):
-        raise RuntimeError("A1 checkpoint index weight_map keys must be ordered")
+    if not all(isinstance(key, str) and key for key in weight_map):
+        raise RuntimeError("A1 checkpoint index contains invalid parameter keys")
     ordered_names = list(dict.fromkeys(weight_map.values()))
     if not all(isinstance(name, str) and Path(name).name == name for name in ordered_names):
         raise RuntimeError("A1 checkpoint index contains unsafe shard names")
@@ -226,7 +325,7 @@ def _checkpoint_artifact_provenance(path: Path) -> dict[str, object]:
         "name": index_path.name,
         "size_bytes": index_path.stat().st_size,
         "sha256": sha256_file(index_path),
-        "ordered_weight_map_sha256": stable_sha256(list(weight_map.items())),
+        "ordered_weight_map_sha256": stable_sha256(sorted(weight_map.items())),
     }
     return {
         "mode": "indexed_weight_map", "index": index_record,
@@ -339,6 +438,77 @@ def _tensor_diagnostic(tensor: torch.Tensor) -> dict[str, object]:
     }
 
 
+def _context_preflight(processed, model) -> dict[str, object]:
+    sequence_length = int(processed.model_kwargs["input_ids"].shape[1])
+    visual_tokens = sum(processed.frame_token_counts)
+    text_config = getattr(model.config, "text_config", model.config)
+    context_limit = getattr(text_config, "max_position_embeddings", None)
+    if context_limit is None:
+        context_limit = getattr(model.config, "max_position_embeddings", None)
+    if not isinstance(context_limit, int) or context_limit <= 0:
+        raise RuntimeError("model does not expose a positive context limit")
+    if sequence_length > context_limit:
+        raise RuntimeError(
+            f"processed sequence exceeds model context: {sequence_length} > {context_limit}"
+        )
+    return {
+        "frame_visual_tokens": list(processed.frame_token_counts),
+        "total_visual_tokens": visual_tokens,
+        "sequence_length": sequence_length,
+        "context_limit": context_limit,
+    }
+
+
+def _e01_trainability_audit(model) -> dict[str, object]:
+    frozen_vggt = [
+        (name, parameter)
+        for name, parameter in model.named_parameters()
+        if "geometry_encoder.vggt." in name
+    ]
+    if not frozen_vggt:
+        raise RuntimeError("loaded GUIDE exposes no VGGT backbone parameters")
+    frozen_violations = [
+        name for name, parameter in frozen_vggt
+        if parameter.requires_grad or parameter.grad is not None
+    ]
+    group_markers = {
+        "guide_geometry_adapters": (
+            "geometry_merger.", "deepstack_geo_merger_list.",
+            "deepstack_geo_pro_merger_list.", "feature_fusion_module.",
+            "deepstack_importance_gates.", "deepstack_global_gates.",
+        ),
+        "llm": ("language_model.",),
+    }
+    norms = {}
+    matched_names = {}
+    for group, markers in group_markers.items():
+        squared = 0.0
+        names = []
+        for name, parameter in model.named_parameters():
+            if (
+                parameter.requires_grad
+                and parameter.grad is not None
+                and any(marker in name for marker in markers)
+                and "parta_state_head" not in name
+            ):
+                squared += float(parameter.grad.detach().float().square().sum().cpu())
+                names.append(name)
+        norms[group] = squared**0.5
+        matched_names[group] = names
+    passed = (
+        not frozen_violations
+        and all(names for names in matched_names.values())
+        and all(np.isfinite(value) and value > 1e-12 for value in norms.values())
+    )
+    return {
+        "passed": passed,
+        "frozen_vggt_parameter_count": len(frozen_vggt),
+        "frozen_vggt_violations": frozen_violations,
+        "trainable_gradient_norms": norms,
+        "trainable_gradient_parameter_names": matched_names,
+    }
+
+
 def _move(value, device):
     if isinstance(value, torch.Tensor):
         return value.to(device)
@@ -433,7 +603,17 @@ def main() -> None:
             "state_backward_steps": 5,
             "formal_training": False,
         }
+        guide_artifact = _checkpoint_artifact_provenance(args.model_path)
+        vggt_artifact = _checkpoint_artifact_provenance(args.vggt_path)
+        resource_preflight = _startup_resource_preflight(
+            final_output.parent, guide_artifact, vggt_artifact, args.device
+        )
+        config["resource_preflight"] = resource_preflight
         atomic_json_dump(config, args.output / "resolved_config.json")
+        if not resource_preflight.get("passed", True):
+            raise RuntimeError(
+                f"startup resource preflight failed: {resource_preflight['failures']}"
+            )
         manifest_provenance = {
             source: _validate_manifest_sampling(
                 root / "qa_manifest_exact_verified.jsonl", source, config["base_interval"]
@@ -445,7 +625,11 @@ def main() -> None:
         )
         samples = _select_fixtures(dataset)
         loader = ExactMediaLoader(args.media_root)
-        processor, model = _load_local(args.model_path, args.vggt_path, dtype, args.device)
+        processor, model, runtime_contract = _load_local(
+            args.model_path, args.vggt_path, dtype, args.device
+        )
+        config.update(runtime_contract)
+        atomic_json_dump(config, args.output / "resolved_config.json")
         model.eval()
         device = torch.device(args.device)
         collator = PartAT0Collator(processor)
@@ -463,8 +647,6 @@ def main() -> None:
         git_revision = subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=PROJECT, text=True
         ).strip()
-        guide_artifact = _checkpoint_artifact_provenance(args.model_path)
-        vggt_artifact = _checkpoint_artifact_provenance(args.vggt_path)
         manifest_digest = stable_sha256(manifest_provenance)
         exact_binding_digest = stable_sha256([
             {"qa_id": sample.qa["qa_id"], "sha256": sample.qa["frame_binding_sha256"]}
@@ -511,6 +693,7 @@ def main() -> None:
                 visual_token_mask=processed.visual_token_mask.to(device),
                 question_token_span=processed.question_token_span,
             )
+            context_metrics = _context_preflight(processed, model)
             output = forward_visual_tap(model, processed)
             if not isinstance(getattr(output, "loss", None), torch.Tensor):
                 raise RuntimeError("authoritative answer labels did not produce QA loss")
@@ -604,6 +787,7 @@ def main() -> None:
                 "media_kind": processed.media_kind,
                 "frame_ids": list(processed.frame_ids),
                 "frame_token_counts": list(processed.frame_token_counts),
+                "context_preflight": context_metrics,
                 "tap_valid_tokens": int(output.visual_state_valid_mask.sum().item()),
                 "frame_token_spans": branch.tap.frame_token_spans[0].detach().cpu().tolist(),
                 "actual_input_visible_object_count": selection.actual_input_visible_object_count,
@@ -622,19 +806,7 @@ def main() -> None:
             for item in fixture_metrics
         )
         report.add_boolean("shape_mask_frame_span", shape_ok, fixtures=fixture_metrics)
-        e01_gradient_names = {}
-        for group, marker in (
-            ("geometry_encoder", "geometry_encoder"),
-            ("feature_fusion", "feature_fusion"),
-        ):
-            squared = 0.0
-            count = 0
-            for name, parameter in model.named_parameters():
-                if marker in name and parameter.requires_grad and parameter.grad is not None:
-                    squared += float(parameter.grad.detach().float().square().sum().cpu())
-                    count += 1
-            if count:
-                e01_gradient_names[group] = squared**0.5
+        e01_audit = _e01_trainability_audit(model)
         parameter_gradients = {}
         missing_required_gradients = []
         component_markers = {
@@ -652,8 +824,9 @@ def main() -> None:
                 or name.startswith("parta_state_head.decoder")
                 or name.startswith("parta_state_head.output_norm")
                 or name == "parta_state_head.slot_queries"
-                or "geometry_encoder" in name
+                or "geometry_merger" in name
                 or "feature_fusion" in name
+                or "deepstack_" in name
             )
             if parameter.grad is None:
                 if required:
@@ -680,11 +853,9 @@ def main() -> None:
         report.add_boolean(
             "qa_supervision_and_e01_trainability",
             bool(qa_losses) and all(np.isfinite(loss) for loss in qa_losses)
-            and bool(e01_gradient_names)
-            and set(e01_gradient_names) == {"geometry_encoder", "feature_fusion"}
-            and all(np.isfinite(value) and value > 1e-12 for value in e01_gradient_names.values()),
+            and bool(e01_audit["passed"]),
             qa_losses=qa_losses,
-            e01_gradient_norms=e01_gradient_names,
+            e01_trainability_audit=e01_audit,
         )
         if not report.payload["checks"]["qa_supervision_and_e01_trainability"]["passed"]:
             raise AssertionError("QA supervision/E-01 trainability smoke gate failed")
@@ -836,7 +1007,7 @@ def main() -> None:
         )
         if device.type == "cuda":
             torch.cuda.empty_cache()
-        _, clean_model = _load_local(args.model_path, args.vggt_path, dtype, args.device)
+        _, clean_model, _ = _load_local(args.model_path, args.vggt_path, dtype, args.device)
         clean_model.eval()
         audit = load_head_free_checkpoint(
             clean_model, a1_state, expected_state_head_keys=expected_head_keys
@@ -856,7 +1027,7 @@ def main() -> None:
             backbone_digest_matches=backbone_digest_matches,
         )
         del clean_model, clean_output, a1_state
-        _, resumed_model = _load_local(args.model_path, args.vggt_path, dtype, args.device)
+        _, resumed_model, _ = _load_local(args.model_path, args.vggt_path, dtype, args.device)
         attach_a1o_state_head(resumed_model, head_config).to(device=device, dtype=dtype)
         resumed_state = torch.load(resume_path, map_location="cpu", weights_only=True)["model"]
         resumed_model.load_state_dict(resumed_state, strict=True)
@@ -890,6 +1061,21 @@ def main() -> None:
             "resolved_config_sha256": stable_sha256(config),
             "checkpoint_sha256": guide_artifact["artifact_sha256"],
             "guide_checkpoint_artifact": guide_artifact,
+            "geometry_encoder_type_effective": runtime_contract[
+                "geometry_encoder_type_effective"
+            ],
+            "geometry_encoder_type_source": runtime_contract[
+                "geometry_encoder_type_source"
+            ],
+            "processor_context_contract": {
+                key: runtime_contract[key]
+                for key in (
+                    "processor_min_pixels",
+                    "processor_max_pixels",
+                    "processor_pixel_field_sources",
+                )
+            },
+            "resource_preflight": resource_preflight,
             "a1_checkpoint_state_sha256": a1_state_sha256,
             "a1_checkpoint_role": "initialization_no_optimizer_updates",
             "a1_checkpoint_optimizer_steps": 0,

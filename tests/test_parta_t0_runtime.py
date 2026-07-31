@@ -84,9 +84,16 @@ class FakeOutput:
 class FakeGuideModel(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        self.config = SimpleNamespace(use_geometry_encoder=True, text_config=SimpleNamespace(hidden_size=8))
-        self.geometry_encoder = torch.nn.Linear(1, 8)
+        self.config = SimpleNamespace(
+            use_geometry_encoder=True,
+            text_config=SimpleNamespace(hidden_size=8, max_position_embeddings=128),
+        )
+        self.geometry_encoder = torch.nn.Module()
+        self.geometry_encoder.vggt = torch.nn.Linear(1, 8)
+        self.geometry_encoder.vggt.requires_grad_(False)
+        self.geometry_merger = torch.nn.Linear(1, 8)
         self.feature_fusion_module = torch.nn.Linear(8, 8)
+        self.language_model = torch.nn.Linear(8, 8)
         self.received_keys = None
 
     def forward(self, **kwargs):
@@ -94,7 +101,9 @@ class FakeGuideModel(torch.nn.Module):
         self.received_keys = set(kwargs)
         geometry = kwargs["geometry_encoder_inputs"]
         assert isinstance(geometry, list) and len(geometry) == 1
-        hidden = self.feature_fusion_module(self.geometry_encoder(kwargs["pixel_values"])).unsqueeze(0)
+        hidden = self.language_model(
+            self.feature_fusion_module(self.geometry_merger(kwargs["pixel_values"]))
+        ).unsqueeze(0)
         valid = torch.ones(1, hidden.shape[1], dtype=torch.bool)
         logits = hidden.mean(1)
         loss = logits.float().square().mean() if "labels" in kwargs else None
@@ -179,7 +188,7 @@ def test_fake_processor_model_end_to_end_video_and_image_exact_order():
             StateLossConfig(),
         )
         branch.losses["loss_state"].backward()
-        assert model.geometry_encoder.weight.grad is not None
+        assert model.geometry_merger.weight.grad is not None
 
 
 def test_cli_failure_is_nonzero_and_atomic_report_exists(tmp_path):
@@ -268,7 +277,34 @@ def test_successful_fake_cli_is_transactional_and_runs_real_gates(tmp_path, monk
     monkeypatch.setattr(runner, "ExactMediaLoader", lambda root: SimpleNamespace(load=lambda item: tuple(
         Image.new("RGB", (2, 2), (index + 1, 0, 0)) for index in item.qa["actual_frame_indices"]
     )))
-    monkeypatch.setattr(runner, "_load_local", lambda *args: (FakeProcessor(), FakeGuideModel()))
+    runtime_contract = {
+        "geometry_encoder_type_effective": "vggt",
+        "geometry_encoder_type_source": "model_default_missing_legacy_field",
+        "processor_min_pixels": runner.GUIDE_MIN_PIXELS,
+        "processor_max_pixels": runner.GUIDE_MAX_PIXELS,
+        "processor_pixel_field_sources": {
+            "min_pixels": "processor_artifact_explicit",
+            "max_pixels": "processor_artifact_explicit",
+        },
+    }
+    monkeypatch.setattr(
+        runner, "_load_local",
+        lambda *args: (FakeProcessor(), FakeGuideModel(), runtime_contract),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_startup_resource_preflight",
+        lambda *args: {
+            "estimated_smoke_checkpoint_bytes": 1,
+            "required_transaction_disk_bytes": 2,
+            "disk_free_bytes": 3,
+            "cuda_device_index": 0,
+            "cuda_capability": [9, 0],
+            "cuda_memory_free_bytes": 4,
+            "cuda_memory_total_bytes": 5,
+            "flash_attn_version": "fake",
+        },
+    )
     captured = {}
     original_attach = runner.attach_a1o_state_head
     def attach_and_capture(model, config):
@@ -300,6 +336,8 @@ def test_successful_fake_cli_is_transactional_and_runs_real_gates(tmp_path, monk
     assert provenance["manifest_provenance"]["adt"]["base_interval"] == 1.0
     assert provenance["manifest_provenance"]["hypersim"]["base_interval"] is None
     assert provenance["manifest_provenance"]["hypersim"]["sampling_contract"] == "single_frame_verified_v1"
+    assert provenance["geometry_encoder_type_effective"] == "vggt"
+    assert provenance["geometry_encoder_type_source"] == "model_default_missing_legacy_field"
     assert provenance["a1_checkpoint_artifact"]["ordered_shards"][0]["sha256"]
     for key in ("guide_checkpoint_artifact", "vggt_checkpoint_artifact"):
         assert provenance[key]["mode"] == "no_index_explicit_manifest"
@@ -427,10 +465,10 @@ def test_checkpoint_index_and_shard_attacks_fail_or_change_digest(tmp_path):
         runner._checkpoint_artifact_provenance(checkpoint)
     (checkpoint / "b.safetensors").write_bytes(b"b")
     index.write_text(json.dumps({"weight_map": {"b.key": "b.safetensors", "a.key": "a.safetensors"}}))
-    with pytest.raises(RuntimeError, match="keys must be ordered"):
-        runner._checkpoint_artifact_provenance(checkpoint)
+    unsorted = runner._checkpoint_artifact_provenance(checkpoint)
     index.write_text(json.dumps({"weight_map": {"a.key": "a.safetensors", "b.key": "b.safetensors"}}))
     original = runner._checkpoint_artifact_provenance(checkpoint)
+    assert unsorted["index"]["ordered_weight_map_sha256"] == original["index"]["ordered_weight_map_sha256"]
     (checkpoint / "b.safetensors").write_bytes(b"modified")
     modified_shard = runner._checkpoint_artifact_provenance(checkpoint)
     assert original["artifact_sha256"] != modified_shard["artifact_sha256"]
@@ -440,6 +478,9 @@ def test_checkpoint_index_and_shard_attacks_fail_or_change_digest(tmp_path):
     }))
     modified_index = runner._checkpoint_artifact_provenance(checkpoint)
     assert modified_shard["artifact_sha256"] != modified_index["artifact_sha256"]
+    index.write_text(json.dumps({"weight_map": {"a.key": "../a.safetensors"}}))
+    with pytest.raises(RuntimeError, match="unsafe shard names"):
+        runner._checkpoint_artifact_provenance(checkpoint)
 
 
 def test_no_index_checkpoint_manifest_binds_config_and_rejects_unindexed_shards(tmp_path):
@@ -499,3 +540,81 @@ def test_manifest_sampling_is_source_aware_and_fail_closed(tmp_path):
     path.write_text(json.dumps(adt) + "\n")
     with pytest.raises(RuntimeError, match="base_interval mismatch"):
         runner._validate_manifest_sampling(path, "adt", 1.0)
+
+
+def test_geometry_encoder_legacy_default_and_explicit_attack():
+    _, runner = load_runner_module()
+    missing = runner._geometry_encoder_contract(SimpleNamespace())
+    assert missing == {
+        "geometry_encoder_type_effective": "vggt",
+        "geometry_encoder_type_source": "model_default_missing_legacy_field",
+    }
+    explicit = runner._geometry_encoder_contract(
+        SimpleNamespace(geometry_encoder_type="vggt")
+    )
+    assert explicit["geometry_encoder_type_source"] == "config_explicit"
+    with pytest.raises(RuntimeError, match="requires VGGT"):
+        runner._geometry_encoder_contract(
+            SimpleNamespace(geometry_encoder_type="pi3")
+        )
+
+
+def test_context_preflight_records_budget_and_rejects_overflow():
+    _, runner = load_runner_module()
+    fixture = SimpleNamespace(
+        model_kwargs={"input_ids": torch.zeros(1, 12, dtype=torch.long)},
+        frame_token_counts=(3, 4),
+    )
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            text_config=SimpleNamespace(max_position_embeddings=16)
+        )
+    )
+    result = runner._context_preflight(fixture, model)
+    assert result == {
+        "frame_visual_tokens": [3, 4],
+        "total_visual_tokens": 7,
+        "sequence_length": 12,
+        "context_limit": 16,
+    }
+    model.config.text_config.max_position_embeddings = 11
+    with pytest.raises(RuntimeError, match="exceeds model context"):
+        runner._context_preflight(fixture, model)
+
+
+def test_e01_gradient_gate_freezes_vggt_and_uses_trainable_guide_path():
+    _, runner = load_runner_module()
+    model = FakeGuideModel()
+    loss = sum(parameter.sum() for parameter in (
+        model.geometry_merger.weight,
+        model.feature_fusion_module.weight,
+        model.language_model.weight,
+    ))
+    loss.backward()
+    audit = runner._e01_trainability_audit(model)
+    assert audit["passed"]
+    assert audit["frozen_vggt_parameter_count"] > 0
+    assert not audit["frozen_vggt_violations"]
+    model.geometry_encoder.vggt.weight.requires_grad_(True)
+    assert not runner._e01_trainability_audit(model)["passed"]
+
+
+def test_resource_preflight_records_capacity_and_fails_closed(tmp_path, monkeypatch):
+    _, runner = load_runner_module()
+    artifact = {"ordered_shards": [{"size_bytes": 100}]}
+    monkeypatch.setattr(runner.shutil, "disk_usage", lambda path: SimpleNamespace(free=10**9))
+    monkeypatch.setattr(runner.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(runner.torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(runner.torch.cuda, "get_device_capability", lambda index: (9, 0))
+    monkeypatch.setattr(runner.torch.cuda, "mem_get_info", lambda index: (1000, 2000))
+    monkeypatch.setitem(sys.modules, "flash_attn", SimpleNamespace(__version__="fake"))
+    passed = runner._startup_resource_preflight(
+        tmp_path, artifact, artifact, "cuda:0"
+    )
+    assert passed["passed"] and passed["estimated_smoke_checkpoint_bytes"] == 200
+    monkeypatch.setattr(runner.shutil, "disk_usage", lambda path: SimpleNamespace(free=1))
+    failed = runner._startup_resource_preflight(
+        tmp_path, artifact, artifact, "cuda:0"
+    )
+    assert not failed["passed"]
+    assert any("insufficient disk" in item for item in failed["failures"])
