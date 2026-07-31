@@ -1,7 +1,7 @@
 # Part A A1-O Architecture
 
-更新时间：2026-07-30（D-59）
-状态：Engineering skeleton曾`REVIEW PASS`；ADT whole-MP4 sampler已被真实pilot supersede，目标合同待实现/Review；真实T0未通过
+更新时间：2026-07-31（D-60）
+状态：Engineering skeleton曾`REVIEW PASS`；ADT D-59 sampler与D-60 QA unlocalized合同待实现Review；真实T0未通过
 
 ## 1. 范围
 
@@ -54,6 +54,17 @@ IDs。每个ID必须存在对应canonical frame state，frame key/index必须逐
 只能是这些实际输入帧中有效可见对象的并集。禁止邻帧替代、外推或伪标签；clip内选中ID仍不
 满足冻结阈值即整景失败。provenance保存whole-video total/FPS、clip首尾raw ID/device timestamp、
 支持能力、采样参数、mapped IDs与hash；A0/A1-O共享全部字段。
+
+QA证据范围与object-state证据范围分离：ADT全部60,207条QA保留，但逐条固定
+`qa_evidence_scope=scene_associated_unlocalized`、`qa_visual_support_verified=false`、
+`evidence_frame_indices=null`。这只证明QA与scene关联，不证明答案证据位于D-59 clip。A0/A1-O共享同一QA
+集合与exact binding；辅助GT仍只来自实际输入帧的direct-GT actual-visible对象。
+
+coverage只作诊断，分箱唯一依据
+`duration_coverage_ratio = supported clip timestamp duration / whole video timestamp duration`，
+不得用frame-count ratio替代：high `>=0.75`、medium `[0.50,0.75)`、low `<0.50`；冻结统计分别为
+`84/87/12 scenes`与`27,636/28,623/3,948 QA`，`duration_coverage_ratio <0.40`共658 QA。loader不得按coverage
+删除样本；reporter输出overall与分层指标，并将分层差异标记为相关性而非逐题支持或因果证据。
 
 现有`guide_exact_raw_mp4_v1`直接在whole MP4上取帧的实现已被真实pilot supersede：固定ADT
 场景的32个采样帧中有6个落在trajectory span之外。该实现不得用于正式ADT manifest；目标
@@ -124,6 +135,9 @@ running与complete状态不可覆盖；失败run不得标为完成。
 - T0-B必须有50–100个source-balanced batches，至少95%的`g_QA`和`g_state`均finite且
   `>1e-12`。
 - 固定fixtures缺一即失败，不允许自动替换。
+- ADT QA support三字段必须存在且取D-60冻结值；A0/A1-O有序QA完整内容/payload必须精确相同，
+  不得只比较QA ID。
+- coverage bin不得进入训练过滤逻辑；只允许进入预注册诊断报告。
 - 真实pose/投影QC、四源manifest、零scene overlap、真实T0均是正式训练前Gate。
 
 ## 7. 已验证与未验证
@@ -133,6 +147,6 @@ synthetic/CPU测试覆盖schema反例、旧GUIDE whole-MP4 raw-ID hard fail、Hu
 empty/all-masked、finite/backward、visual tap、
 head-key过滤、T0数值合同和provenance；合计24项通过，`py_compile`及`git diff --check`通过。
 
-未验证：183景coverage、D-59 sampler实现/Review、真实GUIDE mapped raw-ID frame-state生成、
+未验证：D-59 sampler与D-60 QA合同实现/Review、真实GUIDE mapped raw-ID frame-state生成、
 真实pose/投影QC、五个固定fixture上的真实Qwen T0-A、真实head-free logits等价、
 ADT+Hypersim及最终四源T0-B。不得将synthetic测试或whole-MP4 pilot失败描述为真实T0 PASS。

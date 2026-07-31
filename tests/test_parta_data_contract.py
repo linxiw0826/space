@@ -18,10 +18,13 @@ from src.parta_data_contract import (
     adapt_scene,
     build_manifest_rows,
     canonical_category,
+    coverage_bin,
+    duration_coverage_ratio,
     frame_binding_sha256,
     guide_frame_indices,
     guide_sampling_binding_sha256,
     source_visibility_contract,
+    validate_qa_evidence_contract,
     validate_records,
 )
 
@@ -79,6 +82,11 @@ def raw_records(scene_id="Apartment_release_clean_seq131_M1292"):
         "vsi_media": "adt/a.mp4",
         "question_type": "relative_direction_object",
         "conversations": [],
+        "qa_evidence_scope": "scene_associated_unlocalized",
+        "evidence_frame_indices": None,
+        "qa_visual_support_verified": False,
+        "duration_coverage_ratio": 1.0,
+        "coverage_bin": "high",
         "loss_masks": {"scene_geometry": True},
         "sampling_policy": GUIDE_EXACT_SAMPLING_POLICY,
         "total_frames": 16,
@@ -180,9 +188,93 @@ def test_valid_contract_null_and_mask():
     node = scenes[0]["nodes"][0]
     assert node["rotation_world_from_object"] is None
     assert node["field_mask"]["orientation"] is False
-    assert validate_records(scenes, frames, qa).qa == 1
+    report = validate_records(scenes, frames, qa)
+    assert report.qa == 1
+    assert report.qa_coverage_counts["adt"][
+        "relative_direction_object"
+    ]["high"] == 1
     assert frames[0]["visible_nodes"][0]["visible"] is True
     assert frames[0]["visible_nodes"][0]["evidence_present"] is True
+
+
+@pytest.mark.parametrize(
+    ("ratio", "expected"),
+    [
+        (0.0, "low"),
+        (0.499999, "low"),
+        (0.5, "medium"),
+        (0.749999, "medium"),
+        (0.75, "high"),
+        (1.0, "high"),
+    ],
+)
+def test_coverage_bin_frozen_boundaries(ratio, expected):
+    assert coverage_bin(ratio) == expected
+
+
+@pytest.mark.parametrize(
+    ("clip_end", "expected_ratio", "expected_bin"),
+    [(500, 0.5, "medium"), (750, 0.75, "high")],
+)
+def test_duration_coverage_exact_boundaries(
+    clip_end, expected_ratio, expected_bin
+):
+    provenance = {
+        "whole_video_start_device_timestamp_ns": 0,
+        "whole_video_end_device_timestamp_ns": 1000,
+        "clip_start_device_timestamp_ns": 0,
+        "clip_end_device_timestamp_ns": clip_end,
+    }
+    ratio = duration_coverage_ratio(provenance)
+    assert ratio == expected_ratio
+    assert coverage_bin(ratio) == expected_bin
+
+
+def test_unlocalized_cannot_masquerade_as_verified():
+    _, _, qa = canonical()
+    row = qa[0]
+    row["qa_visual_support_verified"] = True
+    with pytest.raises(
+        ContractError, match="scene_associated_unlocalized|Unlocalized"
+    ):
+        validate_qa_evidence_contract(row)
+
+
+def test_adt_adapter_rejects_frame_verified_even_with_valid_subset():
+    _, _, raw = raw_records()
+    raw.update({
+        "qa_evidence_scope": "frame_verified",
+        "qa_visual_support_verified": True,
+        "evidence_frame_indices": [0],
+    })
+    with pytest.raises(ContractError, match="ADT source QA"):
+        adapt_qa("adt", raw)
+
+
+@pytest.mark.parametrize("evidence", [[], [999999]])
+def test_frame_verified_evidence_must_be_nonempty_actual_subset(evidence):
+    _, _, qa = canonical()
+    row = qa[0]
+    row.update({
+        "source_dataset": "hypersim",
+        "qa_evidence_scope": "frame_verified",
+        "qa_visual_support_verified": True,
+        "evidence_frame_indices": evidence,
+    })
+    with pytest.raises(ContractError, match="nonempty|actual-frame subset"):
+        validate_qa_evidence_contract(row)
+
+
+def test_question_text_does_not_change_selection_or_binding():
+    _, _, qa = canonical()
+    original = copy.deepcopy(qa[0])
+    changed = copy.deepcopy(original)
+    changed["conversations"] = [{"from": "human", "value": "different"}]
+    assert frame_binding_sha256(original) == frame_binding_sha256(changed)
+    assert (
+        original["source_sampling_binding_sha256"]
+        == changed["source_sampling_binding_sha256"]
+    )
 
 
 def test_reference_error_fails():
@@ -538,6 +630,93 @@ def _write_adt_anchor(source_dir: Path, certificate):
             "trust_stage": "finalizer_output_v1",
         }
     }))
+
+
+def test_canonical_cli_rejects_adt_frame_verified_attack(tmp_path):
+    scene, frames, qa = raw_records()
+    qa.update({
+        "qa_evidence_scope": "frame_verified",
+        "qa_visual_support_verified": True,
+        "evidence_frame_indices": [0],
+    })
+    source_dir = tmp_path / "source"
+    output_dir = tmp_path / "canonical"
+    source_dir.mkdir()
+    _write_jsonl(source_dir / "adt_scene_states.jsonl", [scene])
+    _write_jsonl(source_dir / "adt_frame_states.jsonl", frames)
+    _write_jsonl(source_dir / "adt_qa_train.jsonl", [qa])
+    _write_adt_anchor(
+        source_dir, qa["clip_provenance"]["support_certificate"]
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(PROJECT / "scripts/preprocess/build_parta_canonical_data.py"),
+            "--source", "adt",
+            "--input-dir", str(source_dir),
+            "--output-dir", str(output_dir),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "ADT source QA" in result.stderr
+
+
+def test_matched_arm_assertion_passes_and_fails_on_mismatch(tmp_path):
+    scenes, frames, qa = canonical()
+    second = copy.deepcopy(qa[0])
+    second["qa_id"] = "adt:10"
+    second["vsi_row_index"] = 10
+    second["conversations"] = [
+        {"from": "human", "value": "second question"},
+        {"from": "gpt", "value": "second answer"},
+    ]
+    qa.append(second)
+    a0 = tmp_path / "a0.jsonl"
+    a1 = tmp_path / "a1.jsonl"
+    scene_path = tmp_path / "scenes.jsonl"
+    frame_path = tmp_path / "frames.jsonl"
+    report = tmp_path / "matched.json"
+    _write_jsonl(scene_path, scenes)
+    _write_jsonl(frame_path, frames)
+    _write_jsonl(a0, qa)
+    _write_jsonl(a1, copy.deepcopy(qa))
+    command = [
+        sys.executable,
+        str(PROJECT / "scripts/preprocess/assert_parta_matched_arms.py"),
+        "--a0-manifest", str(a0),
+        "--a1-manifest", str(a1),
+        "--scenes", str(scene_path),
+        "--frames", str(frame_path),
+        "--output", str(report),
+    ]
+    subprocess.run(command, check=True)
+    payload = json.loads(report.read_text())
+    assert payload["status"] == "pass"
+    assert payload["qa_loss"]["a0"]["status"] == "not_provided"
+    assert len(payload["artifacts"]["a0"]["file_sha256"]) == 64
+
+    mismatched = copy.deepcopy(qa)
+    mismatched[0]["coverage_bin"] = "medium"
+    _write_jsonl(a1, mismatched)
+    result = subprocess.run(command, capture_output=True, text=True)
+    assert result.returncode != 0
+    assert "coverage bin" in result.stderr
+
+    answer_changed = copy.deepcopy(qa)
+    answer_changed[0]["conversations"] = [
+        {"from": "gpt", "value": "tampered answer"}
+    ]
+    _write_jsonl(a1, answer_changed)
+    result = subprocess.run(command, capture_output=True, text=True)
+    assert result.returncode != 0
+    assert "causal QA payload differs" in result.stderr
+
+    _write_jsonl(a1, list(reversed(qa)))
+    result = subprocess.run(command, capture_output=True, text=True)
+    assert result.returncode != 0
+    assert "ordered qa_id sequence differs" in result.stderr
 
 
 def test_atomic_archive_failure_leaves_no_formal_product(tmp_path, monkeypatch):

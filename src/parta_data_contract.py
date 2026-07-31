@@ -18,6 +18,10 @@ import numpy as np
 
 
 SCHEMA_VERSION = "parta_canonical_v1"
+QA_EVIDENCE_SCOPES = {
+    "frame_verified",
+    "scene_associated_unlocalized",
+}
 GUIDE_EXACT_SAMPLING_POLICY = "guide_exact_over_gt_supported_clip_v1"
 GUIDE_WHOLE_MP4_SAMPLING_POLICY = "guide_exact_raw_mp4_v1"
 T0_FIXTURES = {
@@ -209,6 +213,65 @@ def frame_binding_payload(row: Mapping[str, Any]) -> dict[str, Any]:
 
 def frame_binding_sha256(row: Mapping[str, Any]) -> str:
     return content_sha256(frame_binding_payload(row))
+
+
+def duration_coverage_ratio(clip_provenance: Mapping[str, Any]) -> float:
+    whole = (
+        int(clip_provenance["whole_video_end_device_timestamp_ns"])
+        - int(clip_provenance["whole_video_start_device_timestamp_ns"])
+    )
+    clip = (
+        int(clip_provenance["clip_end_device_timestamp_ns"])
+        - int(clip_provenance["clip_start_device_timestamp_ns"])
+    )
+    if whole < 0 or clip < 0 or clip > whole:
+        raise ContractError("Invalid duration coverage timestamps")
+    return 1.0 if whole == 0 and clip == 0 else clip / whole
+
+
+def coverage_bin(ratio: float) -> str:
+    ratio = float(ratio)
+    if not math.isfinite(ratio) or not 0.0 <= ratio <= 1.0:
+        raise ContractError(f"Invalid duration coverage ratio: {ratio}")
+    if ratio >= 0.75:
+        return "high"
+    if ratio >= 0.5:
+        return "medium"
+    return "low"
+
+
+def validate_qa_evidence_contract(row: Mapping[str, Any]) -> None:
+    scope = row.get("qa_evidence_scope")
+    verified = row.get("qa_visual_support_verified")
+    evidence = row.get("evidence_frame_indices")
+    if scope not in QA_EVIDENCE_SCOPES:
+        raise ContractError(f"Invalid qa_evidence_scope: {scope!r}")
+    if not isinstance(verified, bool):
+        raise ContractError("qa_visual_support_verified must be boolean")
+    if row.get("source_dataset") == "adt" and (
+        scope != "scene_associated_unlocalized"
+        or verified
+        or evidence is not None
+    ):
+        raise ContractError(
+            "ADT QA must be scene_associated_unlocalized/false/null"
+        )
+    if scope == "scene_associated_unlocalized":
+        if verified or evidence is not None:
+            raise ContractError(
+                "Unlocalized QA must have verified=false and evidence=null"
+            )
+        return
+    if not verified or not isinstance(evidence, list) or not evidence:
+        raise ContractError(
+            "frame_verified QA requires verified=true and nonempty evidence"
+        )
+    actual = {int(value) for value in row["actual_frame_indices"]}
+    normalized = [int(value) for value in evidence]
+    if len(normalized) != len(set(normalized)) or not set(normalized) <= actual:
+        raise ContractError(
+            "Evidence frame indices must be a unique actual-frame subset"
+        )
 
 
 def validate_guide_sampling_binding(row: Mapping[str, Any]) -> None:
@@ -699,6 +762,27 @@ def adapt_qa(source: str, raw: Mapping[str, Any]) -> dict[str, Any]:
         "source_schema_version": raw.get("schema_version"),
     }
     if source == "adt":
+        if (
+            raw.get("qa_evidence_scope")
+            != "scene_associated_unlocalized"
+            or raw.get("qa_visual_support_verified") is not False
+            or raw.get("evidence_frame_indices") is not None
+        ):
+            raise ContractError(
+                "ADT source QA must be "
+                "scene_associated_unlocalized/false/null"
+            )
+        row.update({
+            "qa_evidence_scope": raw.get("qa_evidence_scope"),
+            "evidence_frame_indices": raw.get("evidence_frame_indices"),
+            "qa_visual_support_verified": raw.get(
+                "qa_visual_support_verified"
+            ),
+            "duration_coverage_ratio": raw.get(
+                "duration_coverage_ratio"
+            ),
+            "coverage_bin": raw.get("coverage_bin"),
+        })
         row.update({
             "sampling_policy": raw.get("sampling_policy"),
             "video_total_frames": raw.get("total_frames"),
@@ -712,6 +796,20 @@ def adapt_qa(source: str, raw: Mapping[str, Any]) -> dict[str, Any]:
             "clip_provenance": raw.get("clip_provenance"),
         })
         validate_guide_sampling_binding(row)
+        expected_ratio = duration_coverage_ratio(row["clip_provenance"])
+        if float(row["duration_coverage_ratio"]).hex() != expected_ratio.hex():
+            raise ContractError("ADT duration coverage provenance mismatch")
+        if row["coverage_bin"] != coverage_bin(expected_ratio):
+            raise ContractError("ADT coverage bin mismatch")
+    else:
+        row.update({
+            "qa_evidence_scope": "frame_verified",
+            "evidence_frame_indices": indices,
+            "qa_visual_support_verified": True,
+            "duration_coverage_ratio": 1.0,
+            "coverage_bin": "high",
+        })
+    validate_qa_evidence_contract(row)
     return row
 
 
@@ -726,6 +824,7 @@ class ValidationReport:
     truncated_objects: int = 0
     source_counts: dict[str, dict[str, int]] | None = None
     scene_object_counts: dict[str, int] | None = None
+    qa_coverage_counts: dict[str, dict[str, dict[str, int]]] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {"schema_version": "parta_validation_report_v1", **vars(self)}
@@ -752,7 +851,9 @@ def validate_records(
     expected_visible_observations: Mapping[str, int] | None = None,
 ) -> ValidationReport:
     """Validate references, masks, exact input visibility, and frame binding."""
-    report = ValidationReport(source_counts={}, scene_object_counts={})
+    report = ValidationReport(
+        source_counts={}, scene_object_counts={}, qa_coverage_counts={}
+    )
     scene_map: dict[tuple[str, str], Mapping[str, Any]] = {}
     frame_map: dict[tuple[str, str], Mapping[str, Any]] = {}
     for scene in scenes:
@@ -837,12 +938,26 @@ def validate_records(
         frame_map[frame_key] = frame
         report.frames += 1
         report.source_counts[key[0]]["frames"] += 1
+    scene_qa_contracts: dict[tuple[str, str], tuple[Any, ...]] = {}
     for qa in qa_rows:
         scene_key = (qa["source_dataset"], qa["scene_id"])
         if scene_key not in scene_map:
             raise ContractError(f"QA references missing scene {scene_key}")
         if qa["source_dataset"] == "adt":
             validate_guide_sampling_binding(qa)
+        validate_qa_evidence_contract(qa)
+        ratio = float(qa.get("duration_coverage_ratio"))
+        expected_bin = coverage_bin(ratio)
+        if qa.get("coverage_bin") != expected_bin:
+            raise ContractError(f"QA coverage bin mismatch: {qa['qa_id']}")
+        if qa["source_dataset"] == "adt":
+            provenance_ratio = duration_coverage_ratio(
+                qa["clip_provenance"]
+            )
+            if ratio.hex() != provenance_ratio.hex():
+                raise ContractError(
+                    f"ADT QA coverage/provenance mismatch: {qa['qa_id']}"
+                )
         keys = list(qa["actual_frame_keys"])
         indices = list(qa["actual_frame_indices"])
         if len(keys) != len(indices) or len(set(indices)) != len(indices):
@@ -855,6 +970,25 @@ def validate_records(
                 f"for {qa['qa_id']}: expected={expected_frame_binding}, "
                 f"actual={declared_frame_binding}"
             )
+        shared_contract = (
+            tuple(keys),
+            tuple(indices),
+            declared_frame_binding,
+            qa.get("source_sampling_binding_sha256"),
+            qa.get("sampling_policy"),
+            ratio.hex(),
+            qa.get("coverage_bin"),
+            content_sha256(qa.get("clip_provenance")),
+        )
+        if qa["source_dataset"] == "adt":
+            prior_contract = scene_qa_contracts.setdefault(
+                scene_key, shared_contract
+            )
+            if shared_contract != prior_contract:
+                raise ContractError(
+                    "Same-scene QA selection/binding/coverage mismatch: "
+                    f"{scene_key}"
+                )
         if qa["media_kind"] == "video" and not 16 <= len(keys) <= 32:
             raise ContractError(f"Video QA must bind 16-32 frames: {qa['qa_id']}")
         if qa["media_kind"] == "image" and len(keys) != 1:
@@ -894,6 +1028,13 @@ def validate_records(
             raise ContractError(f"Non-finite QA {qa['qa_id']}")
         report.qa += 1
         report.source_counts[scene_key[0]]["qa"] += 1
+        question_type = str(qa.get("question_type") or "__unknown__")
+        report.qa_coverage_counts.setdefault(
+            scene_key[0], {}
+        ).setdefault(question_type, {}).setdefault(expected_bin, 0)
+        report.qa_coverage_counts[scene_key[0]][question_type][
+            expected_bin
+        ] += 1
     if expected_sources is not None:
         unknown = set(expected_sources) - set(T0_FIXTURES)
         if unknown:

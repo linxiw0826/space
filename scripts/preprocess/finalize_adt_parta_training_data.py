@@ -25,6 +25,8 @@ sys.path.insert(0, str(PROJECT))
 
 from src.parta_data_contract import (
     GUIDE_EXACT_SAMPLING_POLICY,
+    coverage_bin,
+    duration_coverage_ratio,
     guide_sampling_binding_sha256,
 )
 from src.adt_gt_supported_clip import (
@@ -988,6 +990,9 @@ def main():
                         ) + "\n"
                     )
                 for qa in qa_by_scene.get(sequence, []):
+                    qa_duration_coverage = duration_coverage_ratio(
+                        sampling_provenance["clip_provenance"]
+                    )
                     qa_buffer.write(json.dumps({
                         "schema_version": "adt_qa_train_v1",
                         "vsi_row_index": qa["vsi_row_index"],
@@ -997,6 +1002,15 @@ def main():
                         "vsi_media": qa["vsi_media"],
                         "question_type": qa["question_type"],
                         "conversations": qa["conversations"],
+                        "qa_evidence_scope": (
+                            "scene_associated_unlocalized"
+                        ),
+                        "evidence_frame_indices": None,
+                        "qa_visual_support_verified": False,
+                        "duration_coverage_ratio": qa_duration_coverage,
+                        "coverage_bin": coverage_bin(
+                            qa_duration_coverage
+                        ),
                         "loss_masks": {
                             "qa": True,
                             "node_identity": True,
