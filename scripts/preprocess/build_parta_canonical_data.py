@@ -17,6 +17,7 @@ from src.parta_data_contract import (  # noqa: E402
     adapt_scene,
     build_manifest_rows,
     read_jsonl,
+    source_visibility_contract,
     validate_records,
     write_jsonl,
 )
@@ -43,7 +44,13 @@ def main() -> None:
 
     scene_name, frame_name, qa_name = FILES[args.source]
     scenes = [adapt_scene(args.source, row) for row in read_jsonl(args.input_dir / scene_name)]
-    frames = [adapt_frame(args.source, row) for row in read_jsonl(args.input_dir / frame_name)]
+    raw_frames = list(read_jsonl(args.input_dir / frame_name))
+    expected_visible_observations = sum(
+        source_visibility_contract(args.source, observation)[1]
+        for row in raw_frames
+        for observation in row.get("visible_nodes", ())
+    )
+    frames = [adapt_frame(args.source, row) for row in raw_frames]
     raw_qa = list(read_jsonl(args.input_dir / qa_name))
     # Hypersim source QA does not repeat frame_id; recover it from frame_key.
     frame_by_media = {row.get("vsi_media"): row for row in frames}
@@ -63,6 +70,9 @@ def main() -> None:
         manifest,
         require_fixtures=args.require_t0_fixtures,
         expected_sources=args.expected_source or None,
+        expected_visible_observations={
+            args.source: expected_visible_observations
+        },
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     write_jsonl(args.output_dir / "scene_states.jsonl", scenes)

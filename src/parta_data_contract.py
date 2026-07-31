@@ -277,6 +277,45 @@ def adapt_scene(source: str, raw: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def source_visibility_contract(
+    source: str, observation: Mapping[str, Any]
+) -> tuple[bool, bool]:
+    """Return ``(evidence_present, supervision_visible)`` for one observation.
+
+    ADT ``visible_nodes`` contains direct GT instance-identity observations.
+    Membership therefore means visible unless the source row explicitly marks
+    the observation invisible.  Hypersim visibility supervision additionally
+    requires valid geometry and at least 16 supporting pixels.
+    """
+    evidence_present = True
+    explicit_visible = observation.get(
+        "visible", observation.get("visibility", True)
+    )
+    if not isinstance(explicit_visible, bool):
+        raise ContractError(
+            f"{source} explicit visibility must be boolean, got "
+            f"{type(explicit_visible).__name__}"
+        )
+    if source == "adt":
+        return evidence_present, explicit_visible
+    if source == "hypersim":
+        geometry_valid = observation.get("geometry_valid", False)
+        pixel_count = observation.get("pixel_count")
+        if not isinstance(geometry_valid, bool):
+            raise ContractError("Hypersim geometry_valid must be boolean")
+        if not isinstance(pixel_count, (int, float)) or isinstance(
+            pixel_count, bool
+        ):
+            raise ContractError(
+                "Hypersim visibility evidence requires numeric pixel_count"
+            )
+        return (
+            evidence_present,
+            bool(explicit_visible and geometry_valid and pixel_count >= 16),
+        )
+    raise ContractError(f"Unsupported source: {source}")
+
+
 def adapt_frame(source: str, raw: Mapping[str, Any]) -> dict[str, Any]:
     contract = SOURCE_CONTRACTS.get(source)
     if contract is None or not str(raw.get("schema_version", "")).startswith(
@@ -287,15 +326,15 @@ def adapt_frame(source: str, raw: Mapping[str, Any]) -> dict[str, Any]:
         )
     visible = []
     for observation in raw.get("visible_nodes", ()):
-        geometry_valid = observation.get("geometry_valid", True)
-        salient_visible = observation.get("pixel_count", 1) >= 16
-        supervision_valid = bool(geometry_valid and salient_visible)
+        evidence_present, supervision_valid = source_visibility_contract(
+            source, observation
+        )
         visible.append(
             {
                 "object_id": _source_object_id(
                     source, raw["scene_id"], observation["object_id"]
                 ),
-                "evidence_present": True,
+                "evidence_present": evidence_present,
                 "visible": supervision_valid,
                 # A1-O v1 predicts global center and per-view visibility only.
                 # Source camera coordinates have different axis conventions,
@@ -371,6 +410,7 @@ class ValidationReport:
     frames: int = 0
     qa: int = 0
     visible_observations: int = 0
+    visibility_evidence_observations: int = 0
     overflow_scenes: int = 0
     truncated_objects: int = 0
     source_counts: dict[str, dict[str, int]] | None = None
@@ -398,6 +438,7 @@ def validate_records(
     max_slots: int = 384,
     require_fixtures: bool = False,
     expected_sources: Sequence[str] | None = None,
+    expected_visible_observations: Mapping[str, int] | None = None,
 ) -> ValidationReport:
     """Validate references, masks, exact input visibility, and frame binding."""
     report = ValidationReport(source_counts={}, scene_object_counts={})
@@ -434,7 +475,13 @@ def validate_records(
         report.scenes += 1
         source_stats = report.source_counts.setdefault(
             scene["source_dataset"],
-            {"scenes": 0, "frames": 0, "qa": 0, "visible_observations": 0},
+            {
+                "scenes": 0,
+                "frames": 0,
+                "qa": 0,
+                "visible_observations": 0,
+                "visibility_evidence_observations": 0,
+            },
         )
         source_stats["scenes"] += 1
         report.scene_object_counts[f"{key[0]}:{key[1]}"] = len(ids)
@@ -447,6 +494,18 @@ def validate_records(
             raise ContractError(f"Duplicate frame {frame_key}")
         node_ids = {node["object_id"] for node in scene_map[key]["nodes"]}
         for observation in frame["visible_nodes"]:
+            evidence_present = observation.get("evidence_present")
+            if not isinstance(evidence_present, bool):
+                raise ContractError("evidence_present must be boolean")
+            if evidence_present:
+                report.visibility_evidence_observations += 1
+                report.source_counts[key[0]][
+                    "visibility_evidence_observations"
+                ] += 1
+            if observation["visible"] and not evidence_present:
+                raise ContractError(
+                    "Visible supervision requires source evidence"
+                )
             if observation["object_id"] not in node_ids:
                 raise ContractError(
                     f"Visible object absent from scene: {observation['object_id']}"
@@ -524,6 +583,30 @@ def validate_records(
             raise ContractError(
                 f"Missing expected sources: {sorted(missing_sources)}"
             )
+    if expected_visible_observations is not None:
+        for source, expected_count in expected_visible_observations.items():
+            if source not in report.source_counts:
+                raise ContractError(
+                    f"Missing source for visibility audit: {source}"
+                )
+            actual_count = report.source_counts[source][
+                "visible_observations"
+            ]
+            if actual_count != expected_count:
+                raise ContractError(
+                    "Source/canonical visible observation mismatch for "
+                    f"{source}: source={expected_count}, canonical={actual_count}"
+                )
+    adt_stats = report.source_counts.get("adt")
+    if (
+        adt_stats is not None
+        and adt_stats["visibility_evidence_observations"] > 0
+        and adt_stats["visible_observations"] == 0
+    ):
+        raise ContractError(
+            "ADT contains frame-level visibility evidence but canonical "
+            "visibility is empty"
+        )
     if require_fixtures:
         present = {(s["source_dataset"], s["scene_id"]) for s in scenes}
         fixture_sources = (

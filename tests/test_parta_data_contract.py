@@ -15,6 +15,7 @@ from src.parta_data_contract import (
     build_manifest_rows,
     canonical_category,
     guide_frame_indices,
+    source_visibility_contract,
     validate_records,
 )
 
@@ -78,6 +79,8 @@ def test_valid_contract_null_and_mask():
     assert node["rotation_world_from_object"] is None
     assert node["field_mask"]["orientation"] is False
     assert validate_records(scenes, frames, qa).qa == 1
+    assert frames[0]["visible_nodes"][0]["visible"] is True
+    assert frames[0]["visible_nodes"][0]["evidence_present"] is True
 
 
 def test_reference_error_fails():
@@ -197,6 +200,69 @@ def test_hypersim_geometry_invalid_is_not_supervision():
     assert manifest[0]["actual_visible_object_ids"] == []
     assert manifest[0]["empty_gt"] is True
     validate_records([scene], [frame], manifest)
+
+
+def test_adt_direct_visibility_does_not_require_hypersim_pixel_fields():
+    _, raw_frames, _ = raw_records()
+    observation = raw_frames[0]["visible_nodes"][0]
+    assert "pixel_count" not in observation
+    assert "geometry_valid" not in observation
+    frame = adapt_frame("adt", raw_frames[0])
+    adapted = frame["visible_nodes"][0]
+    assert adapted["evidence_present"] is True
+    assert adapted["visible"] is True
+    assert adapted["field_mask"]["visibility"] is True
+
+
+def test_adt_explicit_invisible_evidence_is_preserved_but_not_supervised():
+    _, raw_frames, _ = raw_records()
+    raw_frames[0]["visible_nodes"][0]["visible"] = False
+    frame = adapt_frame("adt", raw_frames[0])
+    adapted = frame["visible_nodes"][0]
+    assert adapted["evidence_present"] is True
+    assert adapted["visible"] is False
+    assert adapted["field_mask"]["visibility"] is False
+
+
+def test_adt_visibility_source_count_mismatch_fails_closed():
+    scenes, frames, qa = canonical()
+    with pytest.raises(ContractError, match="observation mismatch"):
+        validate_records(
+            scenes,
+            frames,
+            qa,
+            expected_visible_observations={"adt": 17},
+        )
+
+
+def test_adt_evidence_with_empty_canonical_visibility_fails():
+    scenes, frames, qa = canonical()
+    for frame in frames:
+        for observation in frame["visible_nodes"]:
+            observation["visible"] = False
+            observation["field_mask"]["visibility"] = False
+    qa = list(build_manifest_rows(
+        qa,
+        {("adt", frame["frame_key"]): frame for frame in frames},
+    ))
+    with pytest.raises(ContractError, match="canonical visibility is empty"):
+        validate_records(scenes, frames, qa)
+
+
+def test_hypersim_visibility_requires_geometry_and_pixel_count():
+    assert source_visibility_contract(
+        "hypersim",
+        {"geometry_valid": True, "pixel_count": 16},
+    ) == (True, True)
+    assert source_visibility_contract(
+        "hypersim",
+        {"geometry_valid": True, "pixel_count": 15},
+    ) == (True, False)
+    with pytest.raises(ContractError, match="numeric pixel_count"):
+        source_visibility_contract(
+            "hypersim",
+            {"geometry_valid": True},
+        )
 
 
 def test_coordinate_transform_and_fixed_category_policy():
