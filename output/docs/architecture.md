@@ -1,7 +1,7 @@
 # Part A A1-O Architecture
 
-更新时间：2026-07-30
-状态：Engineering skeleton `REVIEW PASS`；真实T0未通过；正式训练Gate关闭
+更新时间：2026-07-30（D-59）
+状态：Engineering skeleton曾`REVIEW PASS`；ADT whole-MP4 sampler已被真实pilot supersede，目标合同待实现/Review；真实T0未通过
 
 ## 1. 范围
 
@@ -31,7 +31,13 @@ parta_canonical_v1
         ↓
 validate_records()  [fail closed]
         ↓
-GUIDE deterministic 16–32 raw MP4 frame IDs
+ADT: trajectory ∩ calibration ∩ required direct-GT temporal support
+        ↓
+maximal contiguous GT-supported raw-frame training clip
+        ↓
+GUIDE deterministic 16–32 positions inside clip
+        ↓
+map to original MP4 raw frame IDs
         ↓
 exact keys + indices + actual-visible object union + binding SHA256
         ↓
@@ -43,9 +49,15 @@ Hypersim为identity。对象ID必须为`source:scene:raw_object_id`；类别进�
 vocabulary，源类别被保留用于审计。缺失能力写`null`并关闭对应field/capability mask，禁止以0
 伪装GT。
 
-exact-frame链直接使用GUIDE采样器返回的raw MP4 frame IDs。每个ID必须存在对应canonical
-frame state，frame key/index必须逐位置一致。对象target集合只能是这些实际输入帧中有效可见对象
-的并集。缺frame、坏引用、mask/value矛盾或固定fixture缺失均硬失败。
+ADT exact-frame链按D-59先求共同GT支持的最大连续clip，再使用GUIDE采样器并映射回原MP4 raw
+IDs。每个ID必须存在对应canonical frame state，frame key/index必须逐位置一致。对象target集合
+只能是这些实际输入帧中有效可见对象的并集。禁止邻帧替代、外推或伪标签；clip内选中ID仍不
+满足冻结阈值即整景失败。provenance保存whole-video total/FPS、clip首尾raw ID/device timestamp、
+支持能力、采样参数、mapped IDs与hash；A0/A1-O共享全部字段。
+
+现有`guide_exact_raw_mp4_v1`直接在whole MP4上取帧的实现已被真实pilot supersede：固定ADT
+场景的32个采样帧中有6个落在trajectory span之外。该实现不得用于正式ADT manifest；目标
+`guide_exact_over_gt_supported_clip_v1`尚未实现或Review，必须先完成183景coverage audit。
 
 ## 3. 模型架构
 
@@ -116,10 +128,11 @@ running与complete状态不可覆盖；失败run不得标为完成。
 
 ## 7. 已验证与未验证
 
-已验证：两个独立ReviewAgent在修复闭环后均`REVIEW PASS`；synthetic/CPU测试覆盖schema反例、
-GUIDE exact raw-ID hard fail、Hungarian置换/empty/all-masked、finite/backward、visual tap、
+已验证：除D-59新增采样目标外，两个独立ReviewAgent在修复闭环后均`REVIEW PASS`；
+synthetic/CPU测试覆盖schema反例、旧GUIDE whole-MP4 raw-ID hard fail、Hungarian置换/
+empty/all-masked、finite/backward、visual tap、
 head-key过滤、T0数值合同和provenance；合计24项通过，`py_compile`及`git diff --check`通过。
 
-未验证：真实GUIDE raw-ID frame-state生成、真实pose/投影QC、五个固定fixture上的真实Qwen
-T0-A、真实head-free logits等价、ADT+Hypersim及最终四源T0-B。不得将synthetic测试描述为
-真实T0 PASS。
+未验证：183景coverage、D-59 sampler实现/Review、真实GUIDE mapped raw-ID frame-state生成、
+真实pose/投影QC、五个固定fixture上的真实Qwen T0-A、真实head-free logits等价、
+ADT+Hypersim及最终四源T0-B。不得将synthetic测试或whole-MP4 pilot失败描述为真实T0 PASS。
