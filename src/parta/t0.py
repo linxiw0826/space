@@ -39,6 +39,7 @@ T0_A_REQUIRED_CHECKS = frozenset(
         "empty_gt",
         "all_masked_no_object",
         "finite",
+        "qa_supervision_and_e01_trainability",
         "component_shared_gradients",
         "question_invariance",
         "save_resume_equivalence",
