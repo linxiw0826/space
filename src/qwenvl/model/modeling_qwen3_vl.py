@@ -568,6 +568,10 @@ class Qwen3VLModelOutputWithPast(ModelOutput):
     hidden_states: Optional[tuple[torch.FloatTensor]] = None
     attentions: Optional[tuple[torch.FloatTensor]] = None
     rope_deltas: Optional[torch.LongTensor] = None
+    # MODIFIED: Part A A1-O exposes the authoritative multimodal scatter mask
+    # so a training-only side branch can read final visual-prefix hidden states.
+    # It is metadata only and does not alter the QA hidden sequence.
+    visual_pos_masks: Optional[torch.BoolTensor] = None
 
 
 @auto_docstring
@@ -1917,6 +1921,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             last_hidden_state=outputs.last_hidden_state,
             past_key_values=outputs.past_key_values,
             rope_deltas=self.rope_deltas,
+            visual_pos_masks=visual_pos_masks,
         )
 
 
@@ -1947,6 +1952,10 @@ class Qwen3VLCausalLMOutputWithPast(ModelOutput):
     hidden_states: Optional[tuple[torch.FloatTensor]] = None
     attentions: Optional[tuple[torch.FloatTensor]] = None
     rope_deltas: Optional[torch.LongTensor] = None
+    # MODIFIED: populated only when return_visual_state_tap=True. These tensors
+    # are a read-only side output and never re-enter the QA forward path.
+    visual_state_hidden: Optional[torch.FloatTensor] = None
+    visual_state_valid_mask: Optional[torch.BoolTensor] = None
 
 
 class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
@@ -2023,6 +2032,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         geometry_encoder_inputs: Optional[torch.Tensor] = None,
+        return_visual_state_tap: bool = False,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Union[tuple, Qwen3VLCausalLMOutputWithPast]:
         r"""
@@ -2063,11 +2073,35 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size)
 
+        visual_state_hidden = None
+        visual_state_valid_mask = None
+        if return_visual_state_tap:
+            visual_mask = outputs.visual_pos_masks
+            if visual_mask is None:
+                raise ValueError("return_visual_state_tap=True requires visual inputs")
+            counts = visual_mask.sum(dim=1)
+            max_count = int(counts.max().item())
+            visual_state_hidden = hidden_states.new_zeros(
+                hidden_states.shape[0], max_count, hidden_states.shape[-1]
+            )
+            visual_state_valid_mask = torch.zeros(
+                hidden_states.shape[0],
+                max_count,
+                dtype=torch.bool,
+                device=hidden_states.device,
+            )
+            for batch_index in range(hidden_states.shape[0]):
+                sample = hidden_states[batch_index, visual_mask[batch_index]]
+                visual_state_hidden[batch_index, : sample.shape[0]] = sample
+                visual_state_valid_mask[batch_index, : sample.shape[0]] = True
+
         return Qwen3VLCausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             rope_deltas=outputs.rope_deltas,
+            visual_state_hidden=visual_state_hidden,
+            visual_state_valid_mask=visual_state_valid_mask,
         )
 
     def prepare_inputs_for_generation(

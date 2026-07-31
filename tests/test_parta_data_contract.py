@@ -1,0 +1,342 @@
+import copy
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from src.parta_data_contract import (
+    ContractError,
+    T0_FIXTURES,
+    adapt_frame,
+    adapt_qa,
+    adapt_scene,
+    build_manifest_rows,
+    canonical_category,
+    guide_frame_indices,
+    validate_records,
+)
+
+
+def raw_records(scene_id="Apartment_release_clean_seq131_M1292"):
+    scene = {
+        "schema_version": "adt_scene_state_v1",
+        "scene_id": scene_id,
+        "nodes": [{
+            "object_id": "7",
+            "category": "chair",
+            "center_world_m": [1.0, 2.0, 3.0],
+            "extent_m": [0.5, 0.6, 0.7],
+            "rotation_world_from_object": None,
+            "motion_type": "static",
+        }],
+    }
+    frames = []
+    for index in range(16):
+        frames.append({
+            "schema_version": "adt_frame_state_v1",
+            "scene_id": scene_id,
+            "frame_key": f"{scene_id}/{index}",
+            "frame_index": index,
+            "vsi_media": "adt/a.mp4",
+            "rotation_world_from_camera": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+            "translation_world_from_camera_m": [0, 0, 0],
+            "visible_nodes": [{
+                "object_id": "7",
+                "center_camera_m": [1, 2, 3],
+                "camera_distance_m": 4,
+            }],
+        })
+    qa = {
+        "schema_version": "adt_qa_train_v1",
+        "vsi_row_index": 9,
+        "scene_id": scene_id,
+        "candidate_frame_keys": [row["frame_key"] for row in frames],
+        "candidate_frame_indices": list(range(16)),
+        "vsi_media": "adt/a.mp4",
+        "question_type": "relative_direction_object",
+        "conversations": [],
+        "loss_masks": {"scene_geometry": True},
+    }
+    return scene, frames, qa
+
+
+def canonical():
+    raw_scene, raw_frames, raw_qa = raw_records()
+    scene = adapt_scene("adt", raw_scene)
+    frames = [adapt_frame("adt", row) for row in raw_frames]
+    qa = adapt_qa("adt", raw_qa)
+    lookup = {("adt", row["frame_key"]): row for row in frames}
+    manifest = list(build_manifest_rows([qa], lookup))
+    return [scene], frames, manifest
+
+
+def test_valid_contract_null_and_mask():
+    scenes, frames, qa = canonical()
+    node = scenes[0]["nodes"][0]
+    assert node["rotation_world_from_object"] is None
+    assert node["field_mask"]["orientation"] is False
+    assert validate_records(scenes, frames, qa).qa == 1
+
+
+def test_reference_error_fails():
+    scenes, frames, qa = canonical()
+    qa[0]["actual_frame_keys"][0] = "missing"
+    with pytest.raises(ContractError, match="missing frame"):
+        validate_records(scenes, frames, qa)
+
+
+def test_declared_visible_set_must_match_actual_frames():
+    scenes, frames, qa = canonical()
+    qa[0]["actual_visible_object_ids"] = ["adt:not-seven"]
+    with pytest.raises(ContractError, match="visible GT mismatch"):
+        validate_records(scenes, frames, qa)
+
+
+def test_unseen_gt_requires_explicit_empty_gt():
+    scenes, frames, qa = canonical()
+    for frame in frames:
+        frame["visible_nodes"] = []
+    qa[0]["empty_gt"] = False
+    with pytest.raises(ContractError, match="No actual-input-visible"):
+        validate_records(scenes, frames, qa)
+
+
+def test_bad_video_frame_count_fails():
+    scenes, frames, qa = canonical()
+    qa[0]["actual_frame_keys"] = qa[0]["actual_frame_keys"][:8]
+    qa[0]["actual_frame_indices"] = qa[0]["actual_frame_indices"][:8]
+    with pytest.raises(ContractError, match="16-32"):
+        validate_records(scenes, frames, qa)
+
+
+def test_fixed_fixture_missing_fails():
+    scenes, frames, qa = canonical()
+    assert len(T0_FIXTURES["adt"]) == 3
+    with pytest.raises(ContractError, match="Missing fixed T0"):
+        validate_records(scenes, frames, qa, require_fixtures=True)
+
+
+def test_sampling_is_deterministic_and_bounded():
+    first = guide_frame_indices(900, 30.0)
+    second = guide_frame_indices(900, 30.0)
+    assert first == second
+    assert len(first) == 30
+    assert first[0] == 0 and first[-1] == 899
+
+
+def test_mask_value_mismatch_fails():
+    scenes, frames, qa = canonical()
+    broken = copy.deepcopy(scenes)
+    broken[0]["nodes"][0]["field_mask"]["center"] = False
+    with pytest.raises(ContractError, match="Mask/value mismatch"):
+        validate_records(broken, frames, qa)
+
+
+def test_object_ids_are_namespaced_by_scene():
+    scene_a, _, _ = raw_records("scene_a")
+    scene_b, _, _ = raw_records("scene_b")
+    a = adapt_scene("adt", scene_a)["nodes"][0]["object_id"]
+    b = adapt_scene("adt", scene_b)["nodes"][0]["object_id"]
+    assert a == "adt:scene_a:7"
+    assert b == "adt:scene_b:7"
+    assert a != b
+
+
+def test_exact_key_index_mismatch_fails():
+    scenes, frames, qa = canonical()
+    qa[0]["actual_frame_indices"][3] = 999
+    with pytest.raises(ContractError, match="key/index mismatch"):
+        validate_records(scenes, frames, qa)
+
+
+def test_hypersim_geometry_invalid_is_not_supervision():
+    scene = adapt_scene("hypersim", {
+        "schema_version": "hypersim_scene_state_v1",
+        "scene_id": "ai_001_001",
+        "nodes": [{
+            "object_id": 1,
+            "object_name": "chair",
+            "bbox_center_m": [1, 2, 3],
+            "bbox_extent_m": [1, 1, 1],
+            "bbox_orientation_raw": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+        }],
+    })
+    frame = adapt_frame("hypersim", {
+        "schema_version": "hypersim_frame_state_v1",
+        "scene_id": "ai_001_001",
+        "frame_key": "ai_001_001/cam_00/0001",
+        "frame_id": 1,
+        "vsi_media": "hypersim/a.png",
+        "rotation_world_from_camera": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+        "translation_world_from_camera_m": [0, 0, 0],
+        "visible_nodes": [{
+            "object_id": 1,
+            "pixel_count": 100,
+            "geometry_valid": False,
+            "center_camera_m": [1, 2, 3],
+            "camera_distance_m": 4,
+        }],
+    })
+    qa = adapt_qa("hypersim", {
+        "schema_version": "hypersim_qa_train_v1",
+        "vsi_row_index": 1,
+        "scene_id": "ai_001_001",
+        "frame_key": frame["frame_key"],
+        "frame_index": 1,
+        "vsi_media": "hypersim/a.png",
+        "question_type": "x",
+        "conversations": [],
+        "loss_masks": {"scene_geometry": True},
+    })
+    lookup = {("hypersim", frame["frame_key"]): frame}
+    manifest = list(build_manifest_rows([qa], lookup))
+    assert frame["visible_nodes"][0]["visible"] is False
+    assert frame["visible_nodes"][0]["field_mask"]["visibility"] is False
+    assert manifest[0]["actual_visible_object_ids"] == []
+    assert manifest[0]["empty_gt"] is True
+    validate_records([scene], [frame], manifest)
+
+
+def test_coordinate_transform_and_fixed_category_policy():
+    scene, _, _ = raw_records()
+    scene["nodes"][0]["center_world_m"] = [1, 2, 3]
+    scene["nodes"][0]["velocity_world_mps"] = [0, 1, 0]
+    adapted = adapt_scene("adt", scene)
+    assert adapted["coordinate_frame"].endswith("xright_yup_zback_m_v1")
+    assert adapted["nodes"][0]["center_world_m"] == [1.0, 3.0, -2.0]
+    assert adapted["nodes"][0]["velocity_world_mps"] == [0.0, 0.0, -1.0]
+    assert canonical_category("couch")[0] == "sofa"
+    assert canonical_category("unreleased-custom-prototype")[0] == "__unknown__"
+    hypersim = copy.deepcopy(scene)
+    hypersim["schema_version"] = "hypersim_scene_state_v1"
+    assert adapt_scene("hypersim", hypersim)["nodes"][0][
+        "velocity_world_mps"
+    ] == [0.0, 1.0, 0.0]
+
+
+def test_expected_sources_are_hard_required():
+    scenes, frames, qa = canonical()
+    with pytest.raises(ContractError, match="Missing expected sources"):
+        validate_records(
+            scenes,
+            frames,
+            qa,
+            expected_sources=["adt", "hypersim"],
+        )
+
+
+def _write_jsonl(path: Path, rows):
+    path.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+
+
+def test_canonical_and_exact_manifest_cli_e2e(tmp_path):
+    raw_scene, raw_frames, raw_qa = raw_records()
+    exact_indices = guide_frame_indices(480, 30)
+    raw_frames = [
+        {
+            **raw_frames[position],
+            "frame_key": f"{raw_scene['scene_id']}/{raw_index}",
+            "frame_index": raw_index,
+        }
+        for position, raw_index in enumerate(exact_indices)
+    ]
+    raw_qa["candidate_frame_keys"] = [
+        row["frame_key"] for row in raw_frames
+    ]
+    raw_qa["candidate_frame_indices"] = exact_indices
+    source_dir = tmp_path / "source"
+    canonical_dir = tmp_path / "canonical"
+    source_dir.mkdir()
+    _write_jsonl(source_dir / "adt_scene_states.jsonl", [raw_scene])
+    _write_jsonl(source_dir / "adt_frame_states.jsonl", raw_frames)
+    _write_jsonl(source_dir / "adt_qa_train.jsonl", [raw_qa])
+    project = Path(__file__).resolve().parents[1]
+    subprocess.run(
+        [
+            sys.executable,
+            str(project / "scripts/preprocess/build_parta_canonical_data.py"),
+            "--source", "adt",
+            "--input-dir", str(source_dir),
+            "--output-dir", str(canonical_dir),
+            "--expected-source", "adt",
+        ],
+        check=True,
+    )
+    metadata = tmp_path / "metadata.jsonl"
+    _write_jsonl(metadata, [{
+        "source_dataset": "adt",
+        "scene_id": raw_scene["scene_id"],
+        "vsi_media": "adt/a.mp4",
+        "total_frames": 480,
+        "fps": 30,
+    }])
+    output = tmp_path / "exact.jsonl"
+    report = tmp_path / "exact_report.json"
+    subprocess.run(
+        [
+            sys.executable,
+            str(project / "scripts/preprocess/build_parta_exact_frame_manifest.py"),
+            "--scenes", str(canonical_dir / "scene_states.jsonl"),
+            "--frames", str(canonical_dir / "frame_states.jsonl"),
+            "--qa", str(canonical_dir / "qa_manifest.jsonl"),
+            "--video-metadata", str(metadata),
+            "--output", str(output),
+            "--report-output", str(report),
+            "--expected-source", "adt",
+        ],
+        check=True,
+    )
+    row = json.loads(output.read_text().splitlines()[0])
+    assert len(row["actual_frame_keys"]) == 16
+    assert row["actual_frame_indices"] == exact_indices
+    assert len(row["frame_binding_sha256"]) == 64
+    assert json.loads(report.read_text())["qa"] == 1
+
+
+def test_exact_manifest_cli_missing_raw_frame_state_fails(tmp_path):
+    raw_scene, raw_frames, raw_qa = raw_records()
+    source_dir = tmp_path / "source"
+    canonical_dir = tmp_path / "canonical"
+    source_dir.mkdir()
+    _write_jsonl(source_dir / "adt_scene_states.jsonl", [raw_scene])
+    _write_jsonl(source_dir / "adt_frame_states.jsonl", raw_frames)
+    _write_jsonl(source_dir / "adt_qa_train.jsonl", [raw_qa])
+    project = Path(__file__).resolve().parents[1]
+    subprocess.run(
+        [
+            sys.executable,
+            str(project / "scripts/preprocess/build_parta_canonical_data.py"),
+            "--source", "adt",
+            "--input-dir", str(source_dir),
+            "--output-dir", str(canonical_dir),
+        ],
+        check=True,
+    )
+    metadata = tmp_path / "metadata.jsonl"
+    _write_jsonl(metadata, [{
+        "source_dataset": "adt",
+        "scene_id": raw_scene["scene_id"],
+        "vsi_media": "adt/a.mp4",
+        "total_frames": 480,
+        "fps": 30,
+    }])
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(project / "scripts/preprocess/build_parta_exact_frame_manifest.py"),
+            "--scenes", str(canonical_dir / "scene_states.jsonl"),
+            "--frames", str(canonical_dir / "frame_states.jsonl"),
+            "--qa", str(canonical_dir / "qa_manifest.jsonl"),
+            "--video-metadata", str(metadata),
+            "--output", str(tmp_path / "exact.jsonl"),
+            "--report-output", str(tmp_path / "report.json"),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "do not cover exact GUIDE raw frame" in result.stderr
