@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import subprocess
 import sys
@@ -22,6 +23,19 @@ from src.parta_data_contract import (  # noqa: E402
     validate_records,
     write_jsonl,
 )
+from src.adt_gt_supported_clip import (  # noqa: E402
+    GT_SUPPORTED_CLIP_POLICY,
+    select_maximal_run,
+    validate_support_certificate,
+)
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def video_metadata(video_path: Path) -> tuple[int, float]:
@@ -63,6 +77,38 @@ def main() -> None:
     scenes = list(read_jsonl(args.scenes))
     frames = list(read_jsonl(args.frames))
     qa_rows = list(read_jsonl(args.qa))
+    has_adt_video = any(
+        row.get("source_dataset") == "adt"
+        and row.get("media_kind") != "image"
+        for row in qa_rows
+    )
+    certificates = {}
+    if has_adt_video:
+        canonical_report_path = args.scenes.parent / "validation_report.json"
+        if not canonical_report_path.is_file():
+            raise ContractError(
+                "ADT exact build requires canonical sibling validation_report.json"
+            )
+        canonical_report = json.loads(canonical_report_path.read_text())
+        registry = canonical_report.get(
+            "trusted_support_certificate_registry"
+        )
+        if not isinstance(registry, dict):
+            raise ContractError(
+                "Canonical report lacks trusted support-certificate anchor"
+            )
+        certificate_path = args.scenes.parent / registry["path"]
+        actual_digest = file_sha256(certificate_path)
+        if actual_digest != registry["sha256"]:
+            raise ContractError(
+                "Canonical support-certificate anchor SHA256 mismatch"
+            )
+        for certificate in read_jsonl(certificate_path):
+            key = (certificate["scene_id"], certificate["vsi_media"])
+            if key in certificates:
+                raise ContractError(f"Duplicate external support certificate: {key}")
+            validate_support_certificate(certificate)
+            certificates[key] = certificate
     frame_lookup = {
         (row["source_dataset"], row["frame_key"]): row for row in frames
     }
@@ -96,13 +142,30 @@ def main() -> None:
                 f"Missing video metadata for {meta_key}; provide "
                 "--video-metadata or --video-root"
             )
-        guide_indices = guide_frame_indices(
-            total_frames,
+        provenance = qa["clip_provenance"]
+        embedded_certificate = provenance["support_certificate"]
+        certificate_key = (qa["scene_id"], qa["vsi_media"])
+        external_certificate = certificates.get(certificate_key)
+        if external_certificate != embedded_certificate:
+            raise ContractError(
+                f"External support certificate mismatch: {certificate_key}"
+            )
+        _, certified_runs = validate_support_certificate(external_certificate)
+        certified_clip = select_maximal_run(certified_runs)
+        clip_start = int(provenance["clip_start_raw_frame"])
+        clip_end = int(provenance["clip_end_raw_frame"])
+        if certified_clip != (clip_start, clip_end):
+            raise ContractError(
+                f"D-59 clip is not externally certified maximal: {qa['qa_id']}"
+            )
+        local_indices = guide_frame_indices(
+            clip_end - clip_start + 1,
             fps,
             base_interval=args.base_interval,
             min_frames=args.min_frames,
             max_frames=args.max_frames,
         )
+        guide_indices = [clip_start + index for index in local_indices]
         missing = [
             index for index in guide_indices if index not in candidate_frames
         ]
@@ -112,7 +175,7 @@ def main() -> None:
                 f"IDs for {qa['qa_id']}; missing={missing}"
             )
         source_policy = qa["sampling_policy"]
-        if source_policy != GUIDE_EXACT_SAMPLING_POLICY:
+        if source_policy != GT_SUPPORTED_CLIP_POLICY:
             raise ContractError("Unreachable non-GUIDE sampling policy")
         declared_total = qa.get("video_total_frames")
         declared_fps = qa.get("video_fps")
@@ -150,6 +213,32 @@ def main() -> None:
                 f"guide={guide_indices}"
             )
         selected = [candidate_frames[index] for index in guide_indices]
+        source_timestamps = [
+            int(value)
+            for value in provenance["selected_device_timestamps_ns"]
+        ]
+        frame_timestamps = [
+            int(frame["device_timestamp_ns"]) for frame in selected
+        ]
+        if source_timestamps != frame_timestamps:
+            raise ContractError(
+                f"D-59 selected timestamp provenance mismatch: {qa['qa_id']}"
+            )
+        for frame in selected:
+            trajectory_error = frame.get("trajectory_timestamp_error_ns")
+            calibration_error = frame.get("calibration_timestamp_error_ns")
+            if (
+                trajectory_error is None
+                or int(trajectory_error)
+                > int(provenance["max_trajectory_error_ns"])
+                or calibration_error is None
+                or int(calibration_error)
+                > int(provenance["max_calibration_error_ns"])
+            ):
+                raise ContractError(
+                    "D-59 selected frame violates frozen temporal support: "
+                    f"{frame['frame_key']}"
+                )
         if list(qa["actual_frame_keys"]) != [
             frame["frame_key"] for frame in selected
         ]:
@@ -161,7 +250,7 @@ def main() -> None:
         row["actual_frame_indices"] = [
             frame["frame_index"] for frame in selected
         ]
-        row["sampling_policy"] = "guide_exact_raw_mp4_v1"
+        row["sampling_policy"] = GUIDE_EXACT_SAMPLING_POLICY
         row["video_total_frames"] = total_frames
         row["video_fps"] = fps
         rebound.append(row)

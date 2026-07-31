@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import importlib.util
 import json
 import subprocess
@@ -7,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from src.adt_gt_supported_clip import build_support_certificate
 from src.parta_data_contract import (
     ContractError,
     GUIDE_EXACT_SAMPLING_POLICY,
@@ -55,11 +57,15 @@ def raw_records(scene_id="Apartment_release_clean_seq131_M1292"):
             "scene_id": scene_id,
             "frame_key": f"{scene_id}/{index}",
             "frame_index": index,
+            "device_timestamp_ns": index * 1_000_000_000,
+            "trajectory_timestamp_error_ns": 0,
+            "calibration_timestamp_error_ns": 0,
             "vsi_media": "adt/a.mp4",
             "rotation_world_from_camera": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
             "translation_world_from_camera_m": [0, 0, 0],
             "visible_nodes": [{
                 "object_id": "7",
+                "object_geometry_valid": True,
                 "center_camera_m": [1, 2, 3],
                 "camera_distance_m": 4,
             }],
@@ -80,7 +86,48 @@ def raw_records(scene_id="Apartment_release_clean_seq131_M1292"):
         "base_interval": 1.0,
         "min_frames": 16,
         "max_frames": 32,
+        "clip_provenance": {
+            "whole_video_total_frames": 16,
+            "whole_video_fps_hex": float(1.0).hex(),
+            "clip_start_raw_frame": 0,
+            "clip_end_raw_frame": 15,
+            "clip_start_device_timestamp_ns": 0,
+            "clip_end_device_timestamp_ns": 15_000_000_000,
+            "support_runs": [{
+                "start_raw_frame": 0,
+                "end_raw_frame": 15,
+                "frame_count": 16,
+                "start_device_timestamp_ns": 0,
+                "end_device_timestamp_ns": 15_000_000_000,
+            }],
+            "tie_policy": "longest_run_then_earliest_start_v1",
+            "hard_support_fields": ["trajectory", "calibration"],
+            "max_trajectory_error_ns": 5_000_000,
+            "max_calibration_error_ns": 50_000_000,
+            "local_frame_indices": list(range(16)),
+            "selected_device_timestamps_ns": [
+                index * 1_000_000_000 for index in range(16)
+            ],
+        },
     }
+    qa["clip_provenance"]["whole_video_start_device_timestamp_ns"] = 0
+    qa["clip_provenance"]["whole_video_end_device_timestamp_ns"] = (
+        15_000_000_000
+    )
+    qa["clip_provenance"]["clip_frame_count"] = 16
+    qa["clip_provenance"]["support_certificate"] = (
+        build_support_certificate(
+            scene_id=scene_id,
+            vsi_media="adt/a.mp4",
+            frame_timestamps=[
+                index * 1_000_000_000 for index in range(16)
+            ],
+            fps=1.0,
+            support_mask=[True] * 16,
+            max_trajectory_error_ns=5_000_000,
+            max_calibration_error_ns=50_000_000,
+        )
+    )
     qa["sampling_binding_sha256"] = guide_sampling_binding_sha256(
         source_dataset="adt",
         scene_id=scene_id,
@@ -93,6 +140,7 @@ def raw_records(scene_id="Apartment_release_clean_seq131_M1292"):
         min_frames=qa["min_frames"],
         max_frames=qa["max_frames"],
         sampling_policy=qa["sampling_policy"],
+        clip_provenance=qa["clip_provenance"],
     )
     return scene, frames, qa
 
@@ -121,6 +169,7 @@ def rehash_canonical_qa(row):
             min_frames=row["sampling_min_frames"],
             max_frames=row["sampling_max_frames"],
             sampling_policy=row["sampling_policy"],
+            clip_provenance=row["clip_provenance"],
         )
     )
     row["frame_binding_sha256"] = frame_binding_sha256(row)
@@ -270,6 +319,41 @@ def test_rehashed_non_guide_binding_still_fails():
     )
     rehash_canonical_qa(qa[0])
     with pytest.raises(ContractError, match="non-GUIDE raw frame IDs"):
+        validate_records(scenes, frames, qa)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "match"),
+    [
+        (
+                lambda p: p.__setitem__("clip_start_raw_frame", 1),
+                "frame count|too short|tie policy|clip-local",
+        ),
+        (
+            lambda p: p.__setitem__(
+                "clip_start_device_timestamp_ns", 123
+            ),
+            "timestamp/run mismatch",
+        ),
+        (
+            lambda p: p["support_runs"][0].__setitem__("frame_count", 15),
+            "support-run frame count",
+        ),
+        (
+            lambda p: p.__setitem__("max_trajectory_error_ns", 5_000_001),
+                "certificate/provenance mismatch|thresholds differ",
+        ),
+        (
+            lambda p: p["local_frame_indices"].__setitem__(1, 2),
+            "clip-local GUIDE positions",
+        ),
+    ],
+)
+def test_rehashed_d59_clip_provenance_tampering_fails(mutation, match):
+    scenes, frames, qa = canonical()
+    mutation(qa[0]["clip_provenance"])
+    rehash_canonical_qa(qa[0])
+    with pytest.raises(ContractError, match=match):
         validate_records(scenes, frames, qa)
 
 
@@ -443,6 +527,70 @@ def _write_jsonl(path: Path, rows):
     )
 
 
+def _write_adt_anchor(source_dir: Path, certificate):
+    certificate_path = source_dir / "adt_support_certificates.jsonl"
+    _write_jsonl(certificate_path, [certificate])
+    digest = hashlib.sha256(certificate_path.read_bytes()).hexdigest()
+    (source_dir / "adt_alignment_report.json").write_text(json.dumps({
+        "support_certificate_registry": {
+            "path": certificate_path.name,
+            "sha256": digest,
+            "trust_stage": "finalizer_output_v1",
+        }
+    }))
+
+
+def test_atomic_archive_failure_leaves_no_formal_product(tmp_path, monkeypatch):
+    output = tmp_path / "formal.tar.gz"
+    output.write_bytes(b"stale")
+    source = tmp_path / "source.jsonl"
+    source.write_text("{}\n")
+
+    def fail_open(*args, **kwargs):
+        raise RuntimeError("injected tar failure")
+
+    monkeypatch.setattr(FINALIZER.tarfile, "open", fail_open)
+    with pytest.raises(RuntimeError, match="injected"):
+        FINALIZER.write_archive_atomic(output, [source])
+    assert not output.exists()
+    assert not list(tmp_path.glob(f".{output.name}.*.tmp"))
+
+
+def test_dynamic_object_pose_gap_masks_geometry_but_static_does_not():
+    dynamic = {"motion_type": "dynamic"}
+    static = {"motion_type": "static"}
+    assert not FINALIZER.object_geometry_is_valid(dynamic, 5_000_001, 5_000_000)
+    assert FINALIZER.object_geometry_is_valid(dynamic, 5_000_000, 5_000_000)
+    assert FINALIZER.object_geometry_is_valid(static, 999_000_000, 5_000_000)
+
+
+def test_dynamic_scene_node_pose_gap_keeps_identity_but_masks_geometry():
+    raw = {
+        "schema_version": "adt_scene_state_v1",
+        "scene_id": "dynamic_scene",
+        "nodes": [{
+            "object_id": "tracked-7",
+            "category": "chair",
+            "motion_type": "dynamic",
+            "geometry_valid": False,
+            "reference_pose_timestamp_error_ns": 5_000_001,
+            "center_world_m": None,
+            "extent_m": None,
+            "rotation_world_from_object": None,
+        }],
+    }
+    scene = adapt_scene("adt", raw)
+    node = scene["nodes"][0]
+    assert node["source_object_id"] == "tracked-7"
+    assert node["object_id"].endswith("tracked-7")
+    assert node["center_world_m"] is None
+    assert node["extent_m"] is None
+    assert node["rotation_world_from_object"] is None
+    assert node["field_mask"]["center"] is False
+    assert node["field_mask"]["extent"] is False
+    assert node["field_mask"]["orientation"] is False
+
+
 def test_canonical_and_exact_manifest_cli_e2e(tmp_path):
     raw_scene, raw_frames, raw_qa = raw_records()
     exact_indices = guide_frame_indices(480, 30)
@@ -451,6 +599,7 @@ def test_canonical_and_exact_manifest_cli_e2e(tmp_path):
             **raw_frames[position],
             "frame_key": f"{raw_scene['scene_id']}/{raw_index}",
             "frame_index": raw_index,
+            "device_timestamp_ns": raw_index * 1_000_000,
         }
         for position, raw_index in enumerate(exact_indices)
     ]
@@ -460,6 +609,38 @@ def test_canonical_and_exact_manifest_cli_e2e(tmp_path):
     raw_qa["candidate_frame_indices"] = exact_indices
     raw_qa["total_frames"] = 480
     raw_qa["fps"] = 30.0
+    raw_qa["clip_provenance"] = {
+        **raw_qa["clip_provenance"],
+        "whole_video_total_frames": 480,
+        "whole_video_fps_hex": float(30.0).hex(),
+        "whole_video_end_device_timestamp_ns": 479_000_000,
+        "clip_start_raw_frame": 0,
+        "clip_end_raw_frame": 479,
+        "clip_end_device_timestamp_ns": 479_000_000,
+        "clip_frame_count": 480,
+        "support_runs": [{
+            "start_raw_frame": 0,
+            "end_raw_frame": 479,
+            "frame_count": 480,
+            "start_device_timestamp_ns": 0,
+            "end_device_timestamp_ns": 479_000_000,
+        }],
+        "local_frame_indices": exact_indices,
+        "selected_device_timestamps_ns": [
+            index * 1_000_000 for index in exact_indices
+        ],
+        "support_certificate": build_support_certificate(
+            scene_id=raw_scene["scene_id"],
+            vsi_media=raw_qa["vsi_media"],
+            frame_timestamps=[
+                index * 1_000_000 for index in range(480)
+            ],
+            fps=30.0,
+            support_mask=[True] * 480,
+            max_trajectory_error_ns=5_000_000,
+            max_calibration_error_ns=50_000_000,
+        ),
+    }
     raw_qa["sampling_binding_sha256"] = guide_sampling_binding_sha256(
         source_dataset="adt",
         scene_id=raw_qa["scene_id"],
@@ -472,6 +653,7 @@ def test_canonical_and_exact_manifest_cli_e2e(tmp_path):
         min_frames=raw_qa["min_frames"],
         max_frames=raw_qa["max_frames"],
         sampling_policy=raw_qa["sampling_policy"],
+        clip_provenance=raw_qa["clip_provenance"],
     )
     source_dir = tmp_path / "source"
     canonical_dir = tmp_path / "canonical"
@@ -479,6 +661,9 @@ def test_canonical_and_exact_manifest_cli_e2e(tmp_path):
     _write_jsonl(source_dir / "adt_scene_states.jsonl", [raw_scene])
     _write_jsonl(source_dir / "adt_frame_states.jsonl", raw_frames)
     _write_jsonl(source_dir / "adt_qa_train.jsonl", [raw_qa])
+    _write_adt_anchor(
+        source_dir, raw_qa["clip_provenance"]["support_certificate"]
+    )
     project = Path(__file__).resolve().parents[1]
     subprocess.run(
         [
@@ -539,16 +724,71 @@ def test_canonical_and_exact_manifest_cli_e2e(tmp_path):
     )
     assert second_output.read_bytes() == output.read_bytes()
 
+    # Attack: rewrite the support bitset, all row/certificate hashes, and try
+    # to supply the attacker's matching digest at invocation. The trusted
+    # digest is anchored in canonical validation_report.json; exact has no
+    # caller-controlled digest option, so this must fail closed.
+    anchored_certificate = canonical_dir / "adt_support_certificates.jsonl"
+    attacked_certificate = copy.deepcopy(
+        raw_qa["clip_provenance"]["support_certificate"]
+    )
+    attacked_certificate["support_mask_bitset_hex"] = (
+        "fe" + attacked_certificate["support_mask_bitset_hex"][2:]
+    )
+    from src.adt_gt_supported_clip import support_certificate_sha256
+    attacked_certificate["certificate_sha256"] = (
+        support_certificate_sha256(attacked_certificate)
+    )
+    _write_jsonl(anchored_certificate, [attacked_certificate])
+    attacked_row = copy.deepcopy(row)
+    attacked_row["clip_provenance"]["support_certificate"] = (
+        attacked_certificate
+    )
+    rehash_canonical_qa(attacked_row)
+    attacked_qa = tmp_path / "attacked_qa.jsonl"
+    _write_jsonl(attacked_qa, [attacked_row])
+    attacker_digest = hashlib.sha256(
+        anchored_certificate.read_bytes()
+    ).hexdigest()
+    attack_result = subprocess.run(
+        [
+            sys.executable,
+            str(project / "scripts/preprocess/build_parta_exact_frame_manifest.py"),
+            "--scenes", str(canonical_dir / "scene_states.jsonl"),
+            "--frames", str(canonical_dir / "frame_states.jsonl"),
+            "--qa", str(attacked_qa),
+            "--video-metadata", str(metadata),
+            "--output", str(tmp_path / "attacked_out.jsonl"),
+            "--report-output", str(tmp_path / "attacked_report.json"),
+            "--support-certificates-sha256", attacker_digest,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert attack_result.returncode != 0
+    assert (
+        "unrecognized arguments" in attack_result.stderr
+        or "anchor SHA256 mismatch" in attack_result.stderr
+    )
+    # Restore the trusted certificate for the remaining tamper checks.
+    _write_jsonl(
+        anchored_certificate,
+        [raw_qa["clip_provenance"]["support_certificate"]],
+    )
+
     for field, value, expected_errors in [
         (
-            "video_total_frames",
-            481,
-            ("non-GUIDE raw frame IDs", "total-frame provenance mismatch"),
+                "video_total_frames",
+                481,
+                (
+                    "D-59 whole-video total-frame mismatch",
+                    "total-frame provenance mismatch",
+                ),
         ),
         (
-            "video_fps",
-            29.0,
-            ("non-GUIDE raw frame IDs", "FPS provenance mismatch"),
+                "video_fps",
+                29.0,
+                ("D-59 whole-video FPS mismatch", "FPS provenance mismatch"),
         ),
         ("sampling_base_interval", 2.0, ("base_interval mismatch",)),
         ("sampling_min_frames", 15, ("min_frames mismatch",)),
@@ -613,14 +853,71 @@ def test_canonical_and_exact_manifest_cli_e2e(tmp_path):
 
 def test_exact_manifest_cli_missing_raw_frame_state_fails(tmp_path):
     raw_scene, raw_frames, raw_qa = raw_records()
+    raw_qa["total_frames"] = 480
+    raw_qa["fps"] = 30.0
+    raw_qa["clip_provenance"] = {
+        **raw_qa["clip_provenance"],
+        "whole_video_total_frames": 480,
+        "whole_video_fps_hex": float(30.0).hex(),
+        "whole_video_end_device_timestamp_ns": 479_000_000,
+        "clip_start_raw_frame": 0,
+        "clip_end_raw_frame": 479,
+        "clip_end_device_timestamp_ns": 479_000_000,
+        "clip_frame_count": 480,
+        "support_runs": [{
+            "start_raw_frame": 0,
+            "end_raw_frame": 479,
+            "frame_count": 480,
+            "start_device_timestamp_ns": 0,
+            "end_device_timestamp_ns": 479_000_000,
+        }],
+        "local_frame_indices": guide_frame_indices(480, 30.0),
+        "selected_device_timestamps_ns": [
+            index * 1_000_000
+            for index in guide_frame_indices(480, 30.0)
+        ],
+        "support_certificate": build_support_certificate(
+            scene_id=raw_scene["scene_id"],
+            vsi_media=raw_qa["vsi_media"],
+            frame_timestamps=[
+                index * 1_000_000 for index in range(480)
+            ],
+            fps=30.0,
+            support_mask=[True] * 480,
+            max_trajectory_error_ns=5_000_000,
+            max_calibration_error_ns=50_000_000,
+        ),
+    }
+    raw_qa["candidate_frame_indices"] = guide_frame_indices(480, 30.0)
+    raw_qa["candidate_frame_keys"] = [
+        f"{raw_scene['scene_id']}/{index}"
+        for index in raw_qa["candidate_frame_indices"]
+    ]
+    raw_qa["sampling_binding_sha256"] = guide_sampling_binding_sha256(
+        source_dataset="adt",
+        scene_id=raw_qa["scene_id"],
+        vsi_media=raw_qa["vsi_media"],
+        frame_keys=raw_qa["candidate_frame_keys"],
+        frame_indices=raw_qa["candidate_frame_indices"],
+        total_frames=480,
+        fps=30.0,
+        base_interval=1.0,
+        min_frames=16,
+        max_frames=32,
+        sampling_policy=raw_qa["sampling_policy"],
+        clip_provenance=raw_qa["clip_provenance"],
+    )
     source_dir = tmp_path / "source"
     canonical_dir = tmp_path / "canonical"
     source_dir.mkdir()
     _write_jsonl(source_dir / "adt_scene_states.jsonl", [raw_scene])
     _write_jsonl(source_dir / "adt_frame_states.jsonl", raw_frames)
     _write_jsonl(source_dir / "adt_qa_train.jsonl", [raw_qa])
+    _write_adt_anchor(
+        source_dir, raw_qa["clip_provenance"]["support_certificate"]
+    )
     project = Path(__file__).resolve().parents[1]
-    subprocess.run(
+    canonical_result = subprocess.run(
         [
             sys.executable,
             str(project / "scripts/preprocess/build_parta_canonical_data.py"),
@@ -628,29 +925,11 @@ def test_exact_manifest_cli_missing_raw_frame_state_fails(tmp_path):
             "--input-dir", str(source_dir),
             "--output-dir", str(canonical_dir),
         ],
-        check=True,
-    )
-    metadata = tmp_path / "metadata.jsonl"
-    _write_jsonl(metadata, [{
-        "source_dataset": "adt",
-        "scene_id": raw_scene["scene_id"],
-        "vsi_media": "adt/a.mp4",
-        "total_frames": 480,
-        "fps": 30,
-    }])
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(project / "scripts/preprocess/build_parta_exact_frame_manifest.py"),
-            "--scenes", str(canonical_dir / "scene_states.jsonl"),
-            "--frames", str(canonical_dir / "frame_states.jsonl"),
-            "--qa", str(canonical_dir / "qa_manifest.jsonl"),
-            "--video-metadata", str(metadata),
-            "--output", str(tmp_path / "exact.jsonl"),
-            "--report-output", str(tmp_path / "report.json"),
-        ],
         capture_output=True,
         text=True,
     )
-    assert result.returncode != 0
-    assert "do not cover exact GUIDE raw frame" in result.stderr
+    assert canonical_result.returncode != 0
+    assert (
+        "missing frame" in canonical_result.stderr.lower()
+        or "KeyError" in canonical_result.stderr
+    )

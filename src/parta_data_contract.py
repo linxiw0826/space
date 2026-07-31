@@ -18,7 +18,8 @@ import numpy as np
 
 
 SCHEMA_VERSION = "parta_canonical_v1"
-GUIDE_EXACT_SAMPLING_POLICY = "guide_exact_raw_mp4_v1"
+GUIDE_EXACT_SAMPLING_POLICY = "guide_exact_over_gt_supported_clip_v1"
+GUIDE_WHOLE_MP4_SAMPLING_POLICY = "guide_exact_raw_mp4_v1"
 T0_FIXTURES = {
     "adt": (
         "Apartment_release_clean_seq131_M1292",
@@ -163,6 +164,7 @@ def guide_sampling_payload(
     min_frames: int,
     max_frames: int,
     sampling_policy: str,
+    clip_provenance: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return the unique stable payload for exact GUIDE frame binding.
 
@@ -173,7 +175,7 @@ def guide_sampling_payload(
     base_interval = float(base_interval)
     if not math.isfinite(fps) or not math.isfinite(base_interval):
         raise ContractError("Sampling FPS/base interval must be finite")
-    return {
+    payload = {
         "source_dataset": str(source_dataset),
         "scene_id": str(scene_id),
         "vsi_media": str(vsi_media),
@@ -186,6 +188,9 @@ def guide_sampling_payload(
         "min_frames": int(min_frames),
         "max_frames": int(max_frames),
     }
+    if clip_provenance is not None:
+        payload["clip_provenance"] = dict(clip_provenance)
+    return payload
 
 
 def guide_sampling_binding_sha256(**kwargs: Any) -> str:
@@ -235,6 +240,7 @@ def validate_guide_sampling_binding(row: Mapping[str, Any]) -> None:
             "sampling_max_frames", row.get("max_frames")
         ),
     }
+    clip_provenance = row.get("clip_provenance")
     missing = [key for key, value in field_map.items() if value is None]
     if missing:
         raise ContractError(f"Missing GUIDE sampling fields: {missing}")
@@ -243,6 +249,7 @@ def validate_guide_sampling_binding(row: Mapping[str, Any]) -> None:
         scene_id=row["scene_id"],
         vsi_media=row["vsi_media"],
         sampling_policy=policy,
+        clip_provenance=clip_provenance,
         **field_map,
     )
     actual = row.get(
@@ -254,13 +261,128 @@ def validate_guide_sampling_binding(row: Mapping[str, Any]) -> None:
             "Invalid GUIDE source sampling binding SHA256: "
             f"expected={expected}, actual={actual}"
         )
-    recomputed_indices = guide_frame_indices(
-        int(field_map["total_frames"]),
+    if not isinstance(clip_provenance, Mapping):
+        raise ContractError("Missing D-59 clip_provenance")
+    required_clip = {
+        "whole_video_total_frames",
+        "whole_video_fps_hex",
+        "whole_video_start_device_timestamp_ns",
+        "whole_video_end_device_timestamp_ns",
+        "clip_start_raw_frame",
+        "clip_end_raw_frame",
+        "clip_start_device_timestamp_ns",
+        "clip_end_device_timestamp_ns",
+        "clip_frame_count",
+        "support_runs",
+        "tie_policy",
+        "hard_support_fields",
+        "max_trajectory_error_ns",
+        "max_calibration_error_ns",
+        "local_frame_indices",
+        "selected_device_timestamps_ns",
+        "support_certificate",
+    }
+    missing_clip = required_clip - set(clip_provenance)
+    if missing_clip:
+        raise ContractError(
+            f"Missing D-59 clip provenance fields: {sorted(missing_clip)}"
+        )
+    total_frames = int(field_map["total_frames"])
+    if int(clip_provenance["whole_video_total_frames"]) != total_frames:
+        raise ContractError("D-59 whole-video total-frame mismatch")
+    if clip_provenance["whole_video_fps_hex"] != float(field_map["fps"]).hex():
+        raise ContractError("D-59 whole-video FPS mismatch")
+    start = int(clip_provenance["clip_start_raw_frame"])
+    end = int(clip_provenance["clip_end_raw_frame"])
+    if not 0 <= start <= end < total_frames:
+        raise ContractError("Invalid D-59 clip bounds")
+    if int(clip_provenance["clip_frame_count"]) != end - start + 1:
+        raise ContractError("Invalid D-59 clip frame count")
+    from src.adt_gt_supported_clip import (
+        select_maximal_run,
+        validate_support_certificate,
+    )
+    certificate = clip_provenance["support_certificate"]
+    if not isinstance(certificate, dict):
+        raise ContractError("Invalid D-59 support certificate")
+    _, certified_runs = validate_support_certificate(certificate)
+    for key in (
+        "scene_id",
+        "vsi_media",
+        "whole_video_total_frames",
+        "whole_video_fps_hex",
+        "whole_video_start_device_timestamp_ns",
+        "whole_video_end_device_timestamp_ns",
+        "hard_support_fields",
+        "max_trajectory_error_ns",
+        "max_calibration_error_ns",
+    ):
+        expected_value = (
+            row[key] if key in ("scene_id", "vsi_media")
+            else clip_provenance[key]
+        )
+        if certificate[key] != expected_value:
+            raise ContractError(
+                f"D-59 support certificate/provenance mismatch: {key}"
+            )
+    recomputed_local = guide_frame_indices(
+        end - start + 1,
         float(field_map["fps"]),
         base_interval=float(field_map["base_interval"]),
         min_frames=int(field_map["min_frames"]),
         max_frames=int(field_map["max_frames"]),
     )
+    recomputed_indices = [start + index for index in recomputed_local]
+    if list(clip_provenance["local_frame_indices"]) != recomputed_local:
+        raise ContractError("Invalid D-59 clip-local GUIDE positions")
+    runs = clip_provenance["support_runs"]
+    if not isinstance(runs, Sequence) or not runs:
+        raise ContractError("Missing D-59 support runs")
+    normalized_runs = [
+        (int(run["start_raw_frame"]), int(run["end_raw_frame"]))
+        for run in runs
+    ]
+    if normalized_runs != certified_runs:
+        raise ContractError("D-59 declared runs differ from support certificate")
+    previous_end = -1
+    for run, (run_start, run_end) in zip(runs, normalized_runs):
+        if not 0 <= run_start <= run_end < total_frames:
+            raise ContractError("Invalid D-59 support-run bounds")
+        if run_start <= previous_end:
+            raise ContractError("D-59 support runs are not ordered/disjoint")
+        if int(run["frame_count"]) != run_end - run_start + 1:
+            raise ContractError("Invalid D-59 support-run frame count")
+        previous_end = run_end
+    chosen = select_maximal_run(certified_runs)
+    if chosen != (start, end):
+        raise ContractError("D-59 clip violates longest-earliest tie policy")
+    chosen_run = next(
+        run for run, bounds in zip(runs, normalized_runs)
+        if bounds == chosen
+    )
+    if (
+        int(chosen_run["start_device_timestamp_ns"])
+        != int(clip_provenance["clip_start_device_timestamp_ns"])
+        or int(chosen_run["end_device_timestamp_ns"])
+        != int(clip_provenance["clip_end_device_timestamp_ns"])
+    ):
+        raise ContractError("D-59 clip timestamp/run mismatch")
+    if clip_provenance["tie_policy"] != (
+        "longest_run_then_earliest_start_v1"
+    ):
+        raise ContractError("Unsupported D-59 tie policy")
+    if list(clip_provenance["hard_support_fields"]) != [
+        "trajectory", "calibration"
+    ]:
+        raise ContractError("Unsupported D-59 hard-support capability set")
+    if (
+        int(clip_provenance["max_trajectory_error_ns"]) != 5_000_000
+        or int(clip_provenance["max_calibration_error_ns"]) != 50_000_000
+    ):
+        raise ContractError("D-59 temporal thresholds differ from frozen values")
+    selected_timestamps = clip_provenance["selected_device_timestamps_ns"]
+    if len(selected_timestamps) != len(recomputed_indices):
+        raise ContractError("D-59 selected timestamp/ID lengths differ")
     if list(field_map["frame_indices"]) != recomputed_indices:
         raise ContractError(
             "Source sampling binding contains non-GUIDE raw frame IDs: "
@@ -325,6 +447,18 @@ def canonical_category(value: Any) -> tuple[str, str | None]:
 def _node(
     source: str, scene_id: str, raw: Mapping[str, Any]
 ) -> dict[str, Any]:
+    geometry_valid = raw.get("geometry_valid", True)
+    if source == "adt" and not isinstance(geometry_valid, bool):
+        raise ContractError("ADT scene-node geometry_valid must be boolean")
+    if source == "adt" and not geometry_valid and any(
+        raw.get(field) is not None
+        for field in (
+            "center_world_m",
+            "extent_m",
+            "rotation_world_from_object",
+        )
+    ):
+        raise ContractError("ADT invalid scene-node geometry must be nulled")
     center = raw.get("center_world_m", raw.get("bbox_center_m"))
     extent = raw.get("extent_m", raw.get("bbox_extent_m"))
     rotation = raw.get(
@@ -343,6 +477,10 @@ def _node(
         "orientation": _mask(rotation),
         "motion": _mask(raw.get("velocity_world_mps")),
     }
+    if source == "adt" and not geometry_valid:
+        masks["center"] = False
+        masks["extent"] = False
+        masks["orientation"] = False
     return {
         "object_id": _source_object_id(source, scene_id, raw["object_id"]),
         "source_object_id": str(raw["object_id"]),
@@ -352,6 +490,10 @@ def _node(
         "extent_m": extent,
         "rotation_world_from_object": rotation,
         "motion_type": raw.get("motion_type"),
+        "source_geometry_valid": geometry_valid,
+        "reference_pose_timestamp_error_ns": raw.get(
+            "reference_pose_timestamp_error_ns"
+        ),
         "velocity_world_mps": _vector_to_canonical(
             source, raw.get("velocity_world_mps")
         ),
@@ -453,6 +595,24 @@ def adapt_frame(source: str, raw: Mapping[str, Any]) -> dict[str, Any]:
         evidence_present, supervision_valid = source_visibility_contract(
             source, observation
         )
+        source_geometry_valid = observation.get("object_geometry_valid")
+        if source == "adt":
+            if not isinstance(source_geometry_valid, bool):
+                # Backward-compatible source rows lacked the frozen D-59
+                # dynamic-pose mask; formal new rows must set it explicitly.
+                source_geometry_valid = False
+            if not source_geometry_valid and any(
+                observation.get(field) is not None
+                for field in (
+                    "center_world_m",
+                    "rotation_world_from_object",
+                    "center_camera_m",
+                    "camera_distance_m",
+                )
+            ):
+                raise ContractError(
+                    "ADT invalid object geometry must be nulled"
+                )
         visible.append(
             {
                 "object_id": _source_object_id(
@@ -466,6 +626,10 @@ def adapt_frame(source: str, raw: Mapping[str, Any]) -> dict[str, Any]:
                 "center_camera_m": None,
                 "camera_distance_m": None,
                 "camera_coordinate_contract": None,
+                "source_object_geometry_valid": source_geometry_valid,
+                "source_object_pose_timestamp_error_ns": observation.get(
+                    "object_pose_timestamp_error_ns"
+                ),
                 "field_mask": {
                     "visibility": supervision_valid,
                     "camera_geometry": False,
@@ -480,6 +644,13 @@ def adapt_frame(source: str, raw: Mapping[str, Any]) -> dict[str, Any]:
         "scene_id": raw["scene_id"],
         "frame_key": raw["frame_key"],
         "frame_index": int(frame_index) if frame_index is not None else None,
+        "device_timestamp_ns": raw.get("device_timestamp_ns"),
+        "trajectory_timestamp_error_ns": raw.get(
+            "trajectory_timestamp_error_ns"
+        ),
+        "calibration_timestamp_error_ns": raw.get(
+            "calibration_timestamp_error_ns"
+        ),
         "vsi_media": raw.get("vsi_media"),
         "rotation_world_from_camera": _rotation_to_canonical(
             source, raw.get("rotation_world_from_camera")
@@ -538,6 +709,7 @@ def adapt_qa(source: str, raw: Mapping[str, Any]) -> dict[str, Any]:
             "source_sampling_binding_sha256": raw.get(
                 "sampling_binding_sha256"
             ),
+            "clip_provenance": raw.get("clip_provenance"),
         })
         validate_guide_sampling_binding(row)
     return row

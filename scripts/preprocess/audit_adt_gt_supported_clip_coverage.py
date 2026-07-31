@@ -44,11 +44,18 @@ from scripts.preprocess.finalize_adt_parta_training_data import (
     mp4_video_metadata,
     nearest_index,
 )
-from src.parta_data_contract import T0_FIXTURES, guide_frame_indices
+from src.parta_data_contract import T0_FIXTURES
+from src.adt_gt_supported_clip import (
+    GT_SUPPORTED_CLIP_POLICY,
+    contiguous_true_runs as contract_contiguous_true_runs,
+    sample_supported_run as contract_sample_supported_run,
+    select_maximal_run as contract_select_maximal_run,
+    temporal_support as contract_temporal_support,
+)
 
 
 SCHEMA_VERSION = "adt_gt_supported_clip_coverage_v1"
-SAMPLING_POLICY = "guide_exact_over_gt_supported_clip_v1"
+SAMPLING_POLICY = GT_SUPPORTED_CLIP_POLICY
 REQUIRED_GT_MEMBERS = {
     "aria_trajectory.csv",
     "instances.json",
@@ -201,65 +208,34 @@ def temporal_support(
     max_calibration_error_ns: int,
 ) -> tuple[list[bool], list[dict[str, Any]]]:
     """Return per-raw-frame hard support and diagnostics."""
-    if not trajectory_timestamps:
-        raise SceneAuditError("trajectory_empty", "Trajectory contains no timestamps")
-    if not calibration_timestamps:
-        raise SceneAuditError(
-            "calibration_empty", "Calibration contains no timestamps"
+    try:
+        return contract_temporal_support(
+            frame_timestamps,
+            trajectory_timestamps,
+            calibration_timestamps,
+            max_trajectory_error_ns=max_trajectory_error_ns,
+            max_calibration_error_ns=max_calibration_error_ns,
         )
-    valid = []
-    diagnostics = []
-    for frame_index, timestamp in enumerate(frame_timestamps):
-        trajectory_error = None
-        calibration_error = None
-        reasons = []
-        if not trajectory_timestamps[0] <= timestamp <= trajectory_timestamps[-1]:
-            reasons.append("outside_trajectory_span")
-        else:
-            trajectory_index = nearest_index(trajectory_timestamps, timestamp)
-            trajectory_error = abs(
-                trajectory_timestamps[trajectory_index] - timestamp
-            )
-            if trajectory_error > max_trajectory_error_ns:
-                reasons.append("trajectory_time_gap")
-        calibration_index = nearest_index(calibration_timestamps, timestamp)
-        calibration_error = abs(
-            calibration_timestamps[calibration_index] - timestamp
+    except ValueError as error:
+        code = (
+            "trajectory_empty"
+            if not trajectory_timestamps
+            else "calibration_empty"
         )
-        if calibration_error > max_calibration_error_ns:
-            reasons.append("calibration_time_gap")
-        valid.append(not reasons)
-        diagnostics.append({
-            "frame_index": frame_index,
-            "device_timestamp_ns": int(timestamp),
-            "trajectory_timestamp_error_ns": trajectory_error,
-            "calibration_timestamp_error_ns": calibration_error,
-            "valid": not reasons,
-            "reasons": reasons,
-        })
-    return valid, diagnostics
+        raise SceneAuditError(code, str(error)) from error
 
 
 def contiguous_true_runs(mask: Sequence[bool]) -> list[tuple[int, int]]:
     """Return inclusive contiguous true runs in raw-frame coordinates."""
-    runs = []
-    start = None
-    for index, value in enumerate([*mask, False]):
-        if value and start is None:
-            start = index
-        elif not value and start is not None:
-            runs.append((start, index - 1))
-            start = None
-    return runs
+    return contract_contiguous_true_runs(mask)
 
 
 def select_maximal_run(runs: Sequence[tuple[int, int]]) -> tuple[int, int]:
     """Choose longest run; the earliest start is the deterministic tie-break."""
-    if not runs:
-        raise SceneAuditError(
-            "no_gt_supported_run", "No GT-supported raw-frame run"
-        )
-    return min(runs, key=lambda run: (-(run[1] - run[0] + 1), run[0]))
+    try:
+        return contract_select_maximal_run(runs)
+    except ValueError as error:
+        raise SceneAuditError("no_gt_supported_run", str(error)) from error
 
 
 def sample_run(
@@ -272,8 +248,8 @@ def sample_run(
 ) -> list[int]:
     start, end = run
     try:
-        local = guide_frame_indices(
-            end - start + 1,
+        _, selected = contract_sample_supported_run(
+            run,
             fps,
             base_interval=base_interval,
             min_frames=min_frames,
@@ -283,7 +259,6 @@ def sample_run(
         raise SceneAuditError(
             "gt_supported_run_too_short", str(error)
         ) from error
-    selected = [start + value for value in local]
     if len(selected) != len(set(selected)):
         raise AssertionError("GUIDE selected duplicate raw-frame IDs")
     if any(index < start or index > end for index in selected):

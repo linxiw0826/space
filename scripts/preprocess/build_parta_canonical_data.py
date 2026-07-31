@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -33,6 +35,14 @@ FILES = {
 }
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", choices=FILES, required=True)
@@ -41,6 +51,19 @@ def main() -> None:
     parser.add_argument("--require-t0-fixtures", action="store_true")
     parser.add_argument("--expected-source", action="append", default=[])
     args = parser.parse_args()
+    trusted_registry = None
+    if args.source == "adt":
+        source_report = json.loads(
+            (args.input_dir / "adt_alignment_report.json").read_text()
+        )
+        trusted_registry = source_report.get("support_certificate_registry")
+        if not isinstance(trusted_registry, dict):
+            raise ValueError("ADT source report lacks trusted certificate registry")
+        certificate_path = (
+            args.input_dir / trusted_registry["path"]
+        )
+        if file_sha256(certificate_path) != trusted_registry["sha256"]:
+            raise ValueError("ADT source certificate registry digest mismatch")
 
     scene_name, frame_name, qa_name = FILES[args.source]
     scenes = [adapt_scene(args.source, row) for row in read_jsonl(args.input_dir / scene_name)]
@@ -78,10 +101,21 @@ def main() -> None:
     write_jsonl(args.output_dir / "scene_states.jsonl", scenes)
     write_jsonl(args.output_dir / "frame_states.jsonl", frames)
     write_jsonl(args.output_dir / "qa_manifest.jsonl", manifest)
+    report_payload = report.as_dict()
+    if trusted_registry is not None:
+        canonical_certificate = (
+            args.output_dir / "adt_support_certificates.jsonl"
+        )
+        shutil.copyfile(certificate_path, canonical_certificate)
+        report_payload["trusted_support_certificate_registry"] = {
+            "path": canonical_certificate.name,
+            "sha256": trusted_registry["sha256"],
+            "anchored_by": "canonicalized_finalizer_report_v1",
+        }
     (args.output_dir / "validation_report.json").write_text(
-        json.dumps(report.as_dict(), indent=2) + "\n", encoding="utf-8"
+        json.dumps(report_payload, indent=2) + "\n", encoding="utf-8"
     )
-    print(json.dumps(report.as_dict(), indent=2))
+    print(json.dumps(report_payload, indent=2))
 
 
 if __name__ == "__main__":
