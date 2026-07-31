@@ -28,7 +28,7 @@ DTYPE_TOLERANCES = {
     "torch.bfloat16": {"atol": 5e-3, "rtol": 5e-3},
 }
 
-REQUIRED_T0_CHECKS = frozenset(
+T0_A_REQUIRED_CHECKS = frozenset(
     {
         "fixed_fixtures",
         "visual_before_question",
@@ -43,9 +43,10 @@ REQUIRED_T0_CHECKS = frozenset(
         "question_invariance",
         "save_resume_equivalence",
         "head_free_equivalence",
-        "gradient_calibration",
     }
 )
+T0_B_REQUIRED_CHECKS = frozenset({"gradient_calibration"})
+REQUIRED_T0_CHECKS = T0_A_REQUIRED_CHECKS | T0_B_REQUIRED_CHECKS
 
 
 @dataclass(frozen=True)
@@ -246,12 +247,27 @@ def _percentiles(values: np.ndarray) -> dict[str, float]:
 class T0Report:
     """Collect named checks without hiding individual failures in one score."""
 
-    def __init__(self, run_id: str, resolved_config_sha256: str):
+    def __init__(
+        self,
+        run_id: str,
+        resolved_config_sha256: str,
+        *,
+        phase: str = "all",
+    ):
+        required_by_phase = {
+            "t0-a": T0_A_REQUIRED_CHECKS,
+            "t0-b": T0_B_REQUIRED_CHECKS,
+            "all": REQUIRED_T0_CHECKS,
+        }
+        if phase not in required_by_phase:
+            raise ValueError(f"unsupported T0 phase: {phase!r}")
+        self.required_checks = required_by_phase[phase]
         self.payload: dict[str, object] = {
             "schema_version": "parta_t0_report_v1",
             "run_id": run_id,
             "resolved_config_sha256": resolved_config_sha256,
             "fixtures": list(FIXTURE_SCENE_IDS),
+            "phase": phase,
             "checks": {},
             "status": "running",
         }
@@ -290,7 +306,7 @@ class T0Report:
 
     def finalize(self, path: str) -> Mapping[str, object]:
         checks = self.payload["checks"]
-        missing = sorted(REQUIRED_T0_CHECKS - set(checks))
+        missing = sorted(self.required_checks - set(checks))
         failed = sorted(name for name, item in checks.items() if not item.get("passed", False))
         if missing or failed:
             self.payload["status"] = "complete_failed"

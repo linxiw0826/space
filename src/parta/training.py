@@ -47,6 +47,7 @@ def run_a1o_side_branch(
     visual_state_valid_mask: torch.Tensor,
     frame_token_counts: Sequence[Sequence[int]],
     frame_ids: Sequence[Sequence[int]],
+    media_kinds: Sequence[str],
     targets: Sequence[StateTargets],
     loss_config: StateLossConfig,
 ) -> A1OSideBranchOutput:
@@ -62,6 +63,7 @@ def run_a1o_side_branch(
         visual_state_valid_mask,
         frame_token_counts,
         frame_ids,
+        media_kinds,
     )
     predictions = head(tap)
     losses = ObjectStateSetLoss(loss_config)(predictions, targets)

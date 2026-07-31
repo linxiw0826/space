@@ -20,6 +20,7 @@ from parta.state_loss import ObjectStateSetLoss, StateLossConfig, StateTargets
 from parta.training import run_a1o_side_branch
 from parta.t0 import (
     REQUIRED_T0_CHECKS,
+    T0_A_REQUIRED_CHECKS,
     GradientBatchRecord,
     T0Report,
     assert_component_shared_gradient_norms,
@@ -110,7 +111,7 @@ def test_visual_tap_contract_and_set_head_backward():
     visual_mask[:, :32] = True
     counts = [[2] * 16, [2] * 16]
     ids = [list(range(16)), list(range(100, 116))]
-    tap = extract_visual_prefix_hidden(hidden, visual_mask, counts, ids)
+    tap = extract_visual_prefix_hidden(hidden, visual_mask, counts, ids, ["video", "video"])
     assert tap.hidden.shape == (2, 32, 16)
     assert tap.frame_token_spans[0, -1].tolist() == [30, 32]
     head = SetSlotStateHead(
@@ -159,8 +160,37 @@ def test_a1o_runtime_rejects_mope_even_after_attach():
             visual_state_valid_mask=torch.empty(0),
             frame_token_counts=[],
             frame_ids=[],
+            media_kinds=[],
             targets=[],
             loss_config=StateLossConfig(),
+        )
+
+
+def test_visual_tap_media_kind_contract_is_not_globally_loosened():
+    hidden = torch.randn(1, 64, 16)
+
+    image_mask = torch.zeros(1, 64, dtype=torch.bool)
+    image_mask[:, :4] = True
+    tap = extract_visual_prefix_hidden(
+        hidden, image_mask, [[4]], [[7]], ["image"]
+    )
+    assert tap.frame_valid_mask.sum().item() == 1
+
+    with pytest.raises(ValueError, match="video requires 16-32"):
+        extract_visual_prefix_hidden(
+            hidden, image_mask, [[4]], [[7]], ["video"]
+        )
+    with pytest.raises(ValueError, match="image requires exactly 1"):
+        extract_visual_prefix_hidden(
+            hidden,
+            image_mask,
+            [[2, 2]],
+            [[7, 8]],
+            ["image"],
+        )
+    with pytest.raises(ValueError, match="unsupported media_kind"):
+        extract_visual_prefix_hidden(
+            hidden, image_mask, [[4]], [[7]], ["audio"]
         )
 
 
@@ -217,6 +247,16 @@ def test_t0_missing_check_and_component_gradient_are_hard_failures(tmp_path):
             {"existence": 1.0, "center": 0.0},
             ("existence", "center", "extent"),
         )
+
+
+def test_t0_a_report_does_not_require_t0_b_gradient_calibration(tmp_path):
+    report = T0Report("t0-a", "abc", phase="t0-a")
+    for name in T0_A_REQUIRED_CHECKS:
+        report.add_boolean(name, True)
+    payload = report.finalize(str(tmp_path / "t0-a.json"))
+    assert payload["status"] == "complete_passed"
+    assert payload["phase"] == "t0-a"
+    assert "gradient_calibration" not in payload["checks"]
 
 
 def test_d55_run_contract_checkpoint_and_status(tmp_path):

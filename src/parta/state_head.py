@@ -60,6 +60,7 @@ def extract_visual_prefix_hidden(
     visual_pos_masks: torch.Tensor,
     frame_token_counts: Sequence[Sequence[int]],
     frame_ids: Sequence[Sequence[int]],
+    media_kinds: Sequence[str],
 ) -> StateTapOutput:
     """Restore flat visual positions to a padded, frame-aware batch.
 
@@ -74,7 +75,11 @@ def extract_visual_prefix_hidden(
     if last_hidden_state.shape[:2] != visual_pos_masks.shape:
         raise ValueError("hidden and visual_pos_masks sequence shapes differ")
     batch_size, _, hidden_size = last_hidden_state.shape
-    if len(frame_token_counts) != batch_size or len(frame_ids) != batch_size:
+    if (
+        len(frame_token_counts) != batch_size
+        or len(frame_ids) != batch_size
+        or len(media_kinds) != batch_size
+    ):
         raise ValueError("frame metadata batch size differs from hidden batch")
 
     per_sample = []
@@ -85,8 +90,7 @@ def extract_visual_prefix_hidden(
         ids = [int(value) for value in frame_ids[batch_index]]
         if len(counts) != len(ids):
             raise ValueError(f"sample {batch_index}: frame count/ID length mismatch")
-        if not 16 <= len(ids) <= 32:
-            raise ValueError(f"sample {batch_index}: expected 16-32 frames, got {len(ids)}")
+        _validate_media_frame_count(media_kinds[batch_index], len(ids), batch_index)
         visual = last_hidden_state[batch_index, visual_pos_masks[batch_index].bool()]
         if sum(counts) != visual.shape[0]:
             raise ValueError(
@@ -140,12 +144,17 @@ def build_state_tap_from_packed(
     visual_state_valid_mask: torch.Tensor,
     frame_token_counts: Sequence[Sequence[int]],
     frame_ids: Sequence[Sequence[int]],
+    media_kinds: Sequence[str],
 ) -> StateTapOutput:
     """Add exact frame metadata to the packed side output of Qwen3-VL."""
     if visual_state_hidden.ndim != 3 or visual_state_valid_mask.shape != visual_state_hidden.shape[:2]:
         raise ValueError("invalid packed visual state hidden/mask")
     batch_size, max_tokens, _ = visual_state_hidden.shape
-    if len(frame_ids) != batch_size or len(frame_token_counts) != batch_size:
+    if (
+        len(frame_ids) != batch_size
+        or len(frame_token_counts) != batch_size
+        or len(media_kinds) != batch_size
+    ):
         raise ValueError("packed visual state metadata batch mismatch")
     max_frames = max(len(ids) for ids in frame_ids)
     padded_ids = torch.full(
@@ -163,8 +172,9 @@ def build_state_tap_from_packed(
     for batch_index, (counts_raw, ids_raw) in enumerate(zip(frame_token_counts, frame_ids)):
         counts = [int(value) for value in counts_raw]
         ids = [int(value) for value in ids_raw]
-        if len(counts) != len(ids) or not 16 <= len(ids) <= 32:
-            raise ValueError(f"sample {batch_index}: invalid 16-32 frame metadata")
+        if len(counts) != len(ids):
+            raise ValueError(f"sample {batch_index}: frame count/ID length mismatch")
+        _validate_media_frame_count(media_kinds[batch_index], len(ids), batch_index)
         actual_tokens = int(visual_state_valid_mask[batch_index].sum().item())
         if sum(counts) != actual_tokens:
             raise ValueError(
@@ -188,6 +198,30 @@ def build_state_tap_from_packed(
         token_frame_index=token_frame_index,
         frame_token_spans=spans,
     )
+
+
+def _validate_media_frame_count(
+    media_kind: str, frame_count: int, batch_index: int
+) -> None:
+    """Enforce the canonical contract without globally loosening videos.
+
+    ADT video samples always contain 16--32 exact source frames. Hypersim is
+    image-native and therefore contains exactly one frame. Unknown media kinds
+    fail closed instead of inheriting either policy.
+    """
+    if media_kind == "video":
+        if not 16 <= frame_count <= 32:
+            raise ValueError(
+                f"sample {batch_index}: video requires 16-32 frames, got {frame_count}"
+            )
+        return
+    if media_kind == "image":
+        if frame_count != 1:
+            raise ValueError(
+                f"sample {batch_index}: image requires exactly 1 frame, got {frame_count}"
+            )
+        return
+    raise ValueError(f"sample {batch_index}: unsupported media_kind={media_kind!r}")
 
 
 class SetSlotStateHead(nn.Module):

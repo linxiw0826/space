@@ -163,6 +163,80 @@ def canonical():
     return [scene], frames, manifest
 
 
+def test_adapt_and_validate_reject_duplicate_visible_node_ids():
+    _, raw_frames, _ = raw_records()
+    duplicated_raw = copy.deepcopy(raw_frames[0])
+    duplicated_raw["visible_nodes"].append(
+        copy.deepcopy(duplicated_raw["visible_nodes"][0])
+    )
+    with pytest.raises(ContractError, match="Duplicate visible_nodes"):
+        adapt_frame("adt", duplicated_raw)
+
+    scenes, frames, qa = canonical()
+    frames[0]["visible_nodes"].append(
+        copy.deepcopy(frames[0]["visible_nodes"][0])
+    )
+    with pytest.raises(ContractError, match="Duplicate visible_nodes"):
+        validate_records(scenes, frames, qa)
+
+
+@pytest.mark.parametrize(
+    ("media_kind", "vsi_media"),
+    [
+        ("image", "adt/a.mp4"),
+        ("video", "hypersim/a.mp4"),
+        ("video", "adt/a.jpg"),
+    ],
+)
+def test_canonical_validator_rejects_adt_media_contract_attacks(
+    media_kind, vsi_media
+):
+    scenes, frames, qa = canonical()
+    qa[0]["media_kind"] = media_kind
+    qa[0]["vsi_media"] = vsi_media
+    with pytest.raises(ContractError, match="ADT requires"):
+        validate_records(scenes, frames, qa)
+
+
+@pytest.mark.parametrize(
+    "vsi_media",
+    [
+        "/hypersim/a.png",
+        "hypersim/../a.png",
+        "hypersim/./a.png",
+        "hypersim//a.png",
+        "hypersim\\a.png",
+        "https://hypersim/a.png",
+        "",
+    ],
+)
+def test_adapt_qa_rejects_noncanonical_media_paths(vsi_media):
+    raw = {
+        "schema_version": "hypersim_qa_train_v1",
+        "vsi_row_index": 1,
+        "scene_id": "ai_001_001",
+        "frame_key": "ai_001_001/0",
+        "frame_index": 0,
+        "vsi_media": vsi_media,
+        "question_type": "absolute_count",
+        "conversations": [],
+        "loss_masks": {"scene_geometry": True},
+    }
+    with pytest.raises(ContractError, match="POSIX"):
+        adapt_qa("hypersim", raw)
+
+
+@pytest.mark.parametrize(
+    "vsi_media",
+    ["/adt/a.mp4", "adt/../a.mp4", "adt//a.mp4", "adt\\a.mp4"],
+)
+def test_canonical_validator_rejects_noncanonical_frame_media(vsi_media):
+    scenes, frames, qa = canonical()
+    frames[0]["vsi_media"] = vsi_media
+    with pytest.raises(ContractError, match="POSIX"):
+        validate_records(scenes, frames, qa)
+
+
 def rehash_canonical_qa(row):
     row["source_sampling_binding_sha256"] = (
         guide_sampling_binding_sha256(
@@ -190,11 +264,35 @@ def test_valid_contract_null_and_mask():
     assert node["field_mask"]["orientation"] is False
     report = validate_records(scenes, frames, qa)
     assert report.qa == 1
+    assert report.scene_capacity_overflow_scenes == 0
+    assert report.scene_capacity_excess_objects == 0
+    assert report.scene_capacity_scope == "whole_scene_nodes_vs_k384"
+    assert report.as_dict()["schema_version"] == "parta_validation_report_v2"
+    assert "overflow_scenes" not in report.as_dict()
+    assert "truncated_objects" not in report.as_dict()
     assert report.qa_coverage_counts["adt"][
         "relative_direction_object"
     ]["high"] == 1
     assert frames[0]["visible_nodes"][0]["visible"] is True
     assert frames[0]["visible_nodes"][0]["evidence_present"] is True
+
+
+def test_scene_capacity_report_uses_unambiguous_whole_scene_fields():
+    scenes, frames, qa = canonical()
+    template = scenes[0]["nodes"][0]
+    scenes[0]["nodes"] = []
+    for index in range(385):
+        node = copy.deepcopy(template)
+        node["object_id"] = f"adt:capacity:{index}"
+        scenes[0]["nodes"].append(node)
+    frames[0]["visible_nodes"][0]["object_id"] = "adt:capacity:0"
+    for row in frames[1:]:
+        row["visible_nodes"][0]["object_id"] = "adt:capacity:0"
+    qa[0]["actual_visible_object_ids"] = ["adt:capacity:0"]
+    report = validate_records(scenes, frames, qa)
+    assert report.scene_capacity_overflow_scenes == 1
+    assert report.scene_capacity_excess_objects == 1
+    assert report.scene_capacity_scope == "whole_scene_nodes_vs_k384"
 
 
 @pytest.mark.parametrize(

@@ -10,8 +10,10 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from dataclasses import dataclass
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 import numpy as np
@@ -654,7 +656,15 @@ def adapt_frame(source: str, raw: Mapping[str, Any]) -> dict[str, Any]:
             f"Unexpected {source} frame schema: {raw.get('schema_version')}"
         )
     visible = []
+    seen_object_ids: set[str] = set()
     for observation in raw.get("visible_nodes", ()):
+        source_object_id = str(observation["object_id"])
+        if source_object_id in seen_object_ids:
+            raise ContractError(
+                f"Duplicate visible_nodes object_id in {raw['frame_key']}: "
+                f"{source_object_id}"
+            )
+        seen_object_ids.add(source_object_id)
         evidence_present, supervision_valid = source_visibility_contract(
             source, observation
         )
@@ -736,6 +746,7 @@ def adapt_qa(source: str, raw: Mapping[str, Any]) -> dict[str, Any]:
         keys = [raw["frame_key"]]
         indices = [int(raw.get("frame_index", 0))]
         media_kind = "image"
+    validate_source_media_contract(source, media_kind, raw["vsi_media"])
     row = {
         "schema_version": SCHEMA_VERSION,
         "record_type": "qa",
@@ -820,14 +831,15 @@ class ValidationReport:
     qa: int = 0
     visible_observations: int = 0
     visibility_evidence_observations: int = 0
-    overflow_scenes: int = 0
-    truncated_objects: int = 0
+    scene_capacity_overflow_scenes: int = 0
+    scene_capacity_excess_objects: int = 0
+    scene_capacity_scope: str = "whole_scene_nodes_vs_k384"
     source_counts: dict[str, dict[str, int]] | None = None
     scene_object_counts: dict[str, int] | None = None
     qa_coverage_counts: dict[str, dict[str, dict[str, int]]] | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        return {"schema_version": "parta_validation_report_v1", **vars(self)}
+        return {"schema_version": "parta_validation_report_v2", **vars(self)}
 
 
 def _finite(value: Any) -> bool:
@@ -866,8 +878,8 @@ def validate_records(
         if len(ids) != len(set(ids)):
             raise ContractError(f"Duplicate object ID in {key}")
         if len(ids) > max_slots:
-            report.overflow_scenes += 1
-            report.truncated_objects += len(ids) - max_slots
+            report.scene_capacity_overflow_scenes += 1
+            report.scene_capacity_excess_objects += len(ids) - max_slots
         for node in scene["nodes"]:
             for name, valid in node["field_mask"].items():
                 field = {
@@ -899,12 +911,24 @@ def validate_records(
         report.scene_object_counts[f"{key[0]}:{key[1]}"] = len(ids)
     for frame in frames:
         key = (frame["source_dataset"], frame["scene_id"])
+        validate_source_media_contract(
+            frame["source_dataset"],
+            "video" if frame["source_dataset"] == "adt" else "image",
+            frame.get("vsi_media"),
+        )
         if key not in scene_map:
             raise ContractError(f"Frame references missing scene {key}")
         frame_key = (frame["source_dataset"], frame["frame_key"])
         if frame_key in frame_map:
             raise ContractError(f"Duplicate frame {frame_key}")
         node_ids = {node["object_id"] for node in scene_map[key]["nodes"]}
+        observation_ids = [
+            observation["object_id"] for observation in frame["visible_nodes"]
+        ]
+        if len(observation_ids) != len(set(observation_ids)):
+            raise ContractError(
+                f"Duplicate visible_nodes object_id in frame {frame_key}"
+            )
         for observation in frame["visible_nodes"]:
             evidence_present = observation.get("evidence_present")
             if not isinstance(evidence_present, bool):
@@ -941,6 +965,9 @@ def validate_records(
     scene_qa_contracts: dict[tuple[str, str], tuple[Any, ...]] = {}
     for qa in qa_rows:
         scene_key = (qa["source_dataset"], qa["scene_id"])
+        validate_source_media_contract(
+            qa["source_dataset"], qa.get("media_kind"), qa.get("vsi_media")
+        )
         if scene_key not in scene_map:
             raise ContractError(f"QA references missing scene {scene_key}")
         if qa["source_dataset"] == "adt":
@@ -1086,6 +1113,47 @@ def validate_records(
         if missing:
             raise ContractError(f"Missing fixed T0 fixtures: {missing}")
     return report
+
+
+def validate_source_media_contract(
+    source: str, media_kind: Any, vsi_media: Any
+) -> None:
+    """Fail closed on source/media swaps before decoding or training."""
+    if not isinstance(vsi_media, str) or not vsi_media:
+        raise ContractError("vsi_media must be a nonempty relative POSIX path")
+    media = vsi_media
+    if (
+        media != media.strip()
+        or "\\" in media
+        or any(character in media for character in ("\x00", "?", "#"))
+        or media.startswith("/")
+        or re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", media)
+    ):
+        raise ContractError(f"Invalid canonical relative POSIX media path: {media!r}")
+    raw_parts = media.split("/")
+    if len(raw_parts) < 2 or any(part in {"", ".", ".."} for part in raw_parts):
+        raise ContractError(f"Invalid canonical relative POSIX media path: {media!r}")
+    path = PurePosixPath(media)
+    if path.is_absolute() or tuple(path.parts) != tuple(raw_parts):
+        raise ContractError(f"Invalid canonical relative POSIX media path: {media!r}")
+    suffix = path.suffix.lower()
+    if source == "adt":
+        if media_kind != "video" or raw_parts[0] != "adt" or suffix != ".mp4":
+            raise ContractError(
+                "ADT requires media_kind=video, adt/ prefix, and an MP4 path"
+            )
+        return
+    if source == "hypersim":
+        if (
+            media_kind != "image"
+            or raw_parts[0] != "hypersim"
+            or suffix not in {".jpg", ".jpeg", ".png"}
+        ):
+            raise ContractError(
+                "Hypersim requires media_kind=image, hypersim/ prefix, and an image path"
+            )
+        return
+    raise ContractError(f"Unsupported source/media contract: {source!r}")
 
 
 def build_manifest_rows(
