@@ -261,6 +261,12 @@ def supported_clip_sampling(
     return {
         "hard_support_fields": list(HARD_SUPPORT_FIELDS),
         "tie_policy": TIE_POLICY,
+        # The formal finalizer must certify the complete per-frame support
+        # decision, not merely the selected run.  Keep this internal boolean
+        # representation alongside the serialized run summary so the
+        # certificate bitset is derived from the exact decision computed
+        # above rather than from a second, potentially drifting pass.
+        "support_mask": mask,
         "support_runs": [
             {
                 "start_raw_frame": run_start,

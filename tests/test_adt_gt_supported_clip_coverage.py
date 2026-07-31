@@ -6,6 +6,7 @@ import zipfile
 from argparse import Namespace
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 
@@ -164,6 +165,222 @@ def test_json_csv_scene_values_are_consistent(tmp_path):
     assert json.loads(csv_row["selected_raw_frame_ids"]) == (
         loaded["selected_raw_frame_ids"]
     )
+
+
+def test_formal_finalizer_writes_nonempty_certified_scene(tmp_path, monkeypatch):
+    """Exercise the D-59/D-60 finalizer path through certificate writing."""
+    finalizer_path = (
+        PROJECT
+        / "scripts/preprocess/finalize_adt_parta_training_data.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "adt_formal_finalizer_integration", finalizer_path
+    )
+    finalizer = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(finalizer)
+
+    sequence = "Apartment_release_clean_seq131_M1292"
+    output_dir = tmp_path / "output"
+    archive_output = tmp_path / "training.tar.gz"
+    groundtruth_dir = tmp_path / "groundtruth" / sequence
+    calibration_dir = tmp_path / "calibration" / sequence
+    video_root = tmp_path / "videos"
+    groundtruth_dir.mkdir(parents=True)
+    calibration_dir.mkdir(parents=True)
+    video_root.mkdir()
+    groundtruth_zip = groundtruth_dir / f"{sequence}_main_groundtruth.zip"
+    calibration_zip = (
+        calibration_dir / f"{sequence}_mps_slam_calibration.zip"
+    )
+    with zipfile.ZipFile(groundtruth_zip, "w"):
+        pass
+    with zipfile.ZipFile(calibration_zip, "w"):
+        pass
+
+    timestamps_ns = [index * 1_000_000_000 for index in range(40)]
+    identity = np.eye(3, dtype=np.float64)
+    zero = np.zeros(3, dtype=np.float64)
+    trajectory = [
+        {
+            "timestamp_ns": timestamp,
+            "translation_world_from_device_m": zero,
+            "rotation_world_from_device": identity,
+            "linear_velocity_device_mps": [0.0, 0.0, 0.0],
+            "angular_velocity_device_rps": [0.0, 0.0, 0.0],
+            "quality_score": 1.0,
+        }
+        for timestamp in timestamps_ns
+    ]
+    calibrations = [
+        {
+            "timestamp_ns": timestamp,
+            "translation_device_from_camera_m": zero,
+            "rotation_device_from_camera": identity,
+            "projection": [1.0, 1.0, 0.5, 0.5],
+            "calibrated": True,
+        }
+        for timestamp in timestamps_ns
+    ]
+    instances = {
+        "1": {
+            "instance_name": "chair_1",
+            "prototype_name": "chair",
+            "category": "chair",
+            "category_uid": 1,
+            "motion_type": "static",
+            "rigidity": "rigid",
+        }
+    }
+    boxes = {
+        "1": {
+            "center_local_m": zero,
+            "extent_m": np.ones(3, dtype=np.float64),
+        }
+    }
+    poses = {
+        "1": [
+            {
+                "timestamp_ns": -1,
+                "translation_world_from_object_m": zero,
+                "rotation_world_from_object": identity,
+            }
+        ]
+    }
+    qa = {
+        sequence: [
+            {
+                "vsi_row_index": 0,
+                "vsi_media": f"adt/ADT_{sequence}_preview_rgb.mp4",
+                "question_type": "absolute_count",
+                "conversations": [
+                    {"from": "human", "value": "How many chairs?"},
+                    {"from": "gpt", "value": "One."},
+                ],
+            }
+        ]
+    }
+    args = Namespace(
+        jsonl=tmp_path / "vsi.jsonl",
+        sequences=tmp_path / "sequences.txt",
+        groundtruth_root=tmp_path / "groundtruth",
+        calibration_root=tmp_path / "calibration",
+        video_root=video_root,
+        output_dir=output_dir,
+        archive_output=archive_output,
+        sampling_policy=finalizer.GUIDE_EXACT_POLICY,
+        candidate_frames=32,
+        base_interval=1.0,
+        min_frames=16,
+        max_frames=32,
+        knn=8,
+        max_trajectory_error_ns=5_000_000,
+        max_calibration_error_ns=50_000_000,
+        max_object_pose_error_ns=5_000_000,
+        sequence_limit=1,
+    )
+    args.sequences.write_text(sequence + "\n", encoding="utf-8")
+    monkeypatch.setattr(finalizer, "parse_args", lambda: args)
+    monkeypatch.setattr(finalizer, "load_qa", lambda _path: (qa, {"adt": 1}))
+    monkeypatch.setattr(
+        finalizer, "mp4_timestamps", lambda _path: timestamps_ns
+    )
+    monkeypatch.setattr(
+        finalizer, "mp4_video_metadata", lambda _path: (40, 1.0)
+    )
+    monkeypatch.setattr(
+        finalizer, "load_calibrations", lambda _path: calibrations
+    )
+    monkeypatch.setattr(
+        finalizer, "load_trajectory", lambda _archive: trajectory
+    )
+    monkeypatch.setattr(
+        finalizer,
+        "load_object_geometry",
+        lambda _archive: (instances, boxes, poses, ["1"]),
+    )
+    monkeypatch.setattr(
+        finalizer, "load_rgb_boxes", lambda _archive, _timestamps: {}
+    )
+
+    finalizer.main()
+
+    names = [
+        "adt_scene_states.jsonl",
+        "adt_frame_states.jsonl",
+        "adt_qa_train.jsonl",
+        "adt_support_certificates.jsonl",
+    ]
+    for name in names:
+        assert (output_dir / name).read_text(encoding="utf-8").strip()
+    report = json.loads(
+        (output_dir / "adt_alignment_report.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert report["completed_sequences"] == 1
+    assert report["errors"] == []
+    assert report["qa_rows"] == 1
+    assert archive_output.is_file()
+
+
+def test_formal_finalizer_rejects_empty_sequence_request(
+    tmp_path, monkeypatch
+):
+    finalizer_path = (
+        PROJECT
+        / "scripts/preprocess/finalize_adt_parta_training_data.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "adt_empty_finalizer_integration", finalizer_path
+    )
+    finalizer = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(finalizer)
+    sequence_path = tmp_path / "sequences.txt"
+    sequence_path.write_text("", encoding="utf-8")
+    archive_output = tmp_path / "training.tar.gz"
+    args = Namespace(
+        sequences=sequence_path,
+        sequence_limit=None,
+        archive_output=archive_output,
+        max_object_pose_error_ns=5_000_000,
+    )
+    monkeypatch.setattr(finalizer, "parse_args", lambda: args)
+
+    with pytest.raises(ValueError, match="No ADT sequences requested"):
+        finalizer.main()
+    assert not archive_output.exists()
+
+
+def test_formal_finalizer_rejects_empty_qa_table(tmp_path):
+    finalizer_path = (
+        PROJECT
+        / "scripts/preprocess/finalize_adt_parta_training_data.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "adt_nonempty_output_contract", finalizer_path
+    )
+    finalizer = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(finalizer)
+    paths = {
+        name: tmp_path / name
+        for name in ("scene.jsonl", "frame.jsonl", "qa.jsonl", "cert.jsonl")
+    }
+    paths["scene.jsonl"].write_text("{}\n", encoding="utf-8")
+    paths["frame.jsonl"].write_text("{}\n", encoding="utf-8")
+    paths["qa.jsonl"].write_text("", encoding="utf-8")
+    paths["cert.jsonl"].write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="empty outputs=qa.jsonl"):
+        finalizer.require_nonempty_formal_outputs(
+            finalizer.GUIDE_EXACT_POLICY,
+            paths["scene.jsonl"],
+            paths["frame.jsonl"],
+            paths["qa.jsonl"],
+            paths["cert.jsonl"],
+        )
 
 
 def test_empty_observation_is_not_a_hard_support_field(tmp_path):

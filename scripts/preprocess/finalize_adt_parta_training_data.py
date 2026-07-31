@@ -540,6 +540,21 @@ def write_archive_atomic(archive_output, paths):
         raise
 
 
+def require_nonempty_formal_outputs(
+    sampling_policy, scene_path, frame_path, qa_path, certificate_path
+):
+    """Fail closed before archiving incomplete formal training tables."""
+    required = [scene_path, frame_path, qa_path]
+    if sampling_policy == GUIDE_EXACT_POLICY:
+        required.append(certificate_path)
+    empty = [path.name for path in required if path.stat().st_size == 0]
+    if empty:
+        raise SystemExit(
+            "Refusing incomplete ADT training archive; empty outputs="
+            + ",".join(empty)
+        )
+
+
 def file_sha256(path):
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
@@ -571,6 +586,8 @@ def main():
     ]
     if args.sequence_limit is not None:
         sequences = sequences[: args.sequence_limit]
+    if not sequences:
+        raise ValueError("No ADT sequences requested; refusing empty archive")
     qa_by_scene, source_counts = load_qa(args.jsonl)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     scene_path = args.output_dir / "adt_scene_states.jsonl"
@@ -1114,11 +1131,23 @@ def main():
         encoding="utf-8",
     )
     print(json.dumps(report, indent=2, ensure_ascii=False))
+    if stats["scenes"] == 0:
+        raise SystemExit(
+            "No ADT scenes completed; refusing empty training archive; "
+            f"see {report_path}"
+        )
     if args.sampling_policy in (GUIDE_EXACT_POLICY, WHOLE_MP4_POLICY) and errors:
         raise SystemExit(
             f"{len(errors)} scenes failed exact raw-frame alignment; "
             f"no archive was created; see {report_path}"
         )
+    require_nonempty_formal_outputs(
+        args.sampling_policy,
+        scene_path,
+        frame_path,
+        qa_path,
+        certificate_path,
+    )
     write_archive_atomic(
         args.archive_output,
         (scene_path, frame_path, qa_path, certificate_path, report_path),
