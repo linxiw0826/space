@@ -7,7 +7,10 @@ import hashlib
 import json
 from typing import Any, Sequence
 
-from src.parta_data_contract import ContractError, guide_frame_indices
+if __name__.startswith("src."):
+    from src.parta_data_contract import ContractError, guide_frame_indices
+else:
+    from parta_data_contract import ContractError, guide_frame_indices
 
 
 GT_SUPPORTED_CLIP_POLICY = "guide_exact_over_gt_supported_clip_v1"

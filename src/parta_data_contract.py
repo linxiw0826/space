@@ -363,10 +363,16 @@ def validate_guide_sampling_binding(row: Mapping[str, Any]) -> None:
         raise ContractError("Invalid D-59 clip bounds")
     if int(clip_provenance["clip_frame_count"]) != end - start + 1:
         raise ContractError("Invalid D-59 clip frame count")
-    from src.adt_gt_supported_clip import (
-        select_maximal_run,
-        validate_support_certificate,
-    )
+    if __name__.startswith("src."):
+        from src.adt_gt_supported_clip import (
+            select_maximal_run,
+            validate_support_certificate,
+        )
+    else:
+        from adt_gt_supported_clip import (  # type: ignore[no-redef]
+            select_maximal_run,
+            validate_support_certificate,
+        )
     certificate = clip_provenance["support_certificate"]
     if not isinstance(certificate, dict):
         raise ContractError("Invalid D-59 support certificate")

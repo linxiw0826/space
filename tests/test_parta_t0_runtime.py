@@ -2,6 +2,7 @@ import subprocess
 import sys
 import importlib.util
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -325,6 +326,71 @@ def test_runner_source_has_no_stale_external_a1_input_or_undefined_flow():
     assert source.index("a1_artifact = _checkpoint_artifact_provenance(resume_path)") < source.index(
         '"a1_checkpoint_artifact": a1_artifact'
     )
+
+
+def test_data_contract_imports_with_real_runner_src_only_path(tmp_path):
+    """Prevent pytest's repository-root sys.path from hiding runner import failures."""
+    project = Path(__file__).resolve().parents[1]
+    code = """
+import sys
+from pathlib import Path
+
+project = Path(sys.argv[1]).resolve()
+assert project not in map(Path, map(str, sys.path))
+import parta_data_contract
+import adt_gt_supported_clip
+assert adt_gt_supported_clip.ContractError is parta_data_contract.ContractError
+assert callable(parta_data_contract.validate_guide_sampling_binding)
+"""
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(project / "src")
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(project)],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    "module_prefix,python_paths,cwd_mode",
+    [
+        ("", ("src",), "tmp"),
+        ("src.", ("root",), "tmp"),
+        ("", ("root", "src"), "root"),
+    ],
+)
+def test_data_contract_import_namespace_identity(
+    tmp_path, module_prefix, python_paths, cwd_mode
+):
+    project = Path(__file__).resolve().parents[1]
+    code = """
+import importlib
+import sys
+
+prefix = sys.argv[1]
+contract = importlib.import_module(prefix + "parta_data_contract")
+clip = importlib.import_module(prefix + "adt_gt_supported_clip")
+assert clip.ContractError is contract.ContractError
+opposite = "parta_data_contract" if prefix else "src.parta_data_contract"
+assert opposite not in sys.modules
+"""
+    resolved_paths = [
+        str(project / "src") if item == "src" else str(project)
+        for item in python_paths
+    ]
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = os.pathsep.join(resolved_paths)
+    result = subprocess.run(
+        [sys.executable, "-c", code, module_prefix],
+        cwd=project if cwd_mode == "root" else tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_seed_other_than_42_is_rejected_before_execution(tmp_path):
