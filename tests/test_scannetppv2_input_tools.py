@@ -21,6 +21,7 @@ AUDIT = load_script("audit_scannetppv2_vsi_inputs")
 PROBE = load_script("probe_vsi_video_metadata")
 CONFIG = load_script("build_scannetppv2_download_config")
 PILOT = load_script("audit_scannetppv2_pilot")
+BUNDLE = load_script("build_scannetppv2_pilot_frame_bundle")
 
 
 def test_minimal_download_assets_cover_geometry_identity_and_camera_metadata():
@@ -90,6 +91,22 @@ def test_ply_vertex_count_and_label_aliases(tmp_path: Path):
     assert PILOT.normalized_label("office chair") == "chair"
     assert PILOT.normalized_label("trash bin") == "trash can"
     assert PILOT.normalized_label("mouse") == "computer mouse"
+
+
+def test_pilot_bundle_indices_and_metadata_lookup():
+    assert BUNDLE.selected_indices(4934) == [0, 1233, 2466, 3699, 4933]
+    report = {
+        "videos": [
+            {
+                "media": "scannetppv2/39f36da05b.mp4",
+                "status": "ok",
+                "frame_count": 4934,
+            }
+        ]
+    }
+    assert BUNDLE.media_record(report, "39f36da05b")["frame_count"] == 4934
+    with pytest.raises(ValueError):
+        BUNDLE.media_record(report, "missing")
 
 
 def test_frame_metainfo_detects_bad_scene_and_cross_category_collision(
