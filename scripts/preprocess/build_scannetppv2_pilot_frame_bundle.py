@@ -97,8 +97,11 @@ def main() -> None:
             str(video),
             "-vf",
             f"select=eq(n\\,{index})",
-            "-fps_mode",
-            "vfr",
+            # ``-fps_mode`` was added after the ffmpeg release installed on
+            # the execution server.  ``-vsync 0`` is the legacy-compatible
+            # equivalent here and prevents timestamp-driven frame duplication.
+            "-vsync",
+            "0",
             "-frames:v",
             "1",
             str(output),
