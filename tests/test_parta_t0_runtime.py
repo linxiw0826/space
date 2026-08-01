@@ -30,6 +30,28 @@ def load_runner_module():
     return script, runner
 
 
+def test_tensor_diagnostic_is_exact_across_chunks_without_full_float_copy():
+    _, runner = load_runner_module()
+    values = torch.arange(300_000, dtype=torch.float32) - 123.0
+    diagnostic = runner._tensor_diagnostic(values.to(torch.bfloat16))
+    reference = values.to(torch.bfloat16).float()
+    assert diagnostic["shape"] == [300_000]
+    assert diagnostic["finite"] is True
+    assert diagnostic["nonfinite_count"] == 0
+    assert diagnostic["min"] == float(reference.min())
+    assert diagnostic["max"] == float(reference.max())
+    assert diagnostic["l2_norm"] == pytest.approx(
+        float(reference.double().norm()), rel=1e-12
+    )
+
+    bad = torch.tensor([1.0, float("nan"), float("inf")])
+    diagnostic = runner._tensor_diagnostic(bad)
+    assert diagnostic["finite"] is False
+    assert diagnostic["nonfinite_count"] == 2
+    assert diagnostic["min"] == diagnostic["max"] == 1.0
+    assert diagnostic["l2_norm"] is None
+
+
 class FakeProcessor:
     def __init__(self, *, visual_after_question=False, corrupt_prompt=False):
         self.resize_calls = []

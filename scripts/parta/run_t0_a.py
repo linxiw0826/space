@@ -427,14 +427,38 @@ def _validate_manifest_sampling(
 
 
 def _tensor_diagnostic(tensor: torch.Tensor) -> dict[str, object]:
-    detached = tensor.detach().float()
-    finite = torch.isfinite(detached)
+    # QA logits for a 32-frame fixture can contain billions of values.  A
+    # whole-tensor `.float()` plus boolean indexing temporarily needs several
+    # extra GiB and can OOM after an otherwise successful forward/backward.
+    # Compute the exact same audit statistics in bounded chunks instead.
+    flat = tensor.detach().reshape(-1)
+    chunk_elements = 262_144
+    nonfinite_count = 0
+    minimum = None
+    maximum = None
+    squared_norm = 0.0
+    with torch.no_grad():
+        for start in range(0, flat.numel(), chunk_elements):
+            chunk = flat[start : start + chunk_elements].float()
+            finite = torch.isfinite(chunk)
+            finite_count = int(finite.sum().item())
+            nonfinite_count += chunk.numel() - finite_count
+            if finite_count:
+                values = chunk[finite]
+                piece_min = float(values.min().cpu())
+                piece_max = float(values.max().cpu())
+                minimum = piece_min if minimum is None else min(minimum, piece_min)
+                maximum = piece_max if maximum is None else max(maximum, piece_max)
+                squared_norm += float(
+                    torch.sum(values * values, dtype=torch.float64).cpu()
+                )
     return {
         "shape": list(tensor.shape), "dtype": str(tensor.dtype),
-        "finite": bool(finite.all()), "nonfinite_count": int((~finite).sum()),
-        "min": float(detached[finite].min().cpu()) if finite.any() else None,
-        "max": float(detached[finite].max().cpu()) if finite.any() else None,
-        "l2_norm": float(detached.norm().cpu()) if finite.all() else None,
+        "finite": nonfinite_count == 0,
+        "nonfinite_count": nonfinite_count,
+        "min": minimum,
+        "max": maximum,
+        "l2_norm": squared_norm**0.5 if nonfinite_count == 0 else None,
     }
 
 
