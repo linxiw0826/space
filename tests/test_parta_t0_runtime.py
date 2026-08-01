@@ -95,6 +95,14 @@ class FakeGuideModel(torch.nn.Module):
         self.feature_fusion_module = torch.nn.Linear(8, 8)
         self.language_model = torch.nn.Linear(8, 8)
         self.received_keys = None
+        self.gradient_checkpointing_enabled = False
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        assert gradient_checkpointing_kwargs == {"use_reentrant": False}
+        self.gradient_checkpointing_enabled = True
+
+    def enable_input_require_grads(self):
+        self.input_require_grads_enabled = True
 
     def forward(self, **kwargs):
         assert kwargs.pop("return_visual_state_tap") is True
@@ -309,7 +317,7 @@ def test_successful_fake_cli_is_transactional_and_runs_real_gates(tmp_path, monk
     original_attach = runner.attach_a1o_state_head
     def attach_and_capture(model, config):
         head = original_attach(model, config)
-        captured["model"] = model
+        captured.setdefault("model", model)
         return head
     monkeypatch.setattr(runner, "attach_a1o_state_head", attach_and_capture)
     def empty_target(item):
@@ -333,6 +341,11 @@ def test_successful_fake_cli_is_transactional_and_runs_real_gates(tmp_path, monk
     assert report["checks"]["head_free_equivalence"]["backbone_digest_matches"]
     assert json.loads((output / "run_status.json").read_text())["status"] == "complete"
     assert resolved["seed"] == 42 and resolved["base_interval"] == 1.0
+    assert resolved["use_cache"] is False
+    assert resolved["gradient_checkpointing"] is True
+    assert resolved["gradient_checkpointing_use_reentrant"] is False
+    assert captured["model"].gradient_checkpointing_enabled is True
+    assert captured["model"].input_require_grads_enabled is True
     assert provenance["manifest_provenance"]["adt"]["base_interval"] == 1.0
     assert provenance["manifest_provenance"]["hypersim"]["base_interval"] is None
     assert provenance["manifest_provenance"]["hypersim"]["sampling_contract"] == "single_frame_verified_v1"

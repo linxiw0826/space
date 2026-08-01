@@ -628,9 +628,26 @@ def main() -> None:
         processor, model, runtime_contract = _load_local(
             args.model_path, args.vggt_path, dtype, args.device
         )
+        # Match the reproduced GUIDE training memory contract.  In particular,
+        # GradientCheckpointingLayer only checkpoints while the model is in
+        # training mode; leaving the smoke runner in eval mode retains every
+        # decoder activation for the 32-frame ADT fixture and exceeds a 96 GiB
+        # H20 before the first backward pass.
+        model.config.use_cache = False
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
         config.update(runtime_contract)
+        config.update({
+            "use_cache": False,
+            "gradient_checkpointing": True,
+            "gradient_checkpointing_use_reentrant": False,
+            "memory_contract": "guide_training_equivalent_v1",
+        })
         atomic_json_dump(config, args.output / "resolved_config.json")
-        model.eval()
+        model.train()
         device = torch.device(args.device)
         collator = PartAT0Collator(processor)
         hidden_size = int(model.config.text_config.hidden_size)
@@ -724,7 +741,12 @@ def main() -> None:
                 [target],
                 StateLossConfig(),
             )
-            bypass_output = forward_visual_tap(model, processed)
+            # This second pass only proves that A0 and A1-O bind the same
+            # frames/masks/spans.  It contributes no loss and must not retain a
+            # second full 32-frame autograd graph alongside the authoritative
+            # QA/state graph above.
+            with torch.no_grad():
+                bypass_output = forward_visual_tap(model, processed)
             tap_a0 = build_state_tap_from_packed(
                 output.visual_state_hidden, output.visual_state_valid_mask,
                 [processed.frame_token_counts], [processed.frame_ids], [processed.media_kind],
@@ -906,12 +928,13 @@ def main() -> None:
             first_processed, "Describe the same scene differently."
         )
         alternate = type(alternate)(**{**vars(alternate), "model_kwargs": _to_device(alternate.model_kwargs, device)})
-        alternate_output = forward_visual_tap(model, alternate)
-        alternate_branch = run_a1o_side_branch(
-            model, alternate_output.visual_state_hidden, alternate_output.visual_state_valid_mask,
-            [alternate.frame_token_counts], [alternate.frame_ids], [alternate.media_kind],
-            [first_target], StateLossConfig(),
-        )
+        with torch.no_grad():
+            alternate_output = forward_visual_tap(model, alternate)
+            alternate_branch = run_a1o_side_branch(
+                model, alternate_output.visual_state_hidden, alternate_output.visual_state_valid_mask,
+                [alternate.frame_token_counts], [alternate.frame_ids], [alternate.media_kind],
+                [first_target], StateLossConfig(),
+            )
         alternate_tap = build_state_tap_from_packed(
             alternate_output.visual_state_hidden, alternate_output.visual_state_valid_mask,
             [alternate.frame_token_counts], [alternate.frame_ids], [alternate.media_kind],
@@ -1018,7 +1041,8 @@ def main() -> None:
         backbone_digest_matches = restored_backbone_sha256 == a1_shared_state_sha256
         if not backbone_digest_matches:
             raise RuntimeError("head-free restored backbone digest differs from A1 shared digest")
-        clean_output = forward_visual_tap(clean_model, first_processed)
+        with torch.no_grad():
+            clean_output = forward_visual_tap(clean_model, first_processed)
         head_free_cmp = compare_tensors(reference_logits, clean_output.logits.detach().cpu())
         report.add_boolean(
             "head_free_equivalence", head_free_cmp.passed and backbone_digest_matches,
@@ -1032,12 +1056,13 @@ def main() -> None:
         resumed_state = torch.load(resume_path, map_location="cpu", weights_only=True)["model"]
         resumed_model.load_state_dict(resumed_state, strict=True)
         resumed_model.eval()
-        resumed_output = forward_visual_tap(resumed_model, first_processed)
-        resumed_branch = run_a1o_side_branch(
-            resumed_model, resumed_output.visual_state_hidden, resumed_output.visual_state_valid_mask,
-            [first_processed.frame_token_counts], [first_processed.frame_ids],
-            [first_processed.media_kind], [first_target], StateLossConfig(),
-        )
+        with torch.no_grad():
+            resumed_output = forward_visual_tap(resumed_model, first_processed)
+            resumed_branch = run_a1o_side_branch(
+                resumed_model, resumed_output.visual_state_hidden, resumed_output.visual_state_valid_mask,
+                [first_processed.frame_token_counts], [first_processed.frame_ids],
+                [first_processed.media_kind], [first_target], StateLossConfig(),
+            )
         resume_checks = [compare_tensors(reference_logits, resumed_output.logits.detach().cpu())]
         for field in ("existence_logits", "category_logits", "center_world_normalized", "extent_normalized", "visibility_logits"):
             resume_checks.append(compare_tensors(reference_predictions[field], getattr(resumed_branch.predictions, field)))
