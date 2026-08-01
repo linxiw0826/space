@@ -23,6 +23,7 @@ from src.parta_data_contract import (  # noqa: E402
     validate_records,
     write_jsonl,
 )
+from src.scannetppv2_support import validate_support_certificate  # noqa: E402
 
 
 FILES = {
@@ -57,21 +58,36 @@ def main() -> None:
     parser.add_argument("--expected-source", action="append", default=[])
     args = parser.parse_args()
     trusted_registry = None
-    if args.source == "adt":
+    if args.source in {"adt", "scannetppv2"}:
+        report_name = (
+            "adt_alignment_report.json"
+            if args.source == "adt"
+            else "scannetppv2_alignment_report.json"
+        )
         source_report = json.loads(
-            (args.input_dir / "adt_alignment_report.json").read_text()
+            (args.input_dir / report_name).read_text()
         )
         trusted_registry = source_report.get("support_certificate_registry")
         if not isinstance(trusted_registry, dict):
-            raise ValueError("ADT source report lacks trusted certificate registry")
+            raise ValueError(
+                f"{args.source} source report lacks trusted certificate registry"
+            )
         certificate_path = (
             args.input_dir / trusted_registry["path"]
         )
         if file_sha256(certificate_path) != trusted_registry["sha256"]:
-            raise ValueError("ADT source certificate registry digest mismatch")
+            raise ValueError(
+                f"{args.source} source certificate registry digest mismatch"
+            )
+        if args.source == "scannetppv2":
+            certificates = list(read_jsonl(certificate_path))
+            for certificate in certificates:
+                validate_support_certificate(certificate)
 
     scene_name, frame_name, qa_name = FILES[args.source]
     scenes = [adapt_scene(args.source, row) for row in read_jsonl(args.input_dir / scene_name)]
+    if args.source == "scannetppv2" and len(certificates) != len(scenes):
+        raise ValueError("ScanNet++ certificate count differs from scene count")
     raw_frames = list(read_jsonl(args.input_dir / frame_name))
     expected_visible_observations = sum(
         source_visibility_contract(args.source, observation)[1]
@@ -109,13 +125,18 @@ def main() -> None:
     report_payload = report.as_dict()
     if trusted_registry is not None:
         canonical_certificate = (
-            args.output_dir / "adt_support_certificates.jsonl"
+            args.output_dir
+            / (
+                "adt_support_certificates.jsonl"
+                if args.source == "adt"
+                else "scannetppv2_support_certificates.jsonl"
+            )
         )
         shutil.copyfile(certificate_path, canonical_certificate)
         report_payload["trusted_support_certificate_registry"] = {
             "path": canonical_certificate.name,
             "sha256": trusted_registry["sha256"],
-            "anchored_by": "canonicalized_finalizer_report_v1",
+            "anchored_by": f"canonicalized_{args.source}_finalizer_report_v1",
         }
     (args.output_dir / "validation_report.json").write_text(
         json.dumps(report_payload, indent=2) + "\n", encoding="utf-8"

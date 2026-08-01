@@ -16,6 +16,7 @@ sys.path.insert(0, str(PROJECT))
 from src.parta_data_contract import (  # noqa: E402
     ContractError,
     GUIDE_EXACT_SAMPLING_POLICY,
+    GUIDE_WHOLE_MP4_SAMPLING_POLICY,
     build_manifest_rows,
     guide_frame_indices,
     read_jsonl,
@@ -26,7 +27,10 @@ from src.parta_data_contract import (  # noqa: E402
 from src.adt_gt_supported_clip import (  # noqa: E402
     GT_SUPPORTED_CLIP_POLICY,
     select_maximal_run,
-    validate_support_certificate,
+    validate_support_certificate as validate_adt_support_certificate,
+)
+from src.scannetppv2_support import (  # noqa: E402
+    validate_support_certificate as validate_scannetppv2_support_certificate,
 )
 
 
@@ -77,17 +81,20 @@ def main() -> None:
     scenes = list(read_jsonl(args.scenes))
     frames = list(read_jsonl(args.frames))
     qa_rows = list(read_jsonl(args.qa))
-    has_adt_video = any(
-        row.get("source_dataset") == "adt"
-        and row.get("media_kind") != "image"
+    video_sources = {
+        row.get("source_dataset")
         for row in qa_rows
+        if row.get("media_kind") == "video"
+    }
+    has_certified_video = bool(
+        video_sources & {"adt", "scannetppv2"}
     )
     certificates = {}
-    if has_adt_video:
+    if has_certified_video:
         canonical_report_path = args.scenes.parent / "validation_report.json"
         if not canonical_report_path.is_file():
             raise ContractError(
-                "ADT exact build requires canonical sibling validation_report.json"
+                "Exact video build requires canonical sibling validation_report.json"
             )
         canonical_report = json.loads(canonical_report_path.read_text())
         registry = canonical_report.get(
@@ -107,17 +114,30 @@ def main() -> None:
             key = (certificate["scene_id"], certificate["vsi_media"])
             if key in certificates:
                 raise ContractError(f"Duplicate external support certificate: {key}")
-            validate_support_certificate(certificate)
+            if certificate.get("schema_version", "").startswith("adt_"):
+                validate_adt_support_certificate(certificate)
+            else:
+                validate_scannetppv2_support_certificate(certificate)
             certificates[key] = certificate
     frame_lookup = {
         (row["source_dataset"], row["frame_key"]): row for row in frames
     }
     metadata = {}
     if args.video_metadata:
-        for row in read_jsonl(args.video_metadata):
-            metadata[
-                (row["source_dataset"], row["scene_id"], row["vsi_media"])
-            ] = (int(row["total_frames"]), float(row["fps"]))
+        text = args.video_metadata.read_text(encoding="utf-8")
+        payload = json.loads(text) if text.lstrip().startswith("{") else None
+        rows = (
+            payload["videos"]
+            if isinstance(payload, dict) and isinstance(payload.get("videos"), list)
+            else read_jsonl(args.video_metadata)
+        )
+        for row in rows:
+            media = row.get("vsi_media", row.get("media"))
+            source = row.get("source_dataset", str(media).split("/", 1)[0])
+            scene = row.get("scene_id", Path(str(media)).stem)
+            total = row.get("total_frames", row.get("frame_count"))
+            fps_value = row.get("fps", row.get("avg_fps"))
+            metadata[(source, scene, media)] = (int(total), float(fps_value))
 
     rebound = []
     for qa in qa_rows:
@@ -142,15 +162,62 @@ def main() -> None:
                 f"Missing video metadata for {meta_key}; provide "
                 "--video-metadata or --video-root"
             )
-        provenance = qa["clip_provenance"]
-        embedded_certificate = provenance["support_certificate"]
         certificate_key = (qa["scene_id"], qa["vsi_media"])
         external_certificate = certificates.get(certificate_key)
+        if qa["source_dataset"] == "scannetppv2":
+            if external_certificate is None:
+                raise ContractError(
+                    f"Missing ScanNet++ support certificate: {certificate_key}"
+                )
+            validate_scannetppv2_support_certificate(external_certificate)
+            guide_indices = guide_frame_indices(
+                total_frames,
+                fps,
+                base_interval=args.base_interval,
+                min_frames=args.min_frames,
+                max_frames=args.max_frames,
+            )
+            if qa["sampling_policy"] != GUIDE_WHOLE_MP4_SAMPLING_POLICY:
+                raise ContractError("ScanNet++ exact build requires whole-MP4 GUIDE")
+            if int(qa["video_total_frames"]) != total_frames:
+                raise ContractError("ScanNet++ video total-frame provenance mismatch")
+            if float(qa["video_fps"]).hex() != float(fps).hex():
+                raise ContractError("ScanNet++ video FPS provenance mismatch")
+            parameter_pairs = (
+                ("base_interval", float(qa["sampling_base_interval"]), float(args.base_interval)),
+                ("min_frames", int(qa["sampling_min_frames"]), int(args.min_frames)),
+                ("max_frames", int(qa["sampling_max_frames"]), int(args.max_frames)),
+            )
+            for name, source_value, cli_value in parameter_pairs:
+                equal = (
+                    source_value.hex() == cli_value.hex()
+                    if isinstance(source_value, float)
+                    else source_value == cli_value
+                )
+                if not equal:
+                    raise ContractError(f"ScanNet++ sampling {name} mismatch")
+            if list(qa["actual_frame_indices"]) != guide_indices:
+                raise ContractError("ScanNet++ exact frame indices differ from GUIDE")
+            missing = [index for index in guide_indices if index not in candidate_frames]
+            if missing:
+                raise ContractError(f"ScanNet++ frame states missing GUIDE IDs: {missing}")
+            selected = [candidate_frames[index] for index in guide_indices]
+            if list(qa["actual_frame_keys"]) != [frame["frame_key"] for frame in selected]:
+                raise ContractError("ScanNet++ exact frame keys are not GUIDE ordered")
+            certified_frames = external_certificate["frames"]
+            if [int(frame["frame_index"]) for frame in certified_frames] != guide_indices:
+                raise ContractError("ScanNet++ certificate frame IDs differ from GUIDE")
+            if external_certificate["sampling_binding_sha256"] != qa["source_sampling_binding_sha256"]:
+                raise ContractError("ScanNet++ certificate sampling binding mismatch")
+            rebound.append(dict(qa))
+            continue
+        provenance = qa["clip_provenance"]
+        embedded_certificate = provenance["support_certificate"]
         if external_certificate != embedded_certificate:
             raise ContractError(
                 f"External support certificate mismatch: {certificate_key}"
             )
-        _, certified_runs = validate_support_certificate(external_certificate)
+        _, certified_runs = validate_adt_support_certificate(external_certificate)
         certified_clip = select_maximal_run(certified_runs)
         clip_start = int(provenance["clip_start_raw_frame"])
         clip_end = int(provenance["clip_end_raw_frame"])

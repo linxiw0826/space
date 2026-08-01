@@ -10,6 +10,12 @@ from src.scannetppv2_rasterizer import (
     instance_pixel_counts,
     load_mesh_instances,
 )
+from src.scannetppv2_support import (
+    build_support_certificate,
+    validate_support_certificate,
+)
+from src.parta_data_contract import ContractError
+import pytest
 
 
 PROJECT = Path(__file__).resolve().parents[1]
@@ -51,3 +57,30 @@ def test_native_triangle_rasterizer(tmp_path: Path):
     assert labels.shape == (10, 10)
     assert counts[0] > 0
     assert set(np.unique(labels)) <= {-1, 0}
+
+
+def test_render_support_certificate_is_tamper_evident():
+    certificate = build_support_certificate(
+        scene_id="scene",
+        vsi_media="scannetppv2/scene.mp4",
+        sampling_binding_sha256="a" * 64,
+        video_total_frames=60,
+        video_fps=60.0,
+        video_width=640,
+        video_height=480,
+        source_assets={"mesh": {"sha256": "b" * 64, "size_bytes": 1}},
+        rasterizer_source_sha256="c" * 64,
+        rasterizer_library_sha256="d" * 64,
+        frames=[{
+            "frame_index": index,
+            "frame_key": f"scene/frame_{index:06d}",
+            "pose_sha256": "e" * 64,
+            "intrinsic_sha256": "f" * 64,
+            "instance_mask_sha256": "1" * 64,
+            "visible_instance_pixel_counts": {"0": 20},
+        } for index in range(16)],
+    )
+    validate_support_certificate(certificate)
+    certificate["frames"][0]["visible_instance_pixel_counts"]["0"] = 21
+    with pytest.raises(ContractError, match="digest mismatch"):
+        validate_support_certificate(certificate)
