@@ -87,6 +87,63 @@ def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor | Non
     return values[mask].mean()
 
 
+def _canonicalize_target_order(target: StateTargets) -> StateTargets:
+    """Remove arbitrary JSONL/object-list order before Hungarian tie-breaking.
+
+    ``linear_sum_assignment`` is deterministic for a fixed cost matrix, but
+    equivalent optima are resolved using column order.  A raw GT permutation
+    can therefore select a different equivalent assignment and change the
+    separately reduced component losses.  Canonicalizing by supervised target
+    content makes the column order set-defined.  Exact duplicate rows remain
+    interchangeable and necessarily contribute identical supervised losses.
+    """
+    if target.num_objects <= 1:
+        return target
+
+    category_valid = target.category_valid.detach().cpu().bool()
+    center_valid = target.center_valid.detach().cpu().bool()
+    extent_valid = target.extent_valid.detach().cpu().bool()
+    visibility_valid = target.visibility_valid.detach().cpu().bool()
+    categories = target.categories.detach().cpu()
+    centers = target.centers_world_m.detach().cpu()
+    extents = target.extents_m.detach().cpu()
+    visibility = target.visibility.detach().cpu()
+
+    keys = []
+    for index in range(target.num_objects):
+        key: list[float | int] = [
+            int(category_valid[index]),
+            int(categories[index]) if category_valid[index] else 0,
+            int(center_valid[index]),
+        ]
+        key.extend(
+            float(value) if center_valid[index] else 0.0
+            for value in centers[index]
+        )
+        key.append(int(extent_valid[index]))
+        key.extend(
+            float(value) if extent_valid[index] else 0.0
+            for value in extents[index]
+        )
+        for frame in range(visibility.shape[1]):
+            valid = bool(visibility_valid[index, frame])
+            key.extend((int(valid), float(visibility[index, frame]) if valid else 0.0))
+        keys.append(tuple(key))
+
+    order = torch.tensor(
+        sorted(range(target.num_objects), key=lambda index: keys[index]),
+        dtype=torch.long,
+        device=target.categories.device,
+    )
+    values = vars(target).copy()
+    for name in (
+        "categories", "centers_world_m", "extents_m", "visibility",
+        "category_valid", "center_valid", "extent_valid", "visibility_valid",
+    ):
+        values[name] = values[name][order]
+    return StateTargets(**values)
+
+
 class ObjectStateSetLoss:
     """Compute non-differentiable assignment then differentiable set loss."""
 
@@ -285,7 +342,8 @@ class ObjectStateSetLoss:
         scene_metrics = []
         scene_active = []
         assignments = []
-        for index, target in enumerate(targets):
+        canonical_targets = [_canonicalize_target_order(target) for target in targets]
+        for index, target in enumerate(canonical_targets):
             prediction = ObjectStatePredictions(
                 existence_logits=predictions.existence_logits[index],
                 category_logits=predictions.category_logits[index],
@@ -303,14 +361,14 @@ class ObjectStateSetLoss:
 
         # Valid element -> scene mean happened above. Here scenes are averaged
         # within source, then sources receive equal weight.
-        sources = sorted(set(target.source_dataset for target in targets))
+        sources = sorted(set(target.source_dataset for target in canonical_targets))
         reduced = {}
         for component in self.COMPONENTS:
             source_means = []
             for source in sources:
                 indices = [
                     i
-                    for i, target in enumerate(targets)
+                    for i, target in enumerate(canonical_targets)
                     if target.source_dataset == source and scene_active[i][component]
                 ]
                 if indices:
