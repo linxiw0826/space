@@ -84,6 +84,53 @@ def finite_array(value: Any, shape: tuple[int, ...]) -> np.ndarray:
     return array
 
 
+def projection_metrics(
+    *,
+    frames: list[dict[str, Any]],
+    poses: dict[str, dict[str, Any]],
+    centers: dict[int, np.ndarray],
+    source_index,
+    width: int,
+    height: int,
+    sample_count: int = 101,
+) -> dict[str, Any]:
+    sample_indices = np.linspace(
+        0, len(frames) - 1, min(sample_count, len(frames)), dtype=np.int64
+    )
+    total = 0
+    in_front = 0
+    center_in_image = 0
+    for vsi_index in sample_indices:
+        pose = poses[f"frame_{source_index(int(vsi_index)):06d}"]
+        world_from_camera = finite_array(pose["aligned_pose"], (4, 4))
+        camera_from_world = np.linalg.inv(world_from_camera)
+        intrinsic = finite_array(pose["intrinsic"], (3, 3))
+        instance_ids = {
+            int(value)
+            for record in frames[int(vsi_index)].values()
+            for value in record["inst_ids"]
+        }
+        for instance_id in instance_ids:
+            camera = camera_from_world @ np.r_[centers[instance_id], 1.0]
+            total += 1
+            if camera[2] <= 0:
+                continue
+            in_front += 1
+            pixel = intrinsic @ camera[:3]
+            u, v = pixel[:2] / pixel[2]
+            center_in_image += int(0 <= u < width and 0 <= v < height)
+    if total == 0:
+        raise ValueError("projection audit has no visible observations")
+    return {
+        "sampled_vsi_frames": len(sample_indices),
+        "visible_object_centers": total,
+        "in_front_count": in_front,
+        "in_front_rate": in_front / total,
+        "center_in_image_count": center_in_image,
+        "center_in_image_rate": center_in_image / total,
+    }
+
+
 def audit(args: argparse.Namespace) -> dict[str, Any]:
     scene_root = args.data_root / "data" / args.scene_id
     paths = {
@@ -113,9 +160,10 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("annotation id/objectId mismatch")
 
     obb_determinants = []
+    centers = {}
     for group in groups:
         obb = group["obb"]
-        finite_array(obb["centroid"], (3,))
+        centers[int(group["index"])] = finite_array(obb["centroid"], (3,))
         lengths = finite_array(obb["axesLengths"], (3,))
         axes = finite_array(obb["normalizedAxes"], (9,)).reshape(3, 3)
         if (lengths <= 0).any():
@@ -219,10 +267,41 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
     if exif_timestamps != set(timestamps):
         raise ValueError("EXIF timestamp keys differ from pose timestamps")
 
+    image_widths = {int(record["PixelXDimension"]) for record in exif.values()}
+    image_heights = {int(record["PixelYDimension"]) for record in exif.values()}
+    if len(image_widths) != 1 or len(image_heights) != 1:
+        raise ValueError("iPhone EXIF dimensions are not constant")
+    image_width = next(iter(image_widths))
+    image_height = next(iter(image_heights))
+
     candidate_stride = 2
     expected_vsi_frames = (len(poses) + candidate_stride - 1) // candidate_stride
     if expected_vsi_frames != len(frames):
         raise ValueError("VSI frame count is not ceil(iPhone pose count / 2)")
+    candidate_projection = projection_metrics(
+        frames=frames,
+        poses=poses,
+        centers=centers,
+        source_index=lambda index: 2 * index,
+        width=image_width,
+        height=image_height,
+    )
+    control_projection = projection_metrics(
+        frames=frames,
+        poses=poses,
+        centers=centers,
+        source_index=lambda index: index,
+        width=image_width,
+        height=image_height,
+    )
+    if (
+        candidate_projection["in_front_rate"] < 0.99
+        or candidate_projection["center_in_image_rate"] < 0.6
+        or candidate_projection["center_in_image_rate"]
+        - control_projection["center_in_image_rate"]
+        < 0.2
+    ):
+        raise ValueError("candidate stride-2 projection evidence is too weak")
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -255,6 +334,8 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
             "official_stream": "iphone_rgb",
             "official_pose_count": len(poses),
             "official_exif_count": len(exif),
+            "official_image_width": image_width,
+            "official_image_height": image_height,
             "official_timestamp_step_seconds": {
                 "min": float(timestamp_steps.min()),
                 "median": float(np.median(timestamp_steps)),
@@ -264,6 +345,9 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
             "candidate_source_stride": candidate_stride,
             "candidate_mapping": "vsi_frame_i_to_iphone_frame_2i",
             "count_relation_verified": True,
+            "candidate_projection_metrics": candidate_projection,
+            "stride_1_control_projection_metrics": control_projection,
+            "visibility_projection_hypothesis_verified": True,
             "mp4_frame_count_verified": False,
             "projection_verified": False,
             "passed": False,

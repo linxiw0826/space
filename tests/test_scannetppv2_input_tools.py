@@ -93,6 +93,34 @@ def test_ply_vertex_count_and_label_aliases(tmp_path: Path):
     assert PILOT.normalized_label("mouse") == "computer mouse"
 
 
+def test_projection_metrics_prefers_matching_camera_pose():
+    frames = [
+        {
+            "chair": {
+                "inst_ids": np.asarray([0], dtype=np.int64),
+                "inst_num_pixels": np.asarray([100], dtype=np.int64),
+                "num_pixels": 100,
+            }
+        }
+    ]
+    poses = {
+        "frame_000000": {
+            "aligned_pose": np.eye(4).tolist(),
+            "intrinsic": [[10.0, 0.0, 5.0], [0.0, 10.0, 5.0], [0.0, 0.0, 1.0]],
+        }
+    }
+    result = PILOT.projection_metrics(
+        frames=frames,
+        poses=poses,
+        centers={0: np.asarray([0.0, 0.0, 2.0])},
+        source_index=lambda index: index,
+        width=10,
+        height=10,
+    )
+    assert result["in_front_rate"] == 1.0
+    assert result["center_in_image_rate"] == 1.0
+
+
 def test_pilot_bundle_indices_and_metadata_lookup():
     assert BUNDLE.selected_indices(4934) == [0, 1233, 2466, 3699, 4933]
     report = {
