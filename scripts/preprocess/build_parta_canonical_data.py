@@ -32,6 +32,11 @@ FILES = {
         "hypersim_frame_states.jsonl",
         "hypersim_qa_train.jsonl",
     ),
+    "scannetppv2": (
+        "scannetppv2_scene_states.jsonl",
+        "scannetppv2_frame_states.jsonl",
+        "scannetppv2_qa_train.jsonl",
+    ),
 }
 
 

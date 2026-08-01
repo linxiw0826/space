@@ -12,6 +12,7 @@ from src.adt_gt_supported_clip import build_support_certificate
 from src.parta_data_contract import (
     ContractError,
     GUIDE_EXACT_SAMPLING_POLICY,
+    GUIDE_WHOLE_MP4_SAMPLING_POLICY,
     T0_FIXTURES,
     adapt_frame,
     adapt_qa,
@@ -275,6 +276,90 @@ def test_valid_contract_null_and_mask():
     ]["high"] == 1
     assert frames[0]["visible_nodes"][0]["visible"] is True
     assert frames[0]["visible_nodes"][0]["evidence_present"] is True
+
+
+def test_scannetppv2_video_contract_end_to_end():
+    scene_id = "39f36da05b"
+    total_frames = 60
+    indices = guide_frame_indices(total_frames, 60.0)
+    keys = [f"{scene_id}/frame_{index:06d}" for index in indices]
+    raw_scene = {
+        "schema_version": "scannetppv2_scene_state_v1",
+        "scene_id": scene_id,
+        "nodes": [{
+            "object_id": "0",
+            "category": "chair",
+            "center_world_m": [1.0, 2.0, 3.0],
+            "extent_m": [0.5, 0.6, 0.7],
+            "rotation_world_from_object": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+            "motion_type": "static",
+        }],
+    }
+    raw_frames = [{
+        "schema_version": "scannetppv2_frame_state_v1",
+        "scene_id": scene_id,
+        "frame_key": key,
+        "frame_index": index,
+        "vsi_media": f"scannetppv2/{scene_id}.mp4",
+        "rotation_world_from_camera": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+        "translation_world_from_camera_m": [0, 0, 0],
+        "visible_nodes": [{
+            "object_id": "0",
+            "visible": True,
+            "geometry_valid": True,
+            "pixel_count": 100,
+        }],
+    } for key, index in zip(keys, indices)]
+    binding = guide_sampling_binding_sha256(
+        source_dataset="scannetppv2",
+        scene_id=scene_id,
+        vsi_media=f"scannetppv2/{scene_id}.mp4",
+        frame_keys=keys,
+        frame_indices=indices,
+        total_frames=total_frames,
+        fps=60.0,
+        base_interval=1.0,
+        min_frames=16,
+        max_frames=32,
+        sampling_policy=GUIDE_WHOLE_MP4_SAMPLING_POLICY,
+    )
+    raw_qa = {
+        "schema_version": "scannetppv2_qa_train_v1",
+        "source_dataset": "scannetppv2",
+        "vsi_row_index": 1,
+        "scene_id": scene_id,
+        "candidate_frame_keys": keys,
+        "candidate_frame_indices": indices,
+        "vsi_media": f"scannetppv2/{scene_id}.mp4",
+        "question_type": "absolute_count",
+        "conversations": [],
+        "qa_evidence_scope": "scene_associated_unlocalized",
+        "qa_visual_support_verified": False,
+        "evidence_frame_indices": None,
+        "loss_masks": {"scene_geometry": True},
+        "sampling_policy": GUIDE_WHOLE_MP4_SAMPLING_POLICY,
+        "total_frames": total_frames,
+        "fps": 60.0,
+        "base_interval": 1.0,
+        "min_frames": 16,
+        "max_frames": 32,
+        "sampling_binding_sha256": binding,
+        "clip_provenance": None,
+    }
+    scenes = [adapt_scene("scannetppv2", raw_scene)]
+    frames = [adapt_frame("scannetppv2", row) for row in raw_frames]
+    qa = adapt_qa("scannetppv2", raw_qa)
+    manifest = list(build_manifest_rows(
+        [qa], {(row["source_dataset"], row["frame_key"]): row for row in frames}
+    ))
+    report = validate_records(
+        scenes, frames, manifest, expected_sources=["scannetppv2"]
+    )
+    assert report.scenes == 1
+    assert report.frames == 16
+    assert report.qa == 1
+    assert manifest[0]["media_kind"] == "video"
+    assert manifest[0]["qa_evidence_scope"] == "scene_associated_unlocalized"
 
 
 def test_scene_capacity_report_uses_unambiguous_whole_scene_fields():

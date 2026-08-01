@@ -34,6 +34,7 @@ T0_FIXTURES = {
     ),
     "hypersim": ("ai_001_001", "ai_001_002"),
 }
+VIDEO_SOURCES = {"adt", "scannetppv2"}
 STATE_FIELDS = ("category", "center", "extent", "visibility")
 CANONICAL_COORDINATE_CONTRACT = {
     "name": "parta_right_handed_xright_yup_zback_m_v1",
@@ -68,6 +69,21 @@ SOURCE_CONTRACTS = {
             (1.0, 0.0, 0.0),
             (0.0, 1.0, 0.0),
             (0.0, 0.0, 1.0),
+        ),
+    },
+    "scannetppv2": {
+        "source_schema_prefixes": (
+            "scannetppv2_scene_state_v1",
+            "scannetppv2_frame_state_v1",
+        ),
+        "source_axes": {"x": "right", "y": "forward", "z": "up"},
+        "source_handedness": "right",
+        "source_units": "meters",
+        # ScanNet++ aligned meshes are z-up.  Match the canonical y-up frame.
+        "rotation_canonical_from_source_world": (
+            (1.0, 0.0, 0.0),
+            (0.0, 0.0, 1.0),
+            (0.0, -1.0, 0.0),
         ),
     },
 }
@@ -278,11 +294,17 @@ def validate_qa_evidence_contract(row: Mapping[str, Any]) -> None:
 
 def validate_guide_sampling_binding(row: Mapping[str, Any]) -> None:
     """Fail closed unless a QA row carries a valid exact GUIDE binding."""
+    source = row.get("source_dataset", "adt")
     policy = row.get("sampling_policy")
-    if policy != GUIDE_EXACT_SAMPLING_POLICY:
+    expected_policy = (
+        GUIDE_EXACT_SAMPLING_POLICY
+        if source == "adt"
+        else GUIDE_WHOLE_MP4_SAMPLING_POLICY
+    )
+    if source not in VIDEO_SOURCES or policy != expected_policy:
         raise ContractError(
-            "ADT sampling_policy must be exactly "
-            f"{GUIDE_EXACT_SAMPLING_POLICY}, got {policy!r}"
+            f"{source} sampling_policy must be exactly "
+            f"{expected_policy}, got {policy!r}"
         )
     field_map = {
         "frame_keys": row.get(
@@ -326,6 +348,27 @@ def validate_guide_sampling_binding(row: Mapping[str, Any]) -> None:
             "Invalid GUIDE source sampling binding SHA256: "
             f"expected={expected}, actual={actual}"
         )
+    if source == "scannetppv2":
+        if clip_provenance is not None:
+            raise ContractError(
+                "ScanNet++ whole-MP4 sampling must not carry clip provenance"
+            )
+        recomputed_indices = guide_frame_indices(
+            int(field_map["total_frames"]),
+            float(field_map["fps"]),
+            base_interval=float(field_map["base_interval"]),
+            min_frames=int(field_map["min_frames"]),
+            max_frames=int(field_map["max_frames"]),
+        )
+        if list(field_map["frame_indices"]) != recomputed_indices:
+            raise ContractError(
+                "ScanNet++ source sampling contains non-GUIDE MP4 frame IDs"
+            )
+        if len(field_map["frame_keys"]) != len(recomputed_indices):
+            raise ContractError(
+                "ScanNet++ sampling frame key/index lengths differ"
+            )
+        return
     if not isinstance(clip_provenance, Mapping):
         raise ContractError("Missing D-59 clip_provenance")
     required_clip = {
@@ -650,6 +693,21 @@ def source_visibility_contract(
             evidence_present,
             bool(explicit_visible and geometry_valid and pixel_count >= 16),
         )
+    if source == "scannetppv2":
+        geometry_valid = observation.get("geometry_valid", False)
+        pixel_count = observation.get("pixel_count")
+        if not isinstance(geometry_valid, bool):
+            raise ContractError("ScanNet++ geometry_valid must be boolean")
+        if not isinstance(pixel_count, (int, float)) or isinstance(
+            pixel_count, bool
+        ):
+            raise ContractError(
+                "ScanNet++ visibility evidence requires numeric pixel_count"
+            )
+        return (
+            evidence_present,
+            bool(explicit_visible and geometry_valid and pixel_count >= 16),
+        )
     raise ContractError(f"Unsupported source: {source}")
 
 
@@ -743,7 +801,7 @@ def adapt_frame(source: str, raw: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def adapt_qa(source: str, raw: Mapping[str, Any]) -> dict[str, Any]:
-    if source == "adt":
+    if source in VIDEO_SOURCES:
         validate_guide_sampling_binding(raw)
         keys = list(raw["candidate_frame_keys"])
         indices = [int(value) for value in raw["candidate_frame_indices"]]
@@ -778,15 +836,16 @@ def adapt_qa(source: str, raw: Mapping[str, Any]) -> dict[str, Any]:
         },
         "source_schema_version": raw.get("schema_version"),
     }
-    if source == "adt":
+    if source in VIDEO_SOURCES:
         if (
             raw.get("qa_evidence_scope")
             != "scene_associated_unlocalized"
             or raw.get("qa_visual_support_verified") is not False
             or raw.get("evidence_frame_indices") is not None
         ):
+            source_name = "ADT" if source == "adt" else "ScanNet++ V2"
             raise ContractError(
-                "ADT source QA must be "
+                f"{source_name} source QA must be "
                 "scene_associated_unlocalized/false/null"
             )
         row.update({
@@ -795,10 +854,8 @@ def adapt_qa(source: str, raw: Mapping[str, Any]) -> dict[str, Any]:
             "qa_visual_support_verified": raw.get(
                 "qa_visual_support_verified"
             ),
-            "duration_coverage_ratio": raw.get(
-                "duration_coverage_ratio"
-            ),
-            "coverage_bin": raw.get("coverage_bin"),
+            "duration_coverage_ratio": raw.get("duration_coverage_ratio", 1.0),
+            "coverage_bin": raw.get("coverage_bin", "high"),
         })
         row.update({
             "sampling_policy": raw.get("sampling_policy"),
@@ -813,9 +870,13 @@ def adapt_qa(source: str, raw: Mapping[str, Any]) -> dict[str, Any]:
             "clip_provenance": raw.get("clip_provenance"),
         })
         validate_guide_sampling_binding(row)
-        expected_ratio = duration_coverage_ratio(row["clip_provenance"])
-        if float(row["duration_coverage_ratio"]).hex() != expected_ratio.hex():
-            raise ContractError("ADT duration coverage provenance mismatch")
+        expected_ratio = (
+            duration_coverage_ratio(row["clip_provenance"])
+            if source == "adt"
+            else 1.0
+        )
+        if float(row["duration_coverage_ratio"]).hex() != float(expected_ratio).hex():
+            raise ContractError(f"{source} duration coverage provenance mismatch")
         if row["coverage_bin"] != coverage_bin(expected_ratio):
             raise ContractError("ADT coverage bin mismatch")
     else:
@@ -919,7 +980,7 @@ def validate_records(
         key = (frame["source_dataset"], frame["scene_id"])
         validate_source_media_contract(
             frame["source_dataset"],
-            "video" if frame["source_dataset"] == "adt" else "image",
+            "video" if frame["source_dataset"] in VIDEO_SOURCES else "image",
             frame.get("vsi_media"),
         )
         if key not in scene_map:
@@ -976,7 +1037,7 @@ def validate_records(
         )
         if scene_key not in scene_map:
             raise ContractError(f"QA references missing scene {scene_key}")
-        if qa["source_dataset"] == "adt":
+        if qa["source_dataset"] in VIDEO_SOURCES:
             validate_guide_sampling_binding(qa)
         validate_qa_evidence_contract(qa)
         ratio = float(qa.get("duration_coverage_ratio"))
@@ -1013,7 +1074,7 @@ def validate_records(
             qa.get("coverage_bin"),
             content_sha256(qa.get("clip_provenance")),
         )
-        if qa["source_dataset"] == "adt":
+        if qa["source_dataset"] in VIDEO_SOURCES:
             prior_contract = scene_qa_contracts.setdefault(
                 scene_key, shared_contract
             )
@@ -1069,7 +1130,7 @@ def validate_records(
             expected_bin
         ] += 1
     if expected_sources is not None:
-        unknown = set(expected_sources) - set(T0_FIXTURES)
+        unknown = set(expected_sources) - set(SOURCE_CONTRACTS)
         if unknown:
             raise ContractError(f"Unknown expected sources: {sorted(unknown)}")
         present_sources = {s["source_dataset"] for s in scenes}
@@ -1147,6 +1208,17 @@ def validate_source_media_contract(
         if media_kind != "video" or raw_parts[0] != "adt" or suffix != ".mp4":
             raise ContractError(
                 "ADT requires media_kind=video, adt/ prefix, and an MP4 path"
+            )
+        return
+    if source == "scannetppv2":
+        if (
+            media_kind != "video"
+            or raw_parts[0] != "scannetppv2"
+            or suffix != ".mp4"
+        ):
+            raise ContractError(
+                "ScanNet++ V2 requires media_kind=video, scannetppv2/ prefix, "
+                "and an MP4 path"
             )
         return
     if source == "hypersim":
