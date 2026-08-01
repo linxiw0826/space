@@ -22,6 +22,7 @@ PROBE = load_script("probe_vsi_video_metadata")
 CONFIG = load_script("build_scannetppv2_download_config")
 PILOT = load_script("audit_scannetppv2_pilot")
 BUNDLE = load_script("build_scannetppv2_pilot_frame_bundle")
+FULL = load_script("audit_scannetppv2_full_contract")
 
 
 def test_minimal_download_assets_cover_geometry_identity_and_camera_metadata():
@@ -200,3 +201,62 @@ def test_jsonl_counts_qa_by_scene(tmp_path: Path):
     result = AUDIT.audit_jsonl(path)
     assert result["scannetpp_rows"] == 2
     assert result["scene_qa_counts"] == {"a": 2}
+
+
+def test_full_contract_scene_audit(tmp_path: Path):
+    scene = tmp_path / "data" / "scene"
+    (scene / "scans").mkdir(parents=True)
+    (scene / "iphone").mkdir()
+    (scene / "scans" / "mesh_aligned_0.05.ply").write_bytes(
+        b"ply\nformat binary_little_endian 1.0\n"
+        b"element vertex 2\nend_header\n"
+    )
+    (scene / "scans" / "segments.json").write_text(
+        json.dumps({"segIndices": [1, 2]}), encoding="utf-8"
+    )
+    group = {
+        "index": 0,
+        "id": 10,
+        "objectId": 10,
+        "label": "chair",
+        "segments": [1],
+        "obb": {
+            "centroid": [0, 0, 2],
+            "axesLengths": [1, 1, 1],
+            "normalizedAxes": np.eye(3).reshape(-1).tolist(),
+        },
+    }
+    (scene / "scans" / "segments_anno.json").write_text(
+        json.dumps({"segGroups": [group]}), encoding="utf-8"
+    )
+    poses = {
+        f"frame_{index:06d}": {
+            "intrinsic": np.eye(3).tolist(),
+            "aligned_pose": np.eye(4).tolist(),
+        }
+        for index in range(2)
+    }
+    (scene / "iphone" / "pose_intrinsic_imu.json").write_text(
+        json.dumps(poses), encoding="utf-8"
+    )
+    exif = {
+        str(index): {"PixelXDimension": 1920, "PixelYDimension": 1440}
+        for index in range(2)
+    }
+    (scene / "iphone" / "exif.json").write_text(
+        json.dumps(exif), encoding="utf-8"
+    )
+    frames = [{"chair": {"inst_ids": [0]}}]
+    video = {
+        "status": "ok",
+        "frame_count": 2,
+        "avg_fps": 60.0,
+        "width": 640,
+        "height": 480,
+    }
+    result = FULL.audit_scene("scene", scene, frames, video)
+    assert result["status"] == "passed"
+    assert result["vsi_observed_instances"] == 1
+    assert result["pose_frames"] == 2
+    assert result["metainfo_frames"] == 1
+    assert result["image_scale_x"] == pytest.approx(1 / 3)
