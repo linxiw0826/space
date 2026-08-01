@@ -140,6 +140,7 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
         "iphone_pose": scene_root / "iphone/pose_intrinsic_imu.json",
         "iphone_exif": scene_root / "iphone/exif.json",
         "frame_metainfo": args.frame_metainfo,
+        "video_metadata": args.video_metadata,
     }
     artifacts = {name: artifact(path) for name, path in paths.items()}
 
@@ -275,9 +276,32 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
     image_height = next(iter(image_heights))
 
     candidate_stride = 2
-    expected_vsi_frames = (len(poses) + candidate_stride - 1) // candidate_stride
-    if expected_vsi_frames != len(frames):
-        raise ValueError("VSI frame count is not ceil(iPhone pose count / 2)")
+    expected_metainfo_frames = (len(poses) + candidate_stride - 1) // candidate_stride
+    if expected_metainfo_frames != len(frames):
+        raise ValueError("VSI metainfo count is not ceil(iPhone pose count / 2)")
+
+    video_report = load_json(args.video_metadata)
+    expected_media = f"scannetppv2/{args.scene_id}.mp4"
+    video_rows = [
+        row
+        for row in video_report.get("videos", ())
+        if row.get("media") == expected_media
+    ]
+    if len(video_rows) != 1 or video_rows[0].get("status") != "ok":
+        raise ValueError("pilot VSI MP4 metadata row is missing or invalid")
+    video = video_rows[0]
+    if int(video["frame_count"]) != len(poses):
+        raise ValueError("VSI MP4 frame count differs from iPhone pose count")
+    if not math.isclose(float(video["avg_fps"]), 60.0, abs_tol=1e-6):
+        raise ValueError("pilot VSI MP4 is not 60 FPS")
+    if (
+        image_width % int(video["width"]) != 0
+        or image_height % int(video["height"]) != 0
+        or image_width // int(video["width"])
+        != image_height // int(video["height"])
+    ):
+        raise ValueError("VSI MP4 dimensions are not uniform-scale iPhone dimensions")
+    image_downsample_factor = image_width // int(video["width"])
     candidate_projection = projection_metrics(
         frames=frames,
         poses=poses,
@@ -305,7 +329,7 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
 
     return {
         "schema_version": SCHEMA_VERSION,
-        "status": "passed_pending_mp4_frame_verification",
+        "status": "passed_pending_pixel_projection_verification",
         "scene_id": args.scene_id,
         "artifacts": artifacts,
         "identity_contract": {
@@ -342,19 +366,26 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
                 "max": float(timestamp_steps.max()),
             },
             "vsi_metainfo_frame_count": len(frames),
-            "candidate_source_stride": candidate_stride,
-            "candidate_mapping": "vsi_frame_i_to_iphone_frame_2i",
-            "count_relation_verified": True,
+            "vsi_mp4_frame_count": int(video["frame_count"]),
+            "vsi_mp4_fps": float(video["avg_fps"]),
+            "vsi_mp4_width": int(video["width"]),
+            "vsi_mp4_height": int(video["height"]),
+            "image_downsample_factor": image_downsample_factor,
+            "mp4_to_official_mapping": "vsi_mp4_frame_i_to_iphone_frame_i",
+            "metainfo_source_stride": candidate_stride,
+            "metainfo_to_mp4_mapping": "vsi_metainfo_frame_j_to_mp4_frame_2j",
+            "mp4_pose_count_relation_verified": True,
+            "metainfo_count_relation_verified": True,
             "candidate_projection_metrics": candidate_projection,
             "stride_1_control_projection_metrics": control_projection,
             "visibility_projection_hypothesis_verified": True,
-            "mp4_frame_count_verified": False,
-            "projection_verified": False,
+            "mp4_frame_count_verified": True,
+            "pixel_projection_verified": False,
             "passed": False,
         },
         "unresolved_contracts": [
-            "VSI MP4 frame count/FPS must be probed on the execution server",
-            "candidate stride-2 mapping must pass image/pose projection QC",
+            "MP4-to-pose identity mapping must pass extracted-image projection QC",
+            "odd training frames require mesh-rendered visibility because VSI metainfo is stride-2",
         ],
     }
 
@@ -363,6 +394,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-root", required=True, type=Path)
     parser.add_argument("--frame-metainfo", required=True, type=Path)
+    parser.add_argument("--video-metadata", required=True, type=Path)
     parser.add_argument("--scene-id", required=True)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--allow-pickled-npy", action="store_true")

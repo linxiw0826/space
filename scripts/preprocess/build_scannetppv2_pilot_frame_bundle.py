@@ -111,7 +111,7 @@ def main() -> None:
         frames.append(
             {
                 "vsi_frame_index": index,
-                "candidate_official_iphone_frame_index": 2 * index,
+                "candidate_official_iphone_frame_index": index,
                 "path": output.name,
                 "size_bytes": output.stat().st_size,
                 "sha256": sha256_file(output),
@@ -142,7 +142,7 @@ def main() -> None:
             "path": str(args.video_metadata.resolve()),
             "sha256": sha256_file(args.video_metadata),
         },
-        "candidate_frame_mapping": "vsi_frame_i_to_iphone_frame_2i",
+        "candidate_frame_mapping": "vsi_mp4_frame_i_to_iphone_frame_i",
         "frames": frames,
     }
     manifest_path = args.output_dir / "manifest.json"
