@@ -68,7 +68,11 @@ def test_render_support_certificate_is_tamper_evident():
         video_fps=60.0,
         video_width=640,
         video_height=480,
-        source_assets={"mesh": {"sha256": "b" * 64, "size_bytes": 1}},
+        source_assets={
+            name: {"sha256": "b" * 64, "size_bytes": 1}
+            for name in ("mesh", "segments", "annotation", "pose", "exif")
+        },
+        video_metadata_sha256="2" * 64,
         rasterizer_source_sha256="c" * 64,
         rasterizer_library_sha256="d" * 64,
         frames=[{

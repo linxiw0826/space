@@ -252,6 +252,7 @@ def main() -> None:
                 video_total_frames=total_frames, video_fps=fps,
                 video_width=width, video_height=height,
                 source_assets=source_assets,
+                video_metadata_sha256=sha256_file(args.video_metadata),
                 rasterizer_source_sha256=rasterizer_source_sha,
                 rasterizer_library_sha256=rasterizer.library_sha256,
                 frames=certificate_frames,
@@ -328,6 +329,8 @@ def main() -> None:
             "source_sha256": rasterizer_source_sha,
             "library_sha256": rasterizer.library_sha256,
         },
+        "selection_manifest_sha256": sha256_file(args.selection_manifest),
+        "video_metadata_sha256": sha256_file(args.video_metadata),
         "elapsed_seconds": time.time() - start_time,
         "files": {name: artifact(path) for name, path in files.items()},
     }
