@@ -56,6 +56,7 @@ from qwenvl.model.geometry_encoders.vggt_encoder import VGGTEncoder  # noqa: E40
 
 GUIDE_MIN_PIXELS = 8192
 GUIDE_MAX_PIXELS = 268324
+TENSOR_DIAGNOSTIC_CHUNK_ELEMENTS = 8_388_608
 
 
 def _geometry_encoder_contract(config) -> dict[str, str]:
@@ -432,14 +433,15 @@ def _tensor_diagnostic(tensor: torch.Tensor) -> dict[str, object]:
     # extra GiB and can OOM after an otherwise successful forward/backward.
     # Compute the exact same audit statistics in bounded chunks instead.
     flat = tensor.detach().reshape(-1)
-    chunk_elements = 262_144
     nonfinite_count = 0
     minimum = None
     maximum = None
     squared_norm = 0.0
     with torch.no_grad():
-        for start in range(0, flat.numel(), chunk_elements):
-            chunk = flat[start : start + chunk_elements].float()
+        for start in range(0, flat.numel(), TENSOR_DIAGNOSTIC_CHUNK_ELEMENTS):
+            chunk = flat[
+                start : start + TENSOR_DIAGNOSTIC_CHUNK_ELEMENTS
+            ].float()
             finite = torch.isfinite(chunk)
             finite_count = int(finite.sum().item())
             nonfinite_count += chunk.numel() - finite_count

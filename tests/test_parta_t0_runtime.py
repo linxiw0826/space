@@ -30,8 +30,9 @@ def load_runner_module():
     return script, runner
 
 
-def test_tensor_diagnostic_is_exact_across_chunks_without_full_float_copy():
+def test_tensor_diagnostic_is_exact_across_chunks_without_full_float_copy(monkeypatch):
     _, runner = load_runner_module()
+    monkeypatch.setattr(runner, "TENSOR_DIAGNOSTIC_CHUNK_ELEMENTS", 100_000)
     values = torch.arange(300_000, dtype=torch.float32) - 123.0
     diagnostic = runner._tensor_diagnostic(values.to(torch.bfloat16))
     reference = values.to(torch.bfloat16).float()
