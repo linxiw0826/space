@@ -4,25 +4,29 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import gc
 import hashlib
 import json
 import math
+import multiprocessing
 import re
+import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+PROJECT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT))
 
-SCHEMA_VERSION = "scannetppv2_full_contract_audit_v1"
+import src.scannetppv2_labels as label_contract
+from src.scannetppv2_labels import LABEL_ALIASES, normalize_scannetppv2_label
+
+
+SCHEMA_VERSION = "scannetppv2_full_contract_audit_v2"
 FRAME_RE = re.compile(r"^frame_(\d{6})$")
-LABEL_ALIASES = {
-    "ceiling lamp": "ceiling light",
-    "office chair": "chair",
-    "trash bin": "trash can",
-    "mouse": "computer mouse",
-}
 REQUIRED_RELATIVE_PATHS = {
     "mesh": "scans/mesh_aligned_0.05.ply",
     "segments": "scans/segments.json",
@@ -45,8 +49,7 @@ def load_json(path: Path) -> Any:
 
 
 def normalized_label(value: Any) -> str:
-    label = " ".join(str(value).strip().lower().split())
-    return LABEL_ALIASES.get(label, label)
+    return normalize_scannetppv2_label(value)
 
 
 def finite(value: Any, shape: tuple[int, ...]) -> np.ndarray:
@@ -82,10 +85,28 @@ def video_index(report: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return rows
 
 
+def summarize_vsi_frames(frames: list[dict[str, Any]]) -> dict[str, Any]:
+    observed: dict[int, set[str]] = defaultdict(set)
+    observations = 0
+    for frame in frames:
+        for category, record in frame.items():
+            for instance_id in record["inst_ids"]:
+                observed[int(instance_id)].add(str(category))
+                observations += 1
+    return {
+        "observed_labels": {
+            str(instance_id): sorted(labels)
+            for instance_id, labels in observed.items()
+        },
+        "instance_observations": observations,
+        "frame_count": len(frames),
+    }
+
+
 def audit_scene(
     scene: str,
     scene_root: Path,
-    frames: list[dict[str, Any]],
+    frame_summary: dict[str, Any],
     video: dict[str, Any],
 ) -> dict[str, Any]:
     paths = {name: scene_root / relative for name, relative in REQUIRED_RELATIVE_PATHS.items()}
@@ -119,26 +140,34 @@ def audit_scene(
     if ply_vertex_count(paths["mesh"]) != len(segments):
         raise ValueError("mesh vertex count differs from segIndices")
     available_segments = set(map(int, segments))
-    owned_segments: dict[int, int] = {}
+    segment_owners: dict[int, list[int]] = defaultdict(list)
     for group in groups:
         owner = int(group["index"])
         for segment in map(int, group["segments"]):
             if segment not in available_segments:
                 raise ValueError("annotation references missing segment")
-            previous = owned_segments.setdefault(segment, owner)
-            if previous != owner:
-                raise ValueError("segment has multiple annotation owners")
+            if owner in segment_owners[segment]:
+                raise ValueError("annotation repeats a segment within one group")
+            segment_owners[segment].append(owner)
+    owner_counts = Counter(len(owners) for owners in segment_owners.values())
+    multilabel_segments = sum(
+        count for owner_count, count in owner_counts.items() if owner_count > 1
+    )
+    # ScanNet++'s official MeshToLabel transform retains at most the first
+    # three labels for a vertex, then uses the smallest instance for its
+    # single-label representation.  Overlap is therefore native annotation
+    # semantics, not corruption.
+    multilabel_overflow_segments = sum(
+        count for owner_count, count in owner_counts.items() if owner_count > 3
+    )
 
-    observed: dict[int, set[str]] = defaultdict(set)
-    observations = 0
-    for frame in frames:
-        for category, record in frame.items():
-            for instance_id in record["inst_ids"]:
-                observed[int(instance_id)].add(str(category))
-                observations += 1
+    observed = {
+        int(instance_id): set(labels)
+        for instance_id, labels in frame_summary["observed_labels"].items()
+    }
+    observations = int(frame_summary["instance_observations"])
+    metainfo_frame_count = int(frame_summary["frame_count"])
     by_index = {int(group["index"]): group for group in groups}
-    if not observed:
-        raise ValueError("VSI metainfo contains no instance observations")
     for instance_id, labels in observed.items():
         if instance_id not in by_index:
             raise ValueError(f"VSI inst_id absent from segGroups.index: {instance_id}")
@@ -163,7 +192,7 @@ def audit_scene(
         raise ValueError("VSI MP4 frame count differs from official pose count")
     if not math.isclose(float(video["avg_fps"]), 60.0, abs_tol=1e-6):
         raise ValueError("VSI MP4 is not 60 FPS")
-    if len(frames) != (len(poses) + 1) // 2:
+    if metainfo_frame_count != (len(poses) + 1) // 2:
         raise ValueError("VSI metainfo count is not ceil(MP4 frame count / 2)")
     widths = {int(record["PixelXDimension"]) for record in exif.values()}
     heights = {int(record["PixelYDimension"]) for record in exif.values()}
@@ -179,10 +208,22 @@ def audit_scene(
         "annotation_groups": len(groups),
         "vsi_observed_instances": len(observed),
         "vsi_instance_observations": observations,
+        "identity_join_evidence": (
+            "verified_observed_instances"
+            if observed
+            else "not_applicable_no_vsi_instance_observations"
+        ),
         "mesh_vertices": len(segments),
-        "annotated_segments": len(owned_segments),
+        "annotated_segments": len(segment_owners),
+        "segment_owner_count_distribution": {
+            str(key): value for key, value in sorted(owner_counts.items())
+        },
+        "multilabel_segments": multilabel_segments,
+        "multilabel_max_owners": max(owner_counts, default=0),
+        "multilabel_overflow_segments": multilabel_overflow_segments,
+        "single_label_policy": "official_first3_then_smallest_instance_v1",
         "pose_frames": len(poses),
-        "metainfo_frames": len(frames),
+        "metainfo_frames": metainfo_frame_count,
         "video_frames": int(video["frame_count"]),
         "image_scale_x": int(video["width"]) / width,
         "image_scale_y": int(video["height"]) / height,
@@ -193,6 +234,22 @@ def audit_scene(
     }
 
 
+def run_scene_task(
+    item: tuple[int, str, Path, dict[str, Any], dict[str, Any]],
+) -> tuple[int, dict[str, Any]]:
+    offset, scene, scene_root, frame_summary, video = item
+    try:
+        result = audit_scene(scene, scene_root, frame_summary, video)
+    except Exception as error:  # retain all scene failures in one report
+        result = {
+            "scene_id": scene,
+            "status": "failed",
+            "error_type": type(error).__name__,
+            "error": str(error),
+        }
+    return offset, result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--selection-manifest", required=True, type=Path)
@@ -201,6 +258,8 @@ def main() -> None:
     parser.add_argument("--video-metadata", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--allow-pickled-npy", action="store_true")
+    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--official-mesh-transform", required=True, type=Path)
     args = parser.parse_args()
     if not args.allow_pickled_npy:
         raise ValueError("trusted pickled NPY requires --allow-pickled-npy")
@@ -212,18 +271,51 @@ def main() -> None:
         raise ValueError("frame metainfo must be scalar object NPY")
     metainfo = raw.item()
     videos = video_index(load_json(args.video_metadata))
+    if args.workers < 1:
+        raise ValueError("--workers must be positive")
+
+    frame_summaries = {
+        scene: summarize_vsi_frames(metainfo[scene]) for scene in scenes
+    }
+    del metainfo, raw
+    gc.collect()
+
     results = []
     failures = Counter()
-    for offset, scene in enumerate(scenes, 1):
-        try:
-            result = audit_scene(scene, args.data_root / "data" / scene, metainfo[scene], videos[scene])
-            print(f"[{offset}/{len(scenes)}] {scene}: passed", flush=True)
-        except Exception as error:  # retain all scene failures in one report
-            code = type(error).__name__
-            failures[code] += 1
-            result = {"scene_id": scene, "status": "failed", "error_type": code, "error": str(error)}
-            print(f"[{offset}/{len(scenes)}] {scene}: failed: {code}: {error}", flush=True)
-        results.append(result)
+    items = [
+        (
+            offset,
+            scene,
+            args.data_root / "data" / scene,
+            frame_summaries[scene],
+            videos[scene],
+        )
+        for offset, scene in enumerate(scenes, 1)
+    ]
+    if args.workers == 1:
+        iterator = map(run_scene_task, items)
+    else:
+        executor = concurrent.futures.ProcessPoolExecutor(
+            max_workers=args.workers,
+            mp_context=multiprocessing.get_context("spawn"),
+        )
+        iterator = executor.map(run_scene_task, items, chunksize=1)
+    try:
+        for offset, result in iterator:
+            scene = result["scene_id"]
+            if result["status"] == "passed":
+                print(f"[{offset}/{len(scenes)}] {scene}: passed", flush=True)
+            else:
+                failures[result["error_type"]] += 1
+                print(
+                    f"[{offset}/{len(scenes)}] {scene}: failed: "
+                    f"{result['error_type']}: {result['error']}",
+                    flush=True,
+                )
+            results.append(result)
+    finally:
+        if args.workers != 1:
+            executor.shutdown(wait=True)
 
     passed = sum(row["status"] == "passed" for row in results)
     report = {
@@ -233,6 +325,27 @@ def main() -> None:
         "passed_scenes": passed,
         "failed_scenes": len(scenes) - passed,
         "failure_types": dict(failures),
+        "workers": args.workers,
+        "identity_join": "vsi_inst_id_equals_segGroups_index_v1",
+        "label_normalization": {
+            "policy": "lowercase_whitespace_then_explicit_alias_v1",
+            "aliases": dict(sorted(LABEL_ALIASES.items())),
+        },
+        "multilabel_policy": "official_first3_then_smallest_instance_v1",
+        "scenes_without_vsi_instance_observations": [
+            row["scene_id"]
+            for row in results
+            if row.get("status") == "passed"
+            and row.get("vsi_instance_observations") == 0
+        ],
+        "audit_source_sha256": sha256_file(Path(__file__)),
+        "label_normalization_source_sha256": sha256_file(
+            Path(label_contract.__file__)
+        ),
+        "official_mesh_transform": {
+            "path": str(args.official_mesh_transform.resolve()),
+            "sha256": sha256_file(args.official_mesh_transform),
+        },
         "selection_manifest_sha256": sha256_file(args.selection_manifest),
         "frame_metainfo_sha256": sha256_file(args.frame_metainfo),
         "video_metadata_sha256": sha256_file(args.video_metadata),

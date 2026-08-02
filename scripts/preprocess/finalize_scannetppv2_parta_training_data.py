@@ -30,6 +30,7 @@ from src.scannetppv2_rasterizer import (
     load_mesh_instances,
     sha256_file,
 )
+from src.scannetppv2_labels import normalize_scannetppv2_label
 from src.scannetppv2_support import build_support_certificate
 
 
@@ -99,6 +100,8 @@ def main() -> None:
     parser.add_argument("--video-metadata", required=True, type=Path)
     parser.add_argument("--rasterizer-library", required=True, type=Path)
     parser.add_argument("--rasterizer-source", required=True, type=Path)
+    parser.add_argument("--instance-assignment-source", required=True, type=Path)
+    parser.add_argument("--label-normalization-source", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--archive-output", required=True, type=Path)
     parser.add_argument("--base-interval", type=float, default=1.0)
@@ -130,6 +133,8 @@ def main() -> None:
     videos = video_index(load_json(args.video_metadata))
     rasterizer = Rasterizer(args.rasterizer_library)
     rasterizer_source_sha = sha256_file(args.rasterizer_source)
+    instance_assignment_source_sha = sha256_file(args.instance_assignment_source)
+    label_normalization_source_sha = sha256_file(args.label_normalization_source)
     scene_rows, frame_rows, qa_rows, certificates = [], [], [], []
     errors = []
     start_time = time.time()
@@ -182,7 +187,8 @@ def main() -> None:
                 obb = group["obb"]
                 nodes.append({
                     "object_id": str(group["index"]),
-                    "category": group["label"],
+                    "category": normalize_scannetppv2_label(group["label"]),
+                    "source_category": group["label"],
                     "center_world_m": obb["centroid"],
                     "extent_m": obb["axesLengths"],
                     "rotation_world_from_object": np.asarray(
@@ -253,6 +259,8 @@ def main() -> None:
                 video_width=width, video_height=height,
                 source_assets=source_assets,
                 video_metadata_sha256=sha256_file(args.video_metadata),
+                instance_assignment_source_sha256=instance_assignment_source_sha,
+                label_normalization_source_sha256=label_normalization_source_sha,
                 rasterizer_source_sha256=rasterizer_source_sha,
                 rasterizer_library_sha256=rasterizer.library_sha256,
                 frames=certificate_frames,
@@ -329,6 +337,8 @@ def main() -> None:
             "source_sha256": rasterizer_source_sha,
             "library_sha256": rasterizer.library_sha256,
         },
+        "instance_assignment_source_sha256": instance_assignment_source_sha,
+        "label_normalization_source_sha256": label_normalization_source_sha,
         "selection_manifest_sha256": sha256_file(args.selection_manifest),
         "video_metadata_sha256": sha256_file(args.video_metadata),
         "elapsed_seconds": time.time() - start_time,

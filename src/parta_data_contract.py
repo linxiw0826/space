@@ -578,9 +578,10 @@ def _node(
     rotation = raw.get(
         "rotation_world_from_object", raw.get("bbox_orientation_raw")
     )
-    category, source_category = canonical_category(
+    category, derived_source_category = canonical_category(
         raw.get("category") or raw.get("object_name")
     )
+    source_category = raw.get("source_category", derived_source_category)
     center = _vector_to_canonical(source, center)
     extent = _extent_to_canonical(source, extent)
     rotation = _rotation_to_canonical(source, rotation)

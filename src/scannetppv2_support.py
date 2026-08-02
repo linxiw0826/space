@@ -7,7 +7,7 @@ from typing import Any, Mapping, Sequence
 from src.parta_data_contract import ContractError, content_sha256
 
 
-SCHEMA_VERSION = "scannetppv2_render_support_certificate_v1"
+SCHEMA_VERSION = "scannetppv2_render_support_certificate_v2"
 REQUIRED_SOURCE_ASSETS = {"mesh", "segments", "annotation", "pose", "exif"}
 
 
@@ -26,6 +26,8 @@ def certificate_payload(certificate: Mapping[str, Any]) -> dict[str, Any]:
             "video_height",
             "source_assets",
             "video_metadata_sha256",
+            "instance_assignment_source_sha256",
+            "label_normalization_source_sha256",
             "rasterizer_source_sha256",
             "rasterizer_library_sha256",
             "frames",
@@ -44,6 +46,8 @@ def build_support_certificate(
     video_height: int,
     source_assets: Mapping[str, Mapping[str, Any]],
     video_metadata_sha256: str,
+    instance_assignment_source_sha256: str,
+    label_normalization_source_sha256: str,
     rasterizer_source_sha256: str,
     rasterizer_library_sha256: str,
     frames: Sequence[Mapping[str, Any]],
@@ -60,6 +64,8 @@ def build_support_certificate(
         "video_height": int(video_height),
         "source_assets": {key: dict(value) for key, value in source_assets.items()},
         "video_metadata_sha256": video_metadata_sha256,
+        "instance_assignment_source_sha256": instance_assignment_source_sha256,
+        "label_normalization_source_sha256": label_normalization_source_sha256,
         "rasterizer_source_sha256": rasterizer_source_sha256,
         "rasterizer_library_sha256": rasterizer_library_sha256,
         "frames": [dict(frame) for frame in frames],
@@ -83,6 +89,8 @@ def validate_support_certificate(certificate: Mapping[str, Any]) -> None:
     hashes = [
         certificate.get("sampling_binding_sha256"),
         certificate.get("video_metadata_sha256"),
+        certificate.get("instance_assignment_source_sha256"),
+        certificate.get("label_normalization_source_sha256"),
         certificate.get("rasterizer_source_sha256"),
         certificate.get("rasterizer_library_sha256"),
     ]

@@ -59,6 +59,35 @@ def test_native_triangle_rasterizer(tmp_path: Path):
     assert set(np.unique(labels)) <= {-1, 0}
 
 
+def test_mesh_multilabel_uses_official_smallest_instance_policy(tmp_path: Path):
+    mesh_path = tmp_path / "mesh.ply"
+    header = (
+        "ply\nformat binary_little_endian 1.0\n"
+        "element vertex 6\nproperty float x\nproperty float y\n"
+        "property float z\nproperty uchar red\nproperty uchar green\n"
+        "property uchar blue\nelement face 2\n"
+        "property list uchar int vertex_indices\nend_header\n"
+    ).encode("ascii")
+    vertices = [
+        (-0.5, -0.5, 2.0), (0.5, -0.5, 2.0), (0.0, 0.5, 2.0),
+        (-0.5, -0.5, 3.0), (0.5, -0.5, 3.0), (0.0, 0.5, 3.0),
+    ]
+    payload = b"".join(
+        struct.pack("<fffBBB", *xyz, 0, 0, 0) for xyz in vertices
+    ) + struct.pack("<Biii", 3, 0, 1, 2) + struct.pack("<Biii", 3, 3, 4, 5)
+    mesh_path.write_bytes(header + payload)
+    segments = tmp_path / "segments.json"
+    segments.write_text(json.dumps({"segIndices": [0, 0, 0, 1, 1, 1]}))
+    annotation = tmp_path / "annotation.json"
+    annotation.write_text(json.dumps({"segGroups": [
+        {"index": 0, "segments": [0, 1], "label": "large"},
+        {"index": 1, "segments": [0], "label": "small"},
+    ]}))
+
+    mesh = load_mesh_instances(mesh_path, segments, annotation)
+    assert mesh.vertex_labels.tolist() == [1, 1, 1, 0, 0, 0]
+
+
 def test_render_support_certificate_is_tamper_evident():
     certificate = build_support_certificate(
         scene_id="scene",
@@ -73,6 +102,8 @@ def test_render_support_certificate_is_tamper_evident():
             for name in ("mesh", "segments", "annotation", "pose", "exif")
         },
         video_metadata_sha256="2" * 64,
+        instance_assignment_source_sha256="3" * 64,
+        label_normalization_source_sha256="4" * 64,
         rasterizer_source_sha256="c" * 64,
         rasterizer_library_sha256="d" * 64,
         frames=[{

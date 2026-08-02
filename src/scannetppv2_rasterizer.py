@@ -94,14 +94,32 @@ def load_mesh_instances(
     groups = annotation["segGroups"]
     if [int(group["index"]) for group in groups] != list(range(len(groups))):
         raise ValueError("segGroups.index is not zero-based list position")
-    lookup = np.full(int(segments.max()) + 1, -1, dtype=np.int32)
+    lookup_size = int(segments.max()) + 1
+    lookup = np.full(lookup_size, -1, dtype=np.int32)
+    best_instance_size = np.full(lookup_size, np.iinfo(np.int64).max, dtype=np.int64)
+    owner_count = np.zeros(lookup_size, dtype=np.uint8)
+    segment_vertex_counts = np.bincount(segments, minlength=lookup_size)
     for group in groups:
         ids = np.asarray(group["segments"], dtype=np.int64)
         if len(ids) and (ids.min() < 0 or ids.max() >= len(lookup)):
             raise ValueError("annotation references out-of-range segment")
-        if len(ids) and np.any(lookup[ids] != -1):
-            raise ValueError("annotation segment has multiple owners")
-        lookup[ids] = int(group["index"])
+        if len(ids) != len(np.unique(ids)):
+            raise ValueError("annotation repeats a segment within one group")
+        if len(ids) and np.any(segment_vertex_counts[ids] == 0):
+            raise ValueError("annotation references a segment absent from the mesh")
+        if not len(ids):
+            continue
+        # This is the exact single-label policy used by the official
+        # ScanNet++ MeshToLabel transform: retain the first three annotation
+        # owners in file order and select the owner with the fewest vertices.
+        # Strict '<' preserves the first owner when instance sizes tie.
+        group_size = int(segment_vertex_counts[ids].sum())
+        retained = ids[owner_count[ids] < 3]
+        better = group_size < best_instance_size[retained]
+        better_ids = retained[better]
+        lookup[better_ids] = int(group["index"])
+        best_instance_size[better_ids] = group_size
+        owner_count[retained] += 1
     vertex_labels = np.ascontiguousarray(lookup[segments], dtype=np.int32)
     return MeshInstances(vertices, faces, vertex_labels, groups)
 

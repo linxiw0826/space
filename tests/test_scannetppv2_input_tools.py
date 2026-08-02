@@ -5,6 +5,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from src.scannetppv2_labels import normalize_scannetppv2_label
+
 PROJECT = Path(__file__).resolve().parents[1]
 
 
@@ -254,9 +256,73 @@ def test_full_contract_scene_audit(tmp_path: Path):
         "width": 640,
         "height": 480,
     }
-    result = FULL.audit_scene("scene", scene, frames, video)
+    result = FULL.audit_scene(
+        "scene", scene, FULL.summarize_vsi_frames(frames), video
+    )
     assert result["status"] == "passed"
     assert result["vsi_observed_instances"] == 1
     assert result["pose_frames"] == 2
     assert result["metainfo_frames"] == 1
     assert result["image_scale_x"] == pytest.approx(1 / 3)
+
+    empty_result = FULL.audit_scene(
+        "scene", scene, FULL.summarize_vsi_frames([{}]), video
+    )
+    assert empty_result["vsi_observed_instances"] == 0
+    assert empty_result["identity_join_evidence"] == (
+        "not_applicable_no_vsi_instance_observations"
+    )
+
+
+def test_full_contract_accepts_native_multilabel_and_vsi_alias(tmp_path: Path):
+    scene = tmp_path / "data" / "scene"
+    (scene / "scans").mkdir(parents=True)
+    (scene / "iphone").mkdir()
+    (scene / "scans" / "mesh_aligned_0.05.ply").write_bytes(
+        b"ply\nformat binary_little_endian 1.0\n"
+        b"element vertex 2\nend_header\n"
+    )
+    (scene / "scans" / "segments.json").write_text(
+        json.dumps({"segIndices": [1, 2]}), encoding="utf-8"
+    )
+    obb = {
+        "centroid": [0, 0, 2],
+        "axesLengths": [1, 1, 1],
+        "normalizedAxes": np.eye(3).reshape(-1).tolist(),
+    }
+    groups = [
+        {"index": 0, "id": 10, "objectId": 10, "label": "desk", "segments": [1], "obb": obb},
+        {"index": 1, "id": 11, "objectId": 11, "label": "cup", "segments": [1, 2], "obb": obb},
+    ]
+    (scene / "scans" / "segments_anno.json").write_text(
+        json.dumps({"segGroups": groups}), encoding="utf-8"
+    )
+    poses = {
+        f"frame_{index:06d}": {
+            "intrinsic": np.eye(3).tolist(),
+            "aligned_pose": np.eye(4).tolist(),
+        }
+        for index in range(2)
+    }
+    (scene / "iphone" / "pose_intrinsic_imu.json").write_text(json.dumps(poses))
+    (scene / "iphone" / "exif.json").write_text(json.dumps({
+        str(index): {"PixelXDimension": 1920, "PixelYDimension": 1440}
+        for index in range(2)
+    }))
+    result = FULL.audit_scene(
+        "scene",
+        scene,
+        FULL.summarize_vsi_frames([{"table": {"inst_ids": [0]}}]),
+        {"status": "ok", "frame_count": 2, "avg_fps": 60.0, "width": 640, "height": 480},
+    )
+    assert result["multilabel_segments"] == 1
+    assert result["multilabel_max_owners"] == 2
+    assert result["single_label_policy"] == "official_first3_then_smallest_instance_v1"
+
+
+@pytest.mark.parametrize(
+    ("official", "vsi"),
+    [("desk", "table"), ("mug", "cup"), ("shoe", "shoes"), ("chair", "chair")],
+)
+def test_scannetppv2_label_normalization(official: str, vsi: str):
+    assert normalize_scannetppv2_label(official) == vsi
