@@ -188,7 +188,7 @@ def _engineering_coverage(args, contract):
                     or payload.get("optimizer_step_indices")
                        != list(range(1, int(payload.get("optimizer_steps", 0)) + 1))
                     or float(payload.get("final_state_loss", float("inf")))
-                    >= float(payload.get("initial_state_loss", float("-inf"))):
+                    >= float(payload.get("initial_state_loss", float("-inf")))):
                 raise ValueError("A1-O engineering subset did not demonstrate learnability")
         if name == "matched_a0_a1o_real_runner_steps":
             arms = payload.get("arms", {})
