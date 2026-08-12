@@ -123,6 +123,7 @@ def main() -> None:
     write_jsonl(args.output_dir / "frame_states.jsonl", frames)
     write_jsonl(args.output_dir / "qa_manifest.jsonl", manifest)
     report_payload = report.as_dict()
+    report_payload["status"] = "complete_passed"
     if trusted_registry is not None:
         canonical_certificate = (
             args.output_dir

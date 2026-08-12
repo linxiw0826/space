@@ -342,6 +342,7 @@ class ObjectStateSetLoss:
         scene_metrics = []
         scene_active = []
         assignments = []
+        matched_costs = []
         canonical_targets = [_canonicalize_target_order(target) for target in targets]
         for index, target in enumerate(canonical_targets):
             prediction = ObjectStatePredictions(
@@ -353,7 +354,11 @@ class ObjectStateSetLoss:
                 slots=predictions.slots[index],
             )
             cost = self.pair_cost(prediction, target)
-            assignments.append(self.assignment(cost))
+            assignment = self.assignment(cost)
+            assignments.append(assignment)
+            pred_indices, target_indices = assignment
+            if pred_indices.numel():
+                matched_costs.append(cost[pred_indices, target_indices].mean().detach())
             losses, metrics, active = self._scene_loss(prediction, target)
             scene_losses.append(losses)
             scene_metrics.append(metrics)
@@ -383,6 +388,11 @@ class ObjectStateSetLoss:
             "loss_state": total,
             **{f"loss_{key}": value for key, value in reduced.items()},
             "assignments": assignments,
+            "matching_mean_cost": (
+                torch.stack(matched_costs).mean()
+                if matched_costs
+                else predictions.existence_logits.detach().sum() * 0.0
+            ),
         }
         for metric in ("center_mae_m", "extent_mae_m"):
             result[metric] = torch.stack([item[metric] for item in scene_metrics]).mean()

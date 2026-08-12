@@ -17,6 +17,7 @@ from PIL import Image
 from parta_data_contract import (
     CANONICAL_CATEGORIES,
     ContractError,
+    SOURCE_CONTRACTS,
     T0_FIXTURES,
     read_jsonl,
     validate_records,
@@ -58,12 +59,18 @@ class PartACanonicalDataset:
         *,
         qa_filename: str = "qa_manifest_exact_verified.jsonl",
         fixture_only: bool = True,
+        require_fixtures: bool = True,
     ) -> None:
         expected = set(T0_FIXTURES)
-        if set(source_roots) != expected:
+        if require_fixtures and set(source_roots) != expected:
             raise ContractError(
                 f"T0-A requires exactly ADT and Hypersim roots, got {sorted(source_roots)}"
             )
+        unknown_sources = set(source_roots) - set(SOURCE_CONTRACTS)
+        if unknown_sources:
+            raise ContractError(f"unknown canonical sources: {sorted(unknown_sources)}")
+        if fixture_only and not require_fixtures:
+            raise ValueError("fixture_only=True requires require_fixtures=True")
         _validate_qa_filename(qa_filename)
         samples: list[PartASample] = []
         available_fixtures: set[tuple[str, str]] = set()
@@ -93,7 +100,7 @@ class PartACanonicalDataset:
                 scenes,
                 frames,
                 qa_rows,
-                require_fixtures=True,
+                require_fixtures=require_fixtures,
                 expected_sources=(source,),
             )
             scene_map = {(row["source_dataset"], row["scene_id"]): row for row in scenes}
@@ -115,7 +122,7 @@ class PartACanonicalDataset:
             for scene_id in scene_ids
         }
         missing_fixtures = sorted(required - available_fixtures)
-        if missing_fixtures:
+        if require_fixtures and missing_fixtures:
             raise ContractError(
                 "fixed fixtures have no QA rows (substitution forbidden): "
                 f"{missing_fixtures}"

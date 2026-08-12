@@ -5,4 +5,5 @@ AVAILABLE_MODELS = {
     "qwen3_vl_mope_crossattn": "Qwen3_VL_MoPE_CrossAttn",
     "qwen3_vl_mope_router": "Qwen3_VL_MoPE_Router",
     "qwen3_vl_mope_qformer": "Qwen3_VL_MoPE_QFormer",
+    "qwen3_vl_parta": "Qwen3VLPartA",
 }

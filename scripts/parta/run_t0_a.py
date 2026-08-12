@@ -1110,6 +1110,7 @@ def main() -> None:
             "schema_version": "parta_t0_a_provenance_v1",
             "status": payload["status"],
             "resolved_config_sha256": stable_sha256(config),
+            "resolved_config_path": str((final_output / "resolved_config.json").resolve()),
             "checkpoint_sha256": guide_artifact["artifact_sha256"],
             "guide_checkpoint_artifact": guide_artifact,
             "geometry_encoder_type_effective": runtime_contract[
@@ -1155,6 +1156,9 @@ def main() -> None:
             replace(run_contract, status="complete", checkpoint_sha256=a1_state_sha256),
             status_path,
         )
+        terminal_status = json.loads(status_path.read_text(encoding="utf-8"))
+        terminal_status["resolved_config_path"] = str((final_output / "resolved_config.json").resolve())
+        atomic_json_dump(terminal_status, status_path)
         os.replace(args.output, final_output)
     except BaseException as error:
         failure = {
