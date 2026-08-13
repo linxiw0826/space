@@ -187,6 +187,11 @@ def validate_t0_a_code_compatibility(
     project_root: str | Path,
 ) -> dict[str, Any]:
     """Accept exact revision or the reviewed semantic-tree identity only."""
+    if (
+        t0_a_revision != current_code_revision
+        and t0_a_revision != T0_A_COMPATIBILITY_BASE_REVISION
+    ):
+        raise ValueError("T0-A revision has no reviewed compatibility contract")
     root = Path(project_root).resolve()
     head = _git_bytes(root, "rev-parse", "HEAD").decode().strip()
     if head != current_code_revision:
@@ -198,8 +203,6 @@ def validate_t0_a_code_compatibility(
             "t0_a_revision": t0_a_revision,
             "current_revision": current_code_revision,
         }
-    if t0_a_revision != T0_A_COMPATIBILITY_BASE_REVISION:
-        raise ValueError("T0-A revision has no reviewed compatibility contract")
     _git_bytes(root, "cat-file", "-e", f"{t0_a_revision}^{{commit}}")
     _git_bytes(root, "cat-file", "-e", f"{current_code_revision}^{{commit}}")
     _git_bytes(root, "merge-base", "--is-ancestor", t0_a_revision, current_code_revision)

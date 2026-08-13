@@ -254,7 +254,11 @@ def test_transaction_accepts_reviewed_revision_but_keeps_artifact_gates(
         validate_t0_a_initialization_transaction(**kwargs)
 
 
-def test_t0_a_code_compatibility_rejects_unknown_old_revision(tmp_path):
+def test_t0_a_code_compatibility_rejects_unknown_old_revision(tmp_path, monkeypatch):
+    def forbidden_git(*_args, **_kwargs):
+        raise AssertionError("unknown revision rejection must not access Git")
+
+    monkeypatch.setattr("parta.t0_b_runtime._git_bytes", forbidden_git)
     with pytest.raises(ValueError, match="no reviewed compatibility"):
         validate_t0_a_code_compatibility(
             t0_a_revision="d" * 40,
