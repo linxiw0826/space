@@ -41,13 +41,18 @@ T0_A_APPROVED_SEMANTIC_REVISION = "134dfc62e7b23b56077f703fb949ba3e9f1f46bf"
 T0_A_APPROVED_SEMANTIC_TREE_SHA256 = (
     "aefb9e5a6d2a6a17b040a70189ff56f6db6bd3144add6ca8cba5d7df250e9aea"
 )
-# This is deliberately fail-closed until the reviewed implementation is
-# committed and Orchestrator freezes that commit in the required second step.
-T0_B_RUNTIME_APPROVED_REVISION: str | None = None
 T0_B_RUNTIME_PATHS = (
     "scripts/parta/run_t0_b.py",
     "src/parta/t0_b_runtime.py",
 )
+T0_B_RUNTIME_APPROVAL_PATH = "configs/parta/t0_b_runtime_approval.json"
+T0_B_RUNTIME_APPROVAL_SCHEMA = "parta_t0_b_runtime_approval_v1"
+T0_B_RUNTIME_APPROVAL_KEYS = frozenset({
+    "schema_version",
+    "approved_revision",
+    "runtime_tree_sha256",
+    "payload_sha256",
+})
 
 
 def _git_bytes(project_root: Path, *arguments: str) -> bytes:
@@ -87,37 +92,82 @@ def _assert_surface_clean(root: Path, paths: Sequence[str]) -> dict[str, Any]:
     return evidence
 
 
+def _load_t0_b_runtime_approval(root: Path) -> dict[str, str]:
+    path = root / T0_B_RUNTIME_APPROVAL_PATH
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("T0-B runtime approval metadata is missing or invalid") from error
+    if not isinstance(raw, dict) or frozenset(raw) != T0_B_RUNTIME_APPROVAL_KEYS:
+        raise ValueError("T0-B runtime approval metadata has an invalid schema")
+    payload = {
+        key: raw[key]
+        for key in ("schema_version", "approved_revision", "runtime_tree_sha256")
+    }
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    if raw["payload_sha256"] != hashlib.sha256(encoded).hexdigest():
+        raise ValueError("T0-B runtime approval metadata digest mismatch")
+    if raw["schema_version"] != T0_B_RUNTIME_APPROVAL_SCHEMA:
+        raise ValueError("T0-B runtime approval metadata has an invalid schema version")
+    revision = raw["approved_revision"]
+    tree = raw["runtime_tree_sha256"]
+    if revision is None and tree is None:
+        raise ValueError("T0-B runtime identity has not been frozen after review")
+    if not (
+        isinstance(revision, str)
+        and len(revision) == 40
+        and all(character in "0123456789abcdef" for character in revision)
+        and isinstance(tree, str)
+        and len(tree) == 64
+        and all(character in "0123456789abcdef" for character in tree)
+    ):
+        raise ValueError("T0-B runtime approval metadata has invalid identities")
+    return raw
+
+
 def validate_t0_b_runtime_identity(
     *, current_code_revision: str, project_root: str | Path
 ) -> dict[str, Any]:
     root = Path(project_root).resolve()
-    if T0_B_RUNTIME_APPROVED_REVISION is None:
-        raise ValueError("T0-B runtime identity has not been frozen after review")
+    approval_cleanliness = _assert_surface_clean(
+        root, (T0_B_RUNTIME_APPROVAL_PATH,)
+    )
+    approval = _load_t0_b_runtime_approval(root)
+    approved_revision = approval["approved_revision"]
     head = _git_bytes(root, "rev-parse", "HEAD").decode().strip()
     if head != current_code_revision:
         raise ValueError("current code revision differs from repository HEAD")
-    _git_bytes(root, "cat-file", "-e", f"{T0_B_RUNTIME_APPROVED_REVISION}^{{commit}}")
+    _git_bytes(root, "cat-file", "-e", f"{approved_revision}^{{commit}}")
     _git_bytes(root, "cat-file", "-e", f"{current_code_revision}^{{commit}}")
     _git_bytes(
         root,
         "merge-base",
         "--is-ancestor",
-        T0_B_RUNTIME_APPROVED_REVISION,
+        approved_revision,
         current_code_revision,
     )
     approved = _tracked_surface_identity(
-        root, T0_B_RUNTIME_APPROVED_REVISION, T0_B_RUNTIME_PATHS
+        root, approved_revision, T0_B_RUNTIME_PATHS
     )
     current = _tracked_surface_identity(root, current_code_revision, T0_B_RUNTIME_PATHS)
     if current != approved:
         raise ValueError("T0-B gate/runner tree differs from reviewed runtime")
+    if approved != approval["runtime_tree_sha256"]:
+        raise ValueError("T0-B runtime approval tree digest mismatch")
     cleanliness = _assert_surface_clean(root, T0_B_RUNTIME_PATHS)
     return {
-        "approved_revision": T0_B_RUNTIME_APPROVED_REVISION,
+        "approved_revision": approved_revision,
         "current_revision": current_code_revision,
         "paths": list(T0_B_RUNTIME_PATHS),
         "tree_sha256": current,
         "cleanliness": cleanliness,
+        "approval_metadata": {
+            "path": T0_B_RUNTIME_APPROVAL_PATH,
+            "payload_sha256": approval["payload_sha256"],
+            "cleanliness": approval_cleanliness,
+        },
     }
 
 

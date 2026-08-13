@@ -20,11 +20,29 @@ from parta.t0_b_runtime import (
     validate_t0_b_runtime_identity,
     T0_A_COMPATIBILITY_BASE_REVISION,
     T0_A_APPROVED_SEMANTIC_TREE_SHA256,
+    T0_B_RUNTIME_APPROVAL_PATH,
 )
 from parta.checkpoint import (
     ResumeContract, capture_rng_state, load_training_checkpoint, save_training_checkpoint,
 )
 from parta.provenance import stable_sha256
+
+
+def _write_runtime_approval(root, revision, tree, **overrides):
+    payload = {
+        "schema_version": "parta_t0_b_runtime_approval_v1",
+        "approved_revision": revision,
+        "runtime_tree_sha256": tree,
+    }
+    payload.update({key: value for key, value in overrides.items() if key in payload})
+    record = dict(payload)
+    record["payload_sha256"] = stable_sha256(payload)
+    if "payload_sha256" in overrides:
+        record["payload_sha256"] = overrides["payload_sha256"]
+    path = root / T0_B_RUNTIME_APPROVAL_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(record), encoding="utf-8")
+    return path
 
 
 def _observations(count=30, *, bad_index=None):
@@ -296,7 +314,13 @@ def test_t0_a_code_compatibility_rejects_altered_or_unverifiable_history(
         )
 
 
-def test_t0_b_runtime_identity_is_fail_closed_until_phase_two_freeze(tmp_path):
+def test_t0_b_runtime_identity_is_fail_closed_until_phase_two_freeze(
+    tmp_path, monkeypatch
+):
+    _write_runtime_approval(tmp_path, None, None)
+    monkeypatch.setattr(
+        "parta.t0_b_runtime._git_bytes", lambda _root, *_arguments: b""
+    )
     with pytest.raises(ValueError, match="has not been frozen"):
         validate_t0_b_runtime_identity(
             current_code_revision="c" * 40, project_root=tmp_path
@@ -309,6 +333,8 @@ def test_t0_b_runtime_identity_is_fail_closed_until_phase_two_freeze(tmp_path):
 def test_t0_b_runtime_tree_identity_mechanism(tmp_path, monkeypatch, mutation):
     approved = "a" * 40
     current = "c" * 40
+    tree_sha256 = __import__("hashlib").sha256(b"reviewed runtime tree").hexdigest()
+    _write_runtime_approval(tmp_path, approved, tree_sha256)
 
     def fake_git(_root, *arguments):
         if arguments[:2] == ("rev-parse", "HEAD"):
@@ -332,9 +358,6 @@ def test_t0_b_runtime_tree_identity_mechanism(tmp_path, monkeypatch, mutation):
         raise AssertionError(arguments)
 
     monkeypatch.setattr("parta.t0_b_runtime._git_bytes", fake_git)
-    monkeypatch.setattr(
-        "parta.t0_b_runtime.T0_B_RUNTIME_APPROVED_REVISION", approved
-    )
     if mutation is None:
         result = validate_t0_b_runtime_identity(
             current_code_revision=current, project_root=tmp_path
@@ -355,9 +378,7 @@ def test_t0_b_runtime_tree_identity_mechanism(tmp_path, monkeypatch, mutation):
 
 
 def test_t0_b_runtime_identity_rejects_revision_head_disagreement(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        "parta.t0_b_runtime.T0_B_RUNTIME_APPROVED_REVISION", "a" * 40
-    )
+    _write_runtime_approval(tmp_path, "a" * 40, "b" * 64)
     monkeypatch.setattr(
         "parta.t0_b_runtime._git_bytes",
         lambda _root, *arguments: b"different\n"
@@ -368,6 +389,94 @@ def test_t0_b_runtime_identity_rejects_revision_head_disagreement(tmp_path, monk
         validate_t0_b_runtime_identity(
             current_code_revision="c" * 40, project_root=tmp_path
         )
+
+
+@pytest.mark.parametrize(
+    "case", ["invalid_json", "extra_key", "bad_digest", "bad_revision", "bad_tree"]
+)
+def test_t0_b_runtime_identity_rejects_invalid_approval_metadata(
+    tmp_path, monkeypatch, case
+):
+    path = _write_runtime_approval(tmp_path, "a" * 40, "b" * 64)
+    if case == "invalid_json":
+        path.write_text("{", encoding="utf-8")
+    elif case == "extra_key":
+        record = json.loads(path.read_text())
+        record["unexpected"] = True
+        path.write_text(json.dumps(record), encoding="utf-8")
+    elif case == "bad_digest":
+        record = json.loads(path.read_text())
+        record["payload_sha256"] = "0" * 64
+        path.write_text(json.dumps(record), encoding="utf-8")
+    elif case == "bad_revision":
+        _write_runtime_approval(tmp_path, "not-a-revision", "b" * 64)
+    else:
+        _write_runtime_approval(tmp_path, "a" * 40, "not-a-tree")
+
+    def fake_git(_root, *arguments):
+        if arguments[0] in {"diff", "ls-files"}:
+            return b""
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr("parta.t0_b_runtime._git_bytes", fake_git)
+    with pytest.raises(ValueError, match="approval metadata"):
+        validate_t0_b_runtime_identity(
+            current_code_revision="c" * 40, project_root=tmp_path
+        )
+
+
+@pytest.mark.parametrize("mutation", ["unstaged", "staged", "untracked"])
+def test_t0_b_runtime_identity_rejects_dirty_approval_metadata(
+    tmp_path, monkeypatch, mutation
+):
+    _write_runtime_approval(tmp_path, "a" * 40, "b" * 64)
+
+    def fake_git(_root, *arguments):
+        if arguments[0] == "diff":
+            cached = "--cached" in arguments
+            if mutation == "unstaged" and not cached:
+                return f"{T0_B_RUNTIME_APPROVAL_PATH}\n".encode()
+            if mutation == "staged" and cached:
+                return f"{T0_B_RUNTIME_APPROVAL_PATH}\n".encode()
+            return b""
+        if arguments[0] == "ls-files":
+            return (
+                f"{T0_B_RUNTIME_APPROVAL_PATH}\n".encode()
+                if mutation == "untracked"
+                else b""
+            )
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr("parta.t0_b_runtime._git_bytes", fake_git)
+    with pytest.raises(ValueError, match="safety surface is dirty"):
+        validate_t0_b_runtime_identity(
+            current_code_revision="c" * 40, project_root=tmp_path
+        )
+
+
+def test_t0_b_runtime_identity_real_checkout_integration():
+    project_root = Path(__file__).resolve().parents[1]
+    approval = json.loads(
+        (project_root / T0_B_RUNTIME_APPROVAL_PATH).read_text(encoding="utf-8")
+    )
+    if approval["approved_revision"] is None:
+        pytest.skip("bootstrap 2a approval is deliberately not frozen yet")
+    current = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    evidence = validate_t0_b_runtime_identity(
+        current_code_revision=current,
+        project_root=project_root,
+    )
+    assert evidence["approved_revision"] == approval["approved_revision"]
+    assert evidence["tree_sha256"] == approval["runtime_tree_sha256"]
+    assert evidence["approval_metadata"]["payload_sha256"] == approval[
+        "payload_sha256"
+    ]
 
 
 def test_parameter_gradient_norm_counts_only_connected_parameters():
