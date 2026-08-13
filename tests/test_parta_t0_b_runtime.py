@@ -21,6 +21,7 @@ from parta.t0_b_runtime import (
     T0_A_COMPATIBILITY_BASE_REVISION,
     T0_A_APPROVED_SEMANTIC_TREE_SHA256,
     T0_B_RUNTIME_APPROVAL_PATH,
+    _assert_surface_clean,
 )
 from parta.checkpoint import (
     ResumeContract, capture_rng_state, load_training_checkpoint, save_training_checkpoint,
@@ -477,6 +478,42 @@ def test_t0_b_runtime_identity_real_checkout_integration():
     assert evidence["approval_metadata"]["payload_sha256"] == approval[
         "payload_sha256"
     ]
+
+
+@pytest.mark.parametrize(
+    ("untracked", "accepted"),
+    [
+        ("src/parta/__pycache__/t0_b_runtime.cpython-310.pyc\n", True),
+        ("src/parta/__pycache__/t0_b_runtime.pyo\n", True),
+        ("src/parta/__pycache__/helper.py\n", False),
+        (
+            "src/parta/__pycache__/t0_b_runtime.cpython-310.pyc\n"
+            "src/parta/unreviewed_helper.py\n",
+            False,
+        ),
+        ("src/parta/t0_b_runtime.pyc\n", False),
+        (f"{T0_B_RUNTIME_APPROVAL_PATH}\n", False),
+        ("scripts/parta/run_t0_b.py\n", False),
+    ],
+)
+def test_surface_cleanliness_excludes_only_generated_python_cache(
+    tmp_path, monkeypatch, untracked, accepted
+):
+    def fake_git(_root, *arguments):
+        if arguments[0] == "diff":
+            return b""
+        if arguments[0] == "ls-files":
+            return untracked.encode()
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr("parta.t0_b_runtime._git_bytes", fake_git)
+    if accepted:
+        evidence = _assert_surface_clean(tmp_path, ("src/parta",))
+        assert evidence["untracked"] == []
+        assert evidence["ignored_generated_python_cache"] == untracked.splitlines()
+    else:
+        with pytest.raises(ValueError, match="safety surface is dirty"):
+            _assert_surface_clean(tmp_path, ("src/parta",))
 
 
 def test_parameter_gradient_norm_counts_only_connected_parameters():

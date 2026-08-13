@@ -8,7 +8,7 @@ import json
 import subprocess
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Sequence
 
 import torch
@@ -79,15 +79,24 @@ def _tracked_surface_identity(
 def _assert_surface_clean(root: Path, paths: Sequence[str]) -> dict[str, Any]:
     unstaged = _git_bytes(root, "diff", "--name-only", "--", *paths)
     staged = _git_bytes(root, "diff", "--cached", "--name-only", "--", *paths)
-    untracked = _git_bytes(
+    untracked_rows = _git_bytes(
         root, "ls-files", "--others", "--exclude-standard", "--", *paths
-    )
+    ).decode().splitlines()
+    ignored_cache = []
+    untracked = []
+    for row in untracked_rows:
+        candidate = PurePosixPath(row)
+        if "__pycache__" in candidate.parts and candidate.suffix in {".pyc", ".pyo"}:
+            ignored_cache.append(row)
+        else:
+            untracked.append(row)
     evidence = {
         "unstaged": unstaged.decode().splitlines(),
         "staged": staged.decode().splitlines(),
-        "untracked": untracked.decode().splitlines(),
+        "untracked": untracked,
+        "ignored_generated_python_cache": ignored_cache,
     }
-    if any(evidence.values()):
+    if evidence["unstaged"] or evidence["staged"] or evidence["untracked"]:
         raise ValueError(f"reviewed safety surface is dirty: {evidence}")
     return evidence
 
