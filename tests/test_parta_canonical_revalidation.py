@@ -89,6 +89,50 @@ def _replace_rows(root: Path, filename: str, rows: list[dict]) -> None:
     )
 
 
+def _set_scannetpp_binding(
+    root: Path,
+    certificate: dict,
+    *,
+    sampling_binding: str | None = None,
+    indices: list[int] | None = None,
+) -> None:
+    certified_frames = certificate["frames"]
+    frame_indices = indices or [int(row["frame_index"]) for row in certified_frames]
+    frame_keys = [str(row["frame_key"]) for row in certified_frames]
+    _replace_rows(
+        root,
+        "frame_states.jsonl",
+        [
+            {
+                "source_dataset": "scannetppv2",
+                "scene_id": certificate["scene_id"],
+                "frame_key": key,
+                "frame_index": index,
+            }
+            for key, index in zip(frame_keys, frame_indices)
+        ],
+    )
+    _replace_rows(
+        root,
+        "qa_manifest_exact_verified.jsonl",
+        [
+            {
+                "source_dataset": "scannetppv2",
+                "scene_id": certificate["scene_id"],
+                "qa_id": "scannetppv2:q",
+                "vsi_media": certificate["vsi_media"],
+                "source_sampling_binding_sha256": (
+                    sampling_binding
+                    if sampling_binding is not None
+                    else certificate["sampling_binding_sha256"]
+                ),
+                "actual_frame_indices": frame_indices,
+                "actual_frame_keys": frame_keys,
+            }
+        ],
+    )
+
+
 def _stub_full_validation(monkeypatch, source: str) -> list[dict]:
     calls = []
 
@@ -235,7 +279,8 @@ def test_required_certificate_is_fail_closed_and_validated(tmp_path, monkeypatch
                 "source_dataset": "adt",
                 "scene_id": "s",
                 "qa_id": "adt:q",
-                "support_certificate_sha256": certificate["certificate_sha256"],
+                "vsi_media": "adt/s.mp4",
+                "clip_provenance": {"support_certificate": certificate},
             }
         ],
     )
@@ -256,54 +301,79 @@ def test_required_certificate_is_fail_closed_and_validated(tmp_path, monkeypatch
     }
 
 
-@pytest.mark.parametrize("bad_hash", [None, ""])
-def test_scannetpp_qa_requires_scene_certificate_hash(tmp_path, monkeypatch, bad_hash):
+def test_adt_rejects_embedded_certificate_different_from_external(tmp_path, monkeypatch):
+    root = tmp_path / "adt"
+    _write_root(root, "adt")
+    certificate = build_adt_certificate(
+        scene_id="s",
+        vsi_media="adt/s.mp4",
+        frame_timestamps=list(range(16)),
+        fps=30.0,
+        support_mask=[True] * 16,
+        max_trajectory_error_ns=5_000_000,
+        max_calibration_error_ns=50_000_000,
+    )
+    changed = dict(certificate)
+    changed["certificate_sha256"] = "0" * 64
+    _replace_rows(root, SUPPORT_CERTIFICATE_FILENAMES["adt"], [certificate])
+    _replace_rows(
+        root,
+        "qa_manifest_exact_verified.jsonl",
+        [{"source_dataset": "adt", "scene_id": "s", "qa_id": "adt:q",
+          "vsi_media": "adt/s.mp4", "clip_provenance": {"support_certificate": changed}}],
+    )
+    _stub_full_validation(monkeypatch, "adt")
+    with pytest.raises(ContractError, match="embedded/external"):
+        recompute_validation_report(
+            source="adt", root=root, project_root=tmp_path, producer=__file__
+        )
+
+
+def test_scannetpp_rejects_sampling_binding_mismatch(tmp_path, monkeypatch):
     root = tmp_path / "scannetppv2"
     _write_root(root, "scannetppv2")
     certificate = _scannetpp_certificate("s")
     _replace_rows(root, SUPPORT_CERTIFICATE_FILENAMES["scannetppv2"], [certificate])
-    qa = {"source_dataset": "scannetppv2", "scene_id": "s", "qa_id": "q"}
-    if bad_hash is not None:
-        qa["support_certificate_sha256"] = bad_hash
-    _replace_rows(root, "qa_manifest_exact_verified.jsonl", [qa])
+    _set_scannetpp_binding(root, certificate, sampling_binding="0" * 64)
     _stub_full_validation(monkeypatch, "scannetppv2")
-
-    with pytest.raises(ContractError, match="does not match its scene"):
+    with pytest.raises(ContractError, match="sampling binding mismatch"):
         recompute_validation_report(
             source="scannetppv2", root=root, project_root=tmp_path, producer=__file__
         )
 
 
-def test_scannetpp_rejects_cross_scene_certificate_hash(tmp_path, monkeypatch):
+def test_scannetpp_rejects_certified_frame_mismatch(tmp_path, monkeypatch):
     root = tmp_path / "scannetppv2"
     _write_root(root, "scannetppv2")
-    first = _scannetpp_certificate("s")
-    second = _scannetpp_certificate("other")
-    _replace_rows(
-        root,
-        "scene_states.jsonl",
-        [
-            {"source_dataset": "scannetppv2", "scene_id": "s"},
-            {"source_dataset": "scannetppv2", "scene_id": "other"},
-        ],
-    )
-    _replace_rows(
-        root, SUPPORT_CERTIFICATE_FILENAMES["scannetppv2"], [first, second]
-    )
-    _replace_rows(
-        root,
-        "qa_manifest_exact_verified.jsonl",
-        [
-            {
-                "source_dataset": "scannetppv2",
-                "scene_id": "s",
-                "qa_id": "q",
-                "support_certificate_sha256": second["certificate_sha256"],
-            }
-        ],
-    )
+    certificate = _scannetpp_certificate("s")
+    _replace_rows(root, SUPPORT_CERTIFICATE_FILENAMES["scannetppv2"], [certificate])
+    _set_scannetpp_binding(root, certificate, indices=list(range(1, 17)))
     _stub_full_validation(monkeypatch, "scannetppv2")
-    with pytest.raises(ContractError, match="does not match its scene"):
+    with pytest.raises(ContractError, match="certified frames differ"):
+        recompute_validation_report(
+            source="scannetppv2", root=root, project_root=tmp_path, producer=__file__
+        )
+
+
+def test_scannetpp_rejects_canonical_frame_table_mismatch(tmp_path, monkeypatch):
+    root = tmp_path / "scannetppv2"
+    _write_root(root, "scannetppv2")
+    certificate = _scannetpp_certificate("s")
+    _replace_rows(root, SUPPORT_CERTIFICATE_FILENAMES["scannetppv2"], [certificate])
+    _set_scannetpp_binding(root, certificate)
+    frames = [
+        {
+            "source_dataset": "scannetppv2",
+            "scene_id": "s",
+            "frame_key": str(index),
+            "frame_index": index,
+        }
+        for index in range(16)
+    ]
+    frames[-1]["frame_index"] = 99
+    _replace_rows(root, "frame_states.jsonl", frames)
+    _stub_full_validation(monkeypatch, "scannetppv2")
+    with pytest.raises(ContractError, match="canonical frame table"):
         recompute_validation_report(
             source="scannetppv2", root=root, project_root=tmp_path, producer=__file__
         )
@@ -314,18 +384,7 @@ def test_scannetpp_real_certificate_path_is_accepted(tmp_path, monkeypatch):
     _write_root(root, "scannetppv2")
     certificate = _scannetpp_certificate("s")
     _replace_rows(root, SUPPORT_CERTIFICATE_FILENAMES["scannetppv2"], [certificate])
-    _replace_rows(
-        root,
-        "qa_manifest_exact_verified.jsonl",
-        [
-            {
-                "source_dataset": "scannetppv2",
-                "scene_id": "s",
-                "qa_id": "q",
-                "support_certificate_sha256": certificate["certificate_sha256"],
-            }
-        ],
-    )
+    _set_scannetpp_binding(root, certificate)
     _stub_full_validation(monkeypatch, "scannetppv2")
     payload = recompute_validation_report(
         source="scannetppv2", root=root, project_root=tmp_path, producer=__file__

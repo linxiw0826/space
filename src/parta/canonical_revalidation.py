@@ -76,6 +76,7 @@ def _validate_certificate_registry(
     source: str,
     root: Path,
     scenes: list[Mapping[str, Any]],
+    frames: list[Mapping[str, Any]],
     qa_rows: list[Mapping[str, Any]],
 ) -> dict[str, Any] | None:
     filename = SUPPORT_CERTIFICATE_FILENAMES[source]
@@ -108,24 +109,66 @@ def _validate_certificate_registry(
         )
 
     if required:
-        certificate_by_scene = {
-            str(item["scene_id"]): str(item["certificate_sha256"])
+        certificate_by_binding = {
+            (str(item["scene_id"]), str(item["vsi_media"])): item
             for item in certificates
+        }
+        frame_by_key = {
+            (str(item["source_dataset"]), str(item["frame_key"])): item
+            for item in frames
         }
         for row in qa_rows:
             scene_id = str(row.get("scene_id"))
-            expected_hash = certificate_by_scene.get(scene_id)
-            if expected_hash is None:
+            media = str(row.get("vsi_media"))
+            certificate = certificate_by_binding.get((scene_id, media))
+            if certificate is None:
                 raise ContractError(
-                    f"{source} QA references a scene absent from certificate registry: "
+                    f"{source} QA scene/media is absent from certificate registry: "
                     f"{row.get('qa_id')}"
                 )
-            actual_hash = row.get("support_certificate_sha256")
-            if not isinstance(actual_hash, str) or actual_hash != expected_hash:
-                raise ContractError(
-                    f"{source} QA support certificate does not match its scene: "
-                    f"{row.get('qa_id')}"
+            if source == "adt":
+                provenance = row.get("clip_provenance")
+                embedded = (
+                    provenance.get("support_certificate")
+                    if isinstance(provenance, Mapping)
+                    else None
                 )
+                if embedded != certificate:
+                    raise ContractError(
+                        f"ADT embedded/external support certificate mismatch: "
+                        f"{row.get('qa_id')}"
+                    )
+                # validate_records subsequently revalidates this same embedded
+                # certificate, maximal run, scene/media and clip provenance.
+                continue
+
+            if row.get("source_sampling_binding_sha256") != certificate.get(
+                "sampling_binding_sha256"
+            ):
+                raise ContractError(
+                    f"ScanNet++ certificate sampling binding mismatch: {row.get('qa_id')}"
+                )
+            certified_indices = [
+                int(item["frame_index"]) for item in certificate["frames"]
+            ]
+            certified_keys = [str(item["frame_key"]) for item in certificate["frames"]]
+            actual_indices = [int(value) for value in row.get("actual_frame_indices", ())]
+            actual_keys = [str(value) for value in row.get("actual_frame_keys", ())]
+            if actual_indices != certified_indices or actual_keys != certified_keys:
+                raise ContractError(
+                    f"ScanNet++ certified frames differ from canonical QA: {row.get('qa_id')}"
+                )
+            for frame_key, frame_index in zip(actual_keys, actual_indices):
+                canonical_frame = frame_by_key.get((source, frame_key))
+                if (
+                    canonical_frame is None
+                    or str(canonical_frame.get("scene_id")) != scene_id
+                    or int(canonical_frame.get("frame_index", -1)) != frame_index
+                ):
+                    raise ContractError(
+                        f"ScanNet++ certified frame differs from canonical frame table: "
+                        f"{row.get('qa_id')}"
+                    )
     return {
         **_file_record(path, certificate_payload),
         "certificate_count": len(certificates),
@@ -156,7 +199,9 @@ def recompute_validation_report(
     scenes = rows["scene_states.jsonl"]
     frames = rows["frame_states.jsonl"]
     qa_rows = rows["qa_manifest_exact_verified.jsonl"]
-    certificate = _validate_certificate_registry(source, root, scenes, qa_rows)
+    certificate = _validate_certificate_registry(
+        source, root, scenes, frames, qa_rows
+    )
     if certificate is not None:
         inputs[SUPPORT_CERTIFICATE_FILENAMES[source]] = certificate
 
