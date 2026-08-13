@@ -1,12 +1,18 @@
 # Part A A1-O Architecture
 
-更新时间：2026-08-10（D-62代码完成与最终静态Review PASS；D-63 execution boundary同步）
-状态：D-62三源v2 train/val、engineering subset与coverage-matrix代码已完成且最终静态Review PASS；
-执行服务器CPU/GPU均未运行，Gate@CONFIG未批准，正式训练HOLD。v1三分split/四源Gate仅为历史实现。
+更新时间：2026-08-12（D-62执行服务器CPU代码验证PASS；runtime artifacts待生成；后续Gate语义待Preflight）
+状态：D-62三源v2 train/val、engineering subset与coverage-matrix代码已完成并通过最终静态Review；
+执行服务器commit `4d5946a`的`py_compile`通过，Part A pytest为`213/213 PASS`（25.70s，
+`FULL_PARTA_PYTEST_STATUS=0`）。真实三源v2 runtime artifacts尚未生成，GPU未授权，
+`Gate@CONFIG`未批准，正式训练HOLD。v1三分split/四源Gate仅为历史实现。
 
-> **当前覆盖声明**：本轮正式registry固定ADT、Hypersim、ScanNet++ V2，共`375,682 QA /
-> 1,355 scenes`。不等待ScanNet；未来接入必须新版本+manifest+Preflight。D-62代码与静态Review
-> 已完成，但本文接口尚无执行服务器runtime证据，不得写成CPU/GPU PASS。
+> **当前覆盖声明**：本轮正式registry固定ADT、Hypersim、ScanNet++ V2，共`375,498 QA /
+> 1,355 scenes`：ADT `60,207/183`、Hypersim `176,774/317`、ScanNet++ V2 `138,517/855`。
+> ScanNet++原始VSI清单为856 scenes / 138,701 QA；场景`00dd871005`的逐帧元信息为空
+> （`frames_not_nonempty_list`、`frame_count=0`），其184 QA经用户批准显式排除，不参与训练。
+> Gold、canonical、exact与交付均一致为855/138,517；审计证据：
+> `/data2/wlx/logs/parta/d62_scannetpp_excluded_scene_audit.log`。当前代码中的旧frozen inventory
+> 尚待修正和复验；真实三源v2数据产物与CPU数据面审计尚未生成，GPU仍无PASS证据。
 
 > **执行边界**：canonical代码服务器`/u/lwu9/Space_sensing/projects/space`只做开发、只读分析和
 > ReviewAgent静态审查，不运行Python、`py_compile`、pytest或CPU/GPU runtime。静态Review通过后
@@ -54,8 +60,8 @@ Canonical坐标为米制右手系`x=right,y=up,z=back`，相机forward为`-z`。
 ADT先取trajectory、calibration与direct GT共同支持的最大连续raw-frame clip，再在clip内执行GUIDE
 动态16--32帧采样并映射回原MP4 raw IDs；禁止邻帧替代、外推和伪标签。全部60,207条QA保留，但
 固定为`scene_associated_unlocalized`、`qa_visual_support_verified=false`、
-`evidence_frame_indices=null`。Hypersim QA为单帧`frame_verified`。ScanNet++ V2已完成855景
-canonical/exact validation。
+`evidence_frame_indices=null`。Hypersim QA为单帧`frame_verified`。ScanNet++ V2已完成855景、
+138,517 QA的canonical/exact validation；`00dd871005`及其184 QA因空逐帧元信息不进入正式数据。
 
 ScanNet按D-61采用fail-closed QA-level state gate：92,145条合法VSI QA全保留用于QA loss，
 但identity completeness是existence/category/center/extent/visibility五项state loss的总前置门。本次
@@ -72,7 +78,7 @@ data Gate等待pilot的exact RGB/pose、official aggregation/segs/axisAlignment�
 
 ### 2.2 三源统一manifest与split
 
-D-62 v2合同（代码完成、静态Review PASS、真实构建待执行服务器授权）：
+D-62 v2合同（代码完成、静态Review及执行服务器CPU代码测试PASS；真实产物待构建）：
 
 - 基于`schema_version + seed + source_dataset + scene_id`的确定性scene-level分桶；
 - split只允许`train|val`；seed42、source+scene稳定hash、约10% val与其余train；scene零交集；
@@ -87,9 +93,15 @@ inputs与content hash，不按question/loss/performance挑选。该subset在full
 加权；它不是第三个split。工程事务的模型权重、optimizer、scheduler、RNG/sampler状态全部标记
 `non-promotable`并丢弃。formal A0/A1-O从同一冻结初始化step0重训。
 
-当前代码的权威路径已迁移到v2并对`split=smoke`/非三源fail closed；三源v2真实逐源/逐split
-计数仍未在执行服务器生成。未来ScanNet接入不增量混入本版本，而是创建新registry/schema/
-manifest、adapter并重新Preflight。
+当前执行配置把该registry显式设为**每源1 scene**；它仅是身份/复现登记，不要求fixed-subset
+overfit或任何小样本训练，也不改变full-train sampler/权重。此配置不改变manifest v2 schema。
+
+当前代码的权威路径已迁移到v2并对`split=smoke`/非三源fail closed。D-62以前的旧版三源
+unified manifest真实构建与审计已完成；当前唯一缺少的是按D-62新合同生成的正式runtime
+artifacts：train/val-only unified manifest v2、exact-input registry、真实逐源逐split计数，以及
+engineering subset registry（selected scene/QA IDs、exact inputs与content hashes）。这不是重做
+ScanNet++ adapter或重新对齐ScanNet++。未来ScanNet接入不增量混入本版本，而是创建新registry/
+schema/manifest、adapter并重新Preflight。
 
 ### 2.3 K=384对象选择
 
@@ -143,7 +155,7 @@ GUIDE/VGGT digest与forward身份。
   registry、loss/mask/component、matching、exact frames、checkpoint内容恢复和provenance一致性。
 - CPU mock只能产生`awaiting_gpu`，不能产生formal pass。
 
-D-62 coverage matrix（代码完成、静态Review PASS、runtime receipts尚未生成）为：
+D-62原coverage matrix（代码完成、静态Review PASS、runtime receipts尚未生成）为：
 
 ```text
 T0-A + 三源T0-B + fixed-train-subset overfit/matched real runner
@@ -151,6 +163,13 @@ T0-A + 三源T0-B + fixed-train-subset overfit/matched real runner
      + checkpoint/resume + head-free val audit + validators/resource gates
      → pre-authorization → Gate@CONFIG: APPROVE → freeze → formal A0/A1-O from step 0
 ```
+
+用户在2026-08-12确认的新执行路线是：保留每源1 scene engineering registry但不执行
+fixed-subset overfit；resource profiling只把正式32帧worst-case作为必测点，不把16/24作为正式
+候选。若32帧不可行，优先调per-GPU batch、gradient accumulation、gradient checkpointing和FSDP；
+仍不可行才生成版本化低帧数exact binding并重跑数据审计。**这是对上述D-62工程Gate语义的调整，
+当前代码仍实现原coverage matrix；新路线尚未完成针对性Preflight、代码修改或Review，不得视为
+新Gate已支持或PASS。GPU仍未授权，`Gate@CONFIG`仍未批准。**
 
 正式producer绑定仓库canonical path及预注册内容SHA。每阶段报告绑定私有新目录、run/command/
 config/manifest/model/checkpoint/exact-frame身份；旧报告、mock和synthetic artifact不能冒充GPU证据。
@@ -174,9 +193,13 @@ checkpoint/config后one-shot matched运行，不用于调参。主门是scene/vi
 
 ## 7. 当前状态
 
-### D-62 code complete / static Review PASS / runtime pending
+### D-62既有code/static Review/CPU validation PASS；inventory修正与runtime artifacts pending
 
-- 三源v2 train/val schema与engineering subset registry代码；真实split计数/registry artifact待执行；
+- ScanNet++ V2已完成855 scenes / 138,517 QA的Gold、canonical、exact validation；原始清单中的
+  `00dd871005`（184 QA）因逐帧元信息为空被显式排除；
+- D-62以前的旧版三源unified manifest已真实构建和审计；
+- 三源v2 train/val schema与engineering subset registry代码已完成；正式v2 split计数与registry
+  artifacts待执行服务器生成；
 - 旧四源/三分split/guide_smoke gate已迁移为三源coverage matrix；
 - engineering state non-promotion与formal step0重训断言；
 - val-only checkpoint selector与paired-bootstrap decision report；
@@ -184,8 +207,10 @@ checkpoint/config后one-shot matched运行，不用于调参。主门是scene/vi
 
 最终全量静态Review PASS（2026-08-10 orchestrator mailbox）且`git diff --check`通过；Review覆盖
 `src/parta/{unified_data,gate_orchestration,checkpoint,runner,t0_b_runtime,checkpoint_selection,
-vsibench_eval,worker_trust}.py`、对应Part A CLI与tests。该Review没有生成执行artifact；按D-63，
-Python/py_compile/pytest/真实数据构建/CPU runner/GPU均未运行。
+vsibench_eval,worker_trust}.py`、对应Part A CLI与tests。执行服务器commit `4d5946a`随后完成
+`py_compile`与Part A pytest，最终结果为`213 passed in 25.70s`、
+`FULL_PARTA_PYTEST_STATUS=0`。用户只提供终端结果，未提供可引用日志路径，因此此处不登记日志
+artifact。真实三源v2数据构建、CPU data/collator/K384 audit与GPU仍未运行。
 
 ### D-62前已完成并Review通过（legacy实现证据）
 
@@ -195,26 +220,30 @@ Python/py_compile/pytest/真实数据构建/CPU runner/GPU均未运行。
 - overfit/profile/GUIDE smoke统一编排、producer/freeze/finalize合同（旧编排；D-62要求迁移）；
 - matched A0/A1-O-drop VSI-Bench eval与结果身份验证。
 
-以上是D-62前的历史静态/CPU证据，不表示D-62改动已在当前执行服务器通过，也不表示GPU Gate
-或正式训练通过。
+以上旧版三源真实构建/审计已完成；它不等于D-62 v2正式runtime artifacts。D-62代码本身已在
+当前执行服务器通过CPU代码测试，但GPU Gate与正式训练仍未通过。
 
 ### Historical / superseded prerequisites
 
 - ScanNet lineage与production adapter可继续作为未来数据版本工作，但不再阻塞当前三源版本；
 - v1四源manifest与独立smoke等待逻辑被D-62覆盖，保留仅作历史实现追溯。
 
-### Awaiting execution authorization
+### Next code and execution-server CPU work
 
-- 已审代码commit同步与执行服务器revision/clean audit；
-- `py_compile`、Part A pytest、真实三源v2 manifest/engineering subset构建；
-- validator、dataloader/collator、K384、Gate producer/trust CPU验证。
+- 先把代码中的frozen inventory从ScanNet++ `138,701/855`、三源`375,682/1,355`修正为
+  `138,517/855`与`375,498/1,355`，同步修正对应测试；经静态Review后在执行服务器重新运行
+  `py_compile`与Part A CPU测试。此前的213/213 PASS只对应旧inventory，不可冒充修正后的PASS；
+- CPU复验PASS后，使用三个已完成canonical roots运行`build_unified_three_source_manifest.py`，生成train/val-only
+  unified manifest v2与exact-input registry；
+- `engineering-scenes-per-source=1`必须显式写入命令和报告；registry只用于身份/复现登记；
+- 保存真实逐源逐split计数、engineering selected scene/QA IDs、exact inputs与content hashes；
+- 随后运行真实三源dataset/collator/K384 CPU审计；再针对新工程Gate语义补Preflight并修改代码。
 
 ### Awaiting GPU and Gate
 
 - 三源T0-B；
-- A1-O small-set overfit；
-- 16/24/32帧显存与吞吐profiling；
-- fixed-train-subset matched runner、FSDP/resume/head-free forward与coverage matrix；
+- 正式32帧worst-case显存与吞吐profiling（待Preflight/代码调整后执行）；
+- FSDP/resume/head-free forward与修订后的coverage matrix；
 - 正式A0/A1-O训练与A0/A1-O-drop VSI-Bench eval。
 
 ### Provisional / TBD
@@ -226,3 +255,31 @@ Python/py_compile/pytest/真实数据构建/CPU runner/GPU均未运行。
   由`Gate@CONFIG`冻结。
 
 正式训练Gate当前关闭，且未获得正式训练授权。
+
+## 8. 当前至A2的权威决策树
+
+```text
+已完成
+  三源canonical/exact（855/138,517）；排除场景审计；legacy v1真实审计；既有D-62 v2代码/Review；
+  旧inventory下CPU 213/213；T0-A
+    ↓
+当前代码与CPU步骤
+  修正frozen inventory与tests → 静态Review → 执行服务器py_compile/Part A CPU复验
+    → production manifest v2（train/val、375,498 QA / 1,355 scenes、每源1 scene登记registry）
+    → 真实dataset/collator/sampler/K384审计
+    ↓
+Gate语义迁移
+  Preflight → 删除fixed-subset overfit要求、改为32帧only worst-case profile
+    → Code/Review → 执行服务器CPU回归
+    ↓（GPU授权后）
+  T0-B短链路 → 32帧resource profile → 证据汇总 → Gate@CONFIG
+    ├─ HOLD：补齐证据/配置
+    └─ APPROVE
+         ↓
+  A0与A1-O从相同初始化step0、相同全量manifest独立正式训练
+         ↓
+  val-only同规则选checkpoint → A1-O head-free → matched one-shot VSI-Bench
+         ↓
+  Δoverall 95% CI下界>0：GO至A2 Relation Graph
+  点估计>0但CI跨0：INCONCLUSIVE；点估计≤0：NO-GO
+```

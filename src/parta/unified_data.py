@@ -19,9 +19,9 @@ FROZEN_SOURCE_REGISTRY = ("adt", "hypersim", "scannetppv2")
 FROZEN_SOURCE_INVENTORY: Mapping[str, Mapping[str, int]] = {
     "adt": {"qa": 60_207, "scenes": 183},
     "hypersim": {"qa": 176_774, "scenes": 317},
-    "scannetppv2": {"qa": 138_701, "scenes": 855},
+    "scannetppv2": {"qa": 138_517, "scenes": 855},
 }
-FROZEN_TOTAL_INVENTORY = {"qa": 375_682, "scenes": 1_355}
+FROZEN_TOTAL_INVENTORY = {"qa": 375_498, "scenes": 1_355}
 SPLITS = ("train", "val")
 EXACT_QA_FILENAME = "qa_manifest_exact_verified.jsonl"
 REQUIRED_CANONICAL_FILENAMES = (

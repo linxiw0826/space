@@ -10,7 +10,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from parta.canonical_data import PartASample
 from parta.unified_data import (
+    FROZEN_SOURCE_INVENTORY,
     FROZEN_SOURCE_REGISTRY,
+    FROZEN_TOTAL_INVENTORY,
     UNIFIED_SCHEMA_VERSION,
     PartACPUStateCollator,
     PartAUnifiedDataset,
@@ -114,6 +116,19 @@ def _write_canonical_registry_files(root, source, qa_payload):
             stable_json({"source_dataset": source, "fixture": "support"}) + "\n",
             encoding="utf-8",
         )
+
+
+def test_frozen_inventory_matches_approved_three_source_canonical_counts():
+    assert FROZEN_SOURCE_INVENTORY == {
+        "adt": {"qa": 60_207, "scenes": 183},
+        "hypersim": {"qa": 176_774, "scenes": 317},
+        "scannetppv2": {"qa": 138_517, "scenes": 855},
+    }
+    assert FROZEN_TOTAL_INVENTORY == {
+        key: sum(source[key] for source in FROZEN_SOURCE_INVENTORY.values())
+        for key in ("qa", "scenes")
+    }
+    assert FROZEN_TOTAL_INVENTORY == {"qa": 375_498, "scenes": 1_355}
 
 
 def test_v2_scene_split_is_seed42_deterministic_and_train_val_disjoint():
