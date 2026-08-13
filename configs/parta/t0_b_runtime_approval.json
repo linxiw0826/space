@@ -1,6 +1,6 @@
 {
   "schema_version": "parta_t0_b_runtime_approval_v1",
-  "approved_revision": "ebc788e1aba3eb3a50e38bf19a67e1a50af656c5",
-  "runtime_tree_sha256": "60edff5028ba0d97e132f8c1ffa12473f5dd0f3a02455ecbc576eb5289dc3fbf",
-  "payload_sha256": "dc79a30542ae63657b099fdae552270eec26e4e61fedd17965686170571980dd"
+  "approved_revision": "1916a17e3565882a1c390ab1a11ac089afe41880",
+  "runtime_tree_sha256": "8d7cfb10f6f0c860162f645c4be24b23a51b380340b0b8d40f3fe2d3174c3ee1",
+  "payload_sha256": "d7e405125af0d31d445fe3e5f1308e9286d098655f60e819eb31edf4c63bad2f"
 }
