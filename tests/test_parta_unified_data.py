@@ -201,7 +201,7 @@ def test_manifest_loader_rejects_smoke_duplicate_and_scene_leakage(tmp_path):
 
     duplicate_rows = rows + [dict(rows[0])]
     path.write_text("".join(stable_json(row) + "\n" for row in duplicate_rows))
-    with pytest.raises(ContractError, match="duplicate or missing qa_id"):
+    with pytest.raises(ContractError, match="duplicate qa_id"):
         load_unified_rows(path)
 
     leaked_rows = [dict(row) for row in rows]
