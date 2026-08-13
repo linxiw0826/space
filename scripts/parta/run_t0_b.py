@@ -193,6 +193,7 @@ def main() -> None:
             guide_artifact_sha256=guide_artifact["artifact_sha256"],
             vggt_artifact_sha256=vggt_artifact["artifact_sha256"],
             current_manifest_inputs=report["exact_canonical_inputs"],
+            project_root=PROJECT,
         )
         resolved.update({
             "manifest": str(args.manifest.resolve()),

@@ -16,6 +16,10 @@ from parta.t0_b_runtime import (
     validate_t0_a_initialization_transaction,
     parameter_gradient_norm,
     nested_state_digest,
+    validate_t0_a_code_compatibility,
+    validate_t0_b_runtime_identity,
+    T0_A_COMPATIBILITY_BASE_REVISION,
+    T0_A_APPROVED_SEMANTIC_TREE_SHA256,
 )
 from parta.checkpoint import (
     ResumeContract, capture_rng_state, load_training_checkpoint, save_training_checkpoint,
@@ -79,7 +83,7 @@ def test_failed_gpu_gate_is_nonzero_at_finalize(tmp_path):
         finalize_t0_b_report(report, str(tmp_path / "failed.json"))
 
 
-def test_t0_b_rejects_unbound_t0_a_initialization(tmp_path):
+def test_t0_b_rejects_unbound_t0_a_initialization(tmp_path, monkeypatch):
     checkpoint = tmp_path / "t0.pt"
     torch.save({"model": {}}, checkpoint)
     checkpoint_sha = __import__("hashlib").sha256(checkpoint.read_bytes()).hexdigest()
@@ -112,6 +116,15 @@ def test_t0_b_rejects_unbound_t0_a_initialization(tmp_path):
             "hypersim": {"files": {"qa_manifest_exact_verified.jsonl": {"sha256": "h" * 64}}},
             "scannetppv2": {"files": {"qa_manifest_exact_verified.jsonl": {"sha256": "p" * 64}}},
         },
+        project_root=tmp_path,
+    )
+    monkeypatch.setattr(
+        "parta.t0_b_runtime.validate_t0_a_code_compatibility",
+        lambda **_kwargs: {"mode": "exact_revision"},
+    )
+    monkeypatch.setattr(
+        "parta.t0_b_runtime.validate_t0_b_runtime_identity",
+        lambda **_kwargs: {"tree_sha256": "r" * 64},
     )
     assert validate_t0_a_initialization_transaction(**kwargs)[
         "t0_a_checkpoint_optimizer_steps"
@@ -127,6 +140,234 @@ def test_t0_b_rejects_unbound_t0_a_initialization(tmp_path):
     ]["sha256"] = "x" * 64
     with pytest.raises(ValueError, match="manifest.adt"):
         validate_t0_a_initialization_transaction(**kwargs)
+
+
+def test_t0_a_code_compatibility_exact_revision_passes_clean_head(tmp_path, monkeypatch):
+    def clean_git(_root, *arguments):
+        if arguments[:2] == ("rev-parse", "HEAD"):
+            return b"same\n"
+        if arguments[0] in {"diff", "ls-files"}:
+            return b""
+        raise AssertionError(arguments)
+    monkeypatch.setattr("parta.t0_b_runtime._git_bytes", clean_git)
+    result = validate_t0_a_code_compatibility(
+        t0_a_revision="same", current_code_revision="same", project_root=tmp_path
+    )
+    assert result["mode"] == "exact_revision"
+
+
+def test_t0_a_code_compatibility_accepts_reviewed_semantic_tree(tmp_path, monkeypatch):
+    current = "c" * 40
+
+    def fake_git(_root, *arguments):
+        if arguments[:2] == ("rev-parse", "HEAD"):
+            return f"{current}\n".encode()
+        if arguments[0] in {"cat-file", "merge-base"}:
+            return b""
+        if arguments[0] in {"diff", "ls-files"}:
+            return b""
+        if arguments[0] == "ls-tree":
+            return b"reviewed semantic tree"
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr("parta.t0_b_runtime._git_bytes", fake_git)
+    monkeypatch.setattr(
+        "parta.t0_b_runtime.T0_A_APPROVED_SEMANTIC_TREE_SHA256",
+        __import__("hashlib").sha256(b"reviewed semantic tree").hexdigest(),
+    )
+    result = validate_t0_a_code_compatibility(
+        t0_a_revision=T0_A_COMPATIBILITY_BASE_REVISION,
+        current_code_revision=current,
+        project_root=tmp_path,
+    )
+    assert result["mode"] == "reviewed_semantic_tree_v1"
+
+
+def test_transaction_accepts_reviewed_revision_but_keeps_artifact_gates(
+    tmp_path, monkeypatch
+):
+    checkpoint = tmp_path / "t0.pt"
+    torch.save({"model": {}}, checkpoint)
+    checkpoint_sha = __import__("hashlib").sha256(checkpoint.read_bytes()).hexdigest()
+    report = tmp_path / "report.json"
+    report.write_text(json.dumps({"schema_version": "parta_t0_report_v1",
+                                  "status": "complete_passed"}))
+    status = tmp_path / "status.json"
+    status.write_text(json.dumps({"status": "complete", "experiment": "parta-t0-a",
+                                  "code_revision": T0_A_COMPATIBILITY_BASE_REVISION,
+                                  "checkpoint_sha256": "s" * 64}))
+    provenance = tmp_path / "provenance.json"
+    provenance.write_text(json.dumps({
+        "status": "complete_passed", "a1_checkpoint_role": "initialization_no_optimizer_updates",
+        "a1_checkpoint_optimizer_steps": 0,
+        "a1_checkpoint_artifact": {"ordered_shards": [{"sha256": checkpoint_sha}]},
+        "a1_checkpoint_state_sha256": "s" * 64,
+        "parameter_sha256_before_backward": "s" * 64,
+        "parameter_sha256_after_backward": "s" * 64,
+        "git_revision": T0_A_COMPATIBILITY_BASE_REVISION,
+        "checkpoint_sha256": "g" * 64, "vggt_checkpoint_sha256": "v" * 64,
+        "manifest_sha256": {"adt": "a" * 64, "hypersim": "h" * 64},
+        "exact_frame_binding_sha256": "e" * 64,
+    }))
+    monkeypatch.setattr(
+        "parta.t0_b_runtime.validate_t0_a_code_compatibility",
+        lambda **_kwargs: {"mode": "reviewed_semantic_tree_v1"},
+    )
+    monkeypatch.setattr(
+        "parta.t0_b_runtime.validate_t0_b_runtime_identity",
+        lambda **_kwargs: {"tree_sha256": "r" * 64},
+    )
+    kwargs = {
+        "report_path": report, "provenance_path": provenance,
+        "run_status_path": status, "checkpoint_path": checkpoint,
+        "current_code_revision": "c" * 40, "guide_artifact_sha256": "g" * 64,
+        "vggt_artifact_sha256": "v" * 64, "project_root": tmp_path,
+        "current_manifest_inputs": {
+            "adt": {"files": {"qa": {"sha256": "a" * 64}}},
+            "hypersim": {"files": {"qa": {"sha256": "h" * 64}}},
+        },
+    }
+    assert validate_t0_a_initialization_transaction(**kwargs)[
+        "t0_a_code_compatibility"
+    ]["mode"] == "reviewed_semantic_tree_v1"
+    kwargs["guide_artifact_sha256"] = "x" * 64
+    with pytest.raises(ValueError, match="guide_hash"):
+        validate_t0_a_initialization_transaction(**kwargs)
+
+
+def test_t0_a_code_compatibility_rejects_unknown_old_revision(tmp_path):
+    with pytest.raises(ValueError, match="no reviewed compatibility"):
+        validate_t0_a_code_compatibility(
+            t0_a_revision="d" * 40,
+            current_code_revision="c" * 40,
+            project_root=tmp_path,
+        )
+
+
+@pytest.mark.parametrize(
+    "failure", ["altered", "git_failure", "unstaged", "staged", "untracked"]
+)
+def test_t0_a_code_compatibility_rejects_altered_or_unverifiable_history(
+    tmp_path, monkeypatch, failure
+):
+    current = "c" * 40
+
+    def fake_git(_root, *arguments):
+        if failure == "git_failure" and arguments[0] == "merge-base":
+            raise ValueError("reviewed compatibility requires complete usable git history")
+        if arguments[:2] == ("rev-parse", "HEAD"):
+            return f"{current}\n".encode()
+        if arguments[0] in {"cat-file", "merge-base"}:
+            return b""
+        if arguments[0] == "ls-files":
+            return b"src/parta/t0.py\n" if failure == "untracked" else b""
+        if arguments[0] == "diff":
+            cached = "--cached" in arguments
+            if failure == "unstaged" and not cached:
+                return b"src/parta/t0.py\n"
+            if failure == "staged" and cached:
+                return b"src/parta/t0.py\n"
+            return b""
+        if arguments[0] == "ls-tree":
+            return (
+                b"altered semantic tree"
+                if failure == "altered" and arguments[2] == current
+                else b"reviewed semantic tree"
+            )
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr("parta.t0_b_runtime._git_bytes", fake_git)
+    message = {
+        "git_failure": "usable git history",
+        "altered": "differs from reviewed tree",
+        "unstaged": "safety surface is dirty",
+        "staged": "safety surface is dirty",
+        "untracked": "safety surface is dirty",
+    }[failure]
+    monkeypatch.setattr(
+        "parta.t0_b_runtime.T0_A_APPROVED_SEMANTIC_TREE_SHA256",
+        __import__("hashlib").sha256(b"reviewed semantic tree").hexdigest(),
+    )
+    with pytest.raises(ValueError, match=message):
+        validate_t0_a_code_compatibility(
+            t0_a_revision=T0_A_COMPATIBILITY_BASE_REVISION,
+            current_code_revision=current,
+            project_root=tmp_path,
+        )
+
+
+def test_t0_b_runtime_identity_is_fail_closed_until_phase_two_freeze(tmp_path):
+    with pytest.raises(ValueError, match="has not been frozen"):
+        validate_t0_b_runtime_identity(
+            current_code_revision="c" * 40, project_root=tmp_path
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation", [None, "tree", "unstaged", "staged", "untracked"]
+)
+def test_t0_b_runtime_tree_identity_mechanism(tmp_path, monkeypatch, mutation):
+    approved = "a" * 40
+    current = "c" * 40
+
+    def fake_git(_root, *arguments):
+        if arguments[:2] == ("rev-parse", "HEAD"):
+            return f"{current}\n".encode()
+        if arguments[0] in {"cat-file", "merge-base"}:
+            return b""
+        if arguments[0] == "diff":
+            cached = "--cached" in arguments
+            if mutation == "unstaged" and not cached:
+                return b"src/parta/t0_b_runtime.py\n"
+            if mutation == "staged" and cached:
+                return b"scripts/parta/run_t0_b.py\n"
+            return b""
+        if arguments[0] == "ls-files":
+            return b"scripts/parta/run_t0_b.py\n" if mutation == "untracked" else b""
+        if arguments[0] == "ls-tree":
+            revision = arguments[2]
+            if mutation != "tree" or revision == approved:
+                return b"reviewed runtime tree"
+            return b"mutated runtime tree"
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr("parta.t0_b_runtime._git_bytes", fake_git)
+    monkeypatch.setattr(
+        "parta.t0_b_runtime.T0_B_RUNTIME_APPROVED_REVISION", approved
+    )
+    if mutation is None:
+        result = validate_t0_b_runtime_identity(
+            current_code_revision=current, project_root=tmp_path
+        )
+        assert result["tree_sha256"] == __import__("hashlib").sha256(
+            b"reviewed runtime tree"
+        ).hexdigest()
+    elif mutation == "tree":
+        with pytest.raises(ValueError, match="differs from reviewed runtime"):
+            validate_t0_b_runtime_identity(
+                current_code_revision=current, project_root=tmp_path
+            )
+    else:
+        with pytest.raises(ValueError, match="dirty"):
+            validate_t0_b_runtime_identity(
+                current_code_revision=current, project_root=tmp_path
+            )
+
+
+def test_t0_b_runtime_identity_rejects_revision_head_disagreement(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "parta.t0_b_runtime.T0_B_RUNTIME_APPROVED_REVISION", "a" * 40
+    )
+    monkeypatch.setattr(
+        "parta.t0_b_runtime._git_bytes",
+        lambda _root, *arguments: b"different\n"
+        if arguments[:2] == ("rev-parse", "HEAD")
+        else b"",
+    )
+    with pytest.raises(ValueError, match="differs from repository HEAD"):
+        validate_t0_b_runtime_identity(
+            current_code_revision="c" * 40, project_root=tmp_path
+        )
 
 
 def test_parameter_gradient_norm_counts_only_connected_parameters():

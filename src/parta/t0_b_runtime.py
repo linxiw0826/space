@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import hashlib
 import json
+import subprocess
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -14,6 +15,159 @@ import torch
 
 from .provenance import atomic_json_dump
 from .provenance import sha256_file
+
+
+T0_A_COMPATIBILITY_BASE_REVISION = "eb2a0912bde0e8db97acc713f261f06b42b68427"
+T0_A_SEMANTIC_PATHS = (
+    "scripts/parta/run_t0_a.py",
+    "src/parta/canonical_data.py",
+    "src/parta/provenance.py",
+    "src/parta/checkpoint.py",
+    "src/parta/state_head.py",
+    "src/parta/state_loss.py",
+    "src/parta/training.py",
+    "src/parta/t0_runtime.py",
+    "src/parta/t0.py",
+    "src/parta_data_contract.py",
+    "src/adt_gt_supported_clip.py",
+    "src/qwenvl/model/configuration_qwen3_vl.py",
+    "src/qwenvl/model/modeling_qwen3_vl.py",
+    "src/qwenvl/model/processing_qwen3_vl.py",
+    "src/qwenvl/model/feature_fusion.py",
+    "src/qwenvl/model/geometry_encoders",
+    "src/qwenvl/model/vggt",
+)
+T0_A_APPROVED_SEMANTIC_REVISION = "134dfc62e7b23b56077f703fb949ba3e9f1f46bf"
+T0_A_APPROVED_SEMANTIC_TREE_SHA256 = (
+    "aefb9e5a6d2a6a17b040a70189ff56f6db6bd3144add6ca8cba5d7df250e9aea"
+)
+# This is deliberately fail-closed until the reviewed implementation is
+# committed and Orchestrator freezes that commit in the required second step.
+T0_B_RUNTIME_APPROVED_REVISION: str | None = None
+T0_B_RUNTIME_PATHS = (
+    "scripts/parta/run_t0_b.py",
+    "src/parta/t0_b_runtime.py",
+)
+
+
+def _git_bytes(project_root: Path, *arguments: str) -> bytes:
+    try:
+        return subprocess.run(
+            ["git", *arguments],
+            cwd=project_root,
+            check=True,
+            capture_output=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ValueError("reviewed compatibility requires complete usable git history") from error
+
+
+def _tracked_surface_identity(
+    root: Path, revision: str, paths: Sequence[str]
+) -> str:
+    listing = _git_bytes(root, "ls-tree", "-r", revision, "--", *paths)
+    if not listing:
+        raise ValueError("reviewed semantic surface is absent from git tree")
+    return hashlib.sha256(listing).hexdigest()
+
+
+def _assert_surface_clean(root: Path, paths: Sequence[str]) -> dict[str, Any]:
+    unstaged = _git_bytes(root, "diff", "--name-only", "--", *paths)
+    staged = _git_bytes(root, "diff", "--cached", "--name-only", "--", *paths)
+    untracked = _git_bytes(
+        root, "ls-files", "--others", "--exclude-standard", "--", *paths
+    )
+    evidence = {
+        "unstaged": unstaged.decode().splitlines(),
+        "staged": staged.decode().splitlines(),
+        "untracked": untracked.decode().splitlines(),
+    }
+    if any(evidence.values()):
+        raise ValueError(f"reviewed safety surface is dirty: {evidence}")
+    return evidence
+
+
+def validate_t0_b_runtime_identity(
+    *, current_code_revision: str, project_root: str | Path
+) -> dict[str, Any]:
+    root = Path(project_root).resolve()
+    if T0_B_RUNTIME_APPROVED_REVISION is None:
+        raise ValueError("T0-B runtime identity has not been frozen after review")
+    head = _git_bytes(root, "rev-parse", "HEAD").decode().strip()
+    if head != current_code_revision:
+        raise ValueError("current code revision differs from repository HEAD")
+    _git_bytes(root, "cat-file", "-e", f"{T0_B_RUNTIME_APPROVED_REVISION}^{{commit}}")
+    _git_bytes(root, "cat-file", "-e", f"{current_code_revision}^{{commit}}")
+    _git_bytes(
+        root,
+        "merge-base",
+        "--is-ancestor",
+        T0_B_RUNTIME_APPROVED_REVISION,
+        current_code_revision,
+    )
+    approved = _tracked_surface_identity(
+        root, T0_B_RUNTIME_APPROVED_REVISION, T0_B_RUNTIME_PATHS
+    )
+    current = _tracked_surface_identity(root, current_code_revision, T0_B_RUNTIME_PATHS)
+    if current != approved:
+        raise ValueError("T0-B gate/runner tree differs from reviewed runtime")
+    cleanliness = _assert_surface_clean(root, T0_B_RUNTIME_PATHS)
+    return {
+        "approved_revision": T0_B_RUNTIME_APPROVED_REVISION,
+        "current_revision": current_code_revision,
+        "paths": list(T0_B_RUNTIME_PATHS),
+        "tree_sha256": current,
+        "cleanliness": cleanliness,
+    }
+
+
+def validate_t0_a_code_compatibility(
+    *,
+    t0_a_revision: str,
+    current_code_revision: str,
+    project_root: str | Path,
+) -> dict[str, Any]:
+    """Accept exact revision or the reviewed semantic-tree identity only."""
+    root = Path(project_root).resolve()
+    head = _git_bytes(root, "rev-parse", "HEAD").decode().strip()
+    if head != current_code_revision:
+        raise ValueError("current code revision differs from repository HEAD")
+    cleanliness = _assert_surface_clean(root, T0_A_SEMANTIC_PATHS)
+    if t0_a_revision == current_code_revision:
+        return {
+            "mode": "exact_revision",
+            "t0_a_revision": t0_a_revision,
+            "current_revision": current_code_revision,
+        }
+    if t0_a_revision != T0_A_COMPATIBILITY_BASE_REVISION:
+        raise ValueError("T0-A revision has no reviewed compatibility contract")
+    _git_bytes(root, "cat-file", "-e", f"{t0_a_revision}^{{commit}}")
+    _git_bytes(root, "cat-file", "-e", f"{current_code_revision}^{{commit}}")
+    _git_bytes(root, "merge-base", "--is-ancestor", t0_a_revision, current_code_revision)
+    _git_bytes(
+        root,
+        "merge-base", "--is-ancestor", T0_A_APPROVED_SEMANTIC_REVISION,
+        current_code_revision,
+    )
+    approved_identity = _tracked_surface_identity(
+        root, T0_A_APPROVED_SEMANTIC_REVISION, T0_A_SEMANTIC_PATHS
+    )
+    current_identity = _tracked_surface_identity(
+        root, current_code_revision, T0_A_SEMANTIC_PATHS
+    )
+    if approved_identity != T0_A_APPROVED_SEMANTIC_TREE_SHA256:
+        raise ValueError("frozen T0-A semantic identity does not match reviewed tree")
+    if current_identity != approved_identity:
+        raise ValueError("current T0-A semantic surface differs from reviewed tree")
+    return {
+        "mode": "reviewed_semantic_tree_v1",
+        "t0_a_revision": t0_a_revision,
+        "current_revision": current_code_revision,
+        "semantic_paths": list(T0_A_SEMANTIC_PATHS),
+        "semantic_tree_sha256": current_identity,
+        "approved_semantic_revision": T0_A_APPROVED_SEMANTIC_REVISION,
+        "cleanliness": cleanliness,
+    }
 
 
 def validate_t0_a_initialization_transaction(
@@ -26,6 +180,7 @@ def validate_t0_a_initialization_transaction(
     guide_artifact_sha256: str,
     vggt_artifact_sha256: str,
     current_manifest_inputs: Mapping[str, Any],
+    project_root: str | Path,
 ) -> dict[str, Any]:
     """Fail closed unless formal T0-B starts from the passed T0-A transaction."""
     report = json.loads(Path(report_path).read_text(encoding="utf-8"))
@@ -54,10 +209,25 @@ def validate_t0_a_initialization_transaction(
         "parameter_sha256_after_backward"
     ):
         failures.append("initialization_was_updated")
-    if provenance.get("git_revision") != current_code_revision or status.get(
-        "code_revision"
-    ) != current_code_revision:
-        failures.append("code_revision")
+    provenance_revision = provenance.get("git_revision")
+    status_revision = status.get("code_revision")
+    code_compatibility = None
+    runtime_identity = None
+    if provenance_revision != status_revision or not isinstance(provenance_revision, str):
+        failures.append("t0_a_revision_disagreement")
+    else:
+        try:
+            runtime_identity = validate_t0_b_runtime_identity(
+                current_code_revision=current_code_revision,
+                project_root=project_root,
+            )
+            code_compatibility = validate_t0_a_code_compatibility(
+                t0_a_revision=provenance_revision,
+                current_code_revision=current_code_revision,
+                project_root=project_root,
+            )
+        except ValueError:
+            failures.append("code_revision_compatibility")
     if provenance.get("checkpoint_sha256") != guide_artifact_sha256:
         failures.append("guide_hash")
     if provenance.get("vggt_checkpoint_sha256") != vggt_artifact_sha256:
@@ -93,6 +263,8 @@ def validate_t0_a_initialization_transaction(
         "t0_a_exact_frame_binding_sha256": exact,
         "t0_a_manifest_sha256": dict(t0_inputs),
         "code_revision": current_code_revision,
+        "t0_a_code_compatibility": code_compatibility,
+        "t0_b_runtime_identity": runtime_identity,
     }
 from .t0 import GradientBatchRecord, summarize_gradient_calibration
 
