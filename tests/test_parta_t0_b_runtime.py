@@ -16,6 +16,8 @@ from parta.t0_b_runtime import (
     validate_t0_a_initialization_transaction,
     parameter_gradient_norm,
     nested_state_digest,
+    t0_a_model_state_digest,
+    validate_t0_a_model_state_restore,
     validate_t0_a_code_compatibility,
     validate_t0_b_runtime_identity,
     T0_A_COMPATIBILITY_BASE_REVISION,
@@ -619,3 +621,65 @@ def test_checkpoint_resume_restores_tensor_optimizer_scheduler_counter_and_rng(t
     )
     assert actual == expected
     assert counters == {"global_step": 7, "epoch": 2, "sampler_position": 11}
+
+
+def test_t0_a_model_state_digest_matches_record_semantics_not_generic_digest():
+    state = {
+        "weight": torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16),
+        "bias": torch.tensor([3.0], dtype=torch.float32),
+    }
+    records = []
+    for key, value in sorted(state.items()):
+        raw = value.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
+        records.append((
+            key,
+            list(value.shape),
+            str(value.dtype),
+            __import__("hashlib").sha256(raw).hexdigest(),
+        ))
+    expected = stable_sha256(records)
+    assert t0_a_model_state_digest(state) == expected
+    assert nested_state_digest(state) != expected
+
+
+def test_t0_a_model_state_restore_valid_round_trip():
+    checkpoint = {"weight": torch.tensor([1.0, 2.0])}
+    loaded = {"weight": checkpoint["weight"].clone()}
+    expected = t0_a_model_state_digest(checkpoint)
+    evidence = validate_t0_a_model_state_restore(
+        checkpoint_state=checkpoint,
+        loaded_state=loaded,
+        expected_digest=expected,
+    )
+    assert set(evidence.values()) == {expected}
+
+
+def test_t0_a_model_state_restore_rejects_checkpoint_tamper():
+    original = {"weight": torch.tensor([1.0, 2.0])}
+    tampered = {"weight": torch.tensor([1.0, 9.0])}
+    with pytest.raises(ValueError, match="checkpoint payload"):
+        validate_t0_a_model_state_restore(
+            checkpoint_state=tampered,
+            loaded_state=tampered,
+            expected_digest=t0_a_model_state_digest(original),
+        )
+
+
+def test_t0_a_model_state_restore_rejects_loaded_state_mismatch():
+    checkpoint = {"weight": torch.tensor([1.0, 2.0])}
+    loaded = {"weight": torch.tensor([1.0, 9.0])}
+    with pytest.raises(ValueError, match="loaded T0-A"):
+        validate_t0_a_model_state_restore(
+            checkpoint_state=checkpoint,
+            loaded_state=loaded,
+            expected_digest=t0_a_model_state_digest(checkpoint),
+        )
+
+
+@pytest.mark.parametrize(
+    "state",
+    [{}, {1: torch.tensor([1.0])}, {"weight": "not-a-tensor"}],
+)
+def test_t0_a_model_state_digest_rejects_malformed_state(state):
+    with pytest.raises(ValueError, match="T0-A model state"):
+        t0_a_model_state_digest(state)

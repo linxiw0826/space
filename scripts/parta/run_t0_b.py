@@ -45,6 +45,7 @@ from parta.t0_b_runtime import (  # noqa: E402
     finalize_t0_b_report,
     nested_state_digest,
     parameter_gradient_norm,
+    validate_t0_a_model_state_restore,
     validate_t0_a_initialization_transaction,
 )
 from parta.training import run_a1o_side_branch  # noqa: E402
@@ -242,8 +243,15 @@ def main() -> None:
         incompatible = model.load_state_dict(smoke_payload["model"], strict=True)
         if incompatible.missing_keys or incompatible.unexpected_keys:
             raise ValueError("strict T0-A initialization restore failed")
-        if nested_state_digest(model.state_dict()) != t0_a_transaction["t0_a_checkpoint_state_sha256"]:
-            raise ValueError("loaded T0-A initialization state digest mismatch")
+        initialization_state_binding = validate_t0_a_model_state_restore(
+            checkpoint_state=smoke_payload["model"],
+            loaded_state=model.state_dict(),
+            expected_digest=t0_a_transaction["t0_a_checkpoint_state_sha256"],
+        )
+        provenance["artifacts"]["t0_a_initialization_transaction"][
+            "model_state_binding"
+        ] = initialization_state_binding
+        atomic_json_dump(provenance, args.output_dir / "provenance.json")
         model.train()
         optimizer = torch.optim.AdamW(
             [parameter for parameter in model.parameters() if parameter.requires_grad], lr=2e-5

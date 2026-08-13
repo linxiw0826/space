@@ -15,6 +15,7 @@ import torch
 
 from .provenance import atomic_json_dump
 from .provenance import sha256_file
+from .provenance import stable_sha256
 
 
 T0_A_COMPATIBILITY_BASE_REVISION = "eb2a0912bde0e8db97acc713f261f06b42b68427"
@@ -560,3 +561,52 @@ def nested_state_digest(value: Any) -> str:
 
     update(value)
     return digest.hexdigest()
+
+
+def t0_a_model_state_digest(state: Mapping[str, torch.Tensor]) -> str:
+    """Reproduce the exact model-state digest recorded by T0-A."""
+    if not isinstance(state, Mapping) or not state:
+        raise ValueError("T0-A model state must be a non-empty mapping")
+    if any(
+        not isinstance(key, str) or not isinstance(value, torch.Tensor)
+        for key, value in state.items()
+    ):
+        raise ValueError("T0-A model state must map string keys to tensors")
+    records = []
+    for key, value in sorted(state.items()):
+        raw = value.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
+        records.append(
+            (
+                key,
+                list(value.shape),
+                str(value.dtype),
+                hashlib.sha256(raw).hexdigest(),
+            )
+        )
+    return stable_sha256(records)
+
+
+def validate_t0_a_model_state_restore(
+    *,
+    checkpoint_state: Mapping[str, torch.Tensor],
+    loaded_state: Mapping[str, torch.Tensor],
+    expected_digest: str,
+) -> dict[str, str]:
+    """Bind both serialized and strictly loaded model states to T0-A."""
+    if not (
+        isinstance(expected_digest, str)
+        and len(expected_digest) == 64
+        and all(character in "0123456789abcdef" for character in expected_digest)
+    ):
+        raise ValueError("recorded T0-A model state digest is malformed")
+    checkpoint_digest = t0_a_model_state_digest(checkpoint_state)
+    if checkpoint_digest != expected_digest:
+        raise ValueError("T0-A checkpoint payload model state digest mismatch")
+    loaded_digest = t0_a_model_state_digest(loaded_state)
+    if loaded_digest != expected_digest:
+        raise ValueError("loaded T0-A initialization state digest mismatch")
+    return {
+        "expected_sha256": expected_digest,
+        "checkpoint_payload_sha256": checkpoint_digest,
+        "loaded_model_sha256": loaded_digest,
+    }
