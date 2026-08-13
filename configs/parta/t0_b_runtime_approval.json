@@ -1,6 +1,6 @@
 {
   "schema_version": "parta_t0_b_runtime_approval_v1",
-  "approved_revision": null,
-  "runtime_tree_sha256": null,
-  "payload_sha256": "88e7bdab8522a1b8ae545efbbccaeea4bfe6bd41de5f2240f0de98dc55409e45"
+  "approved_revision": "ebc788e1aba3eb3a50e38bf19a67e1a50af656c5",
+  "runtime_tree_sha256": "60edff5028ba0d97e132f8c1ffa12473f5dd0f3a02455ecbc576eb5289dc3fbf",
+  "payload_sha256": "dc79a30542ae63657b099fdae552270eec26e4e61fedd17965686170571980dd"
 }
