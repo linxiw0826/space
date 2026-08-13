@@ -347,8 +347,13 @@ class PartATrainer:
     def train_step(self, batch: PartATrainBatch) -> TrainingStepRecord:
         batch.validate()
         started = time.perf_counter()
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
+        cuda_parameter = next(
+            (parameter for parameter in self.model.parameters() if parameter.device.type == "cuda"),
+            None,
+        )
+        cuda_device = cuda_parameter.device if cuda_parameter is not None else None
+        if cuda_device is not None:
+            torch.cuda.reset_peak_memory_stats(cuda_device)
         self.optimizer.zero_grad(set_to_none=True)
         try:
             output = self.forward_adapter(self.model, batch.model_inputs, self.config.arm == "a1o")
@@ -423,7 +428,8 @@ class PartATrainer:
             samples_per_second=len(batch.targets) / elapsed,
             frames_per_second=frame_count / elapsed,
             peak_cuda_memory_bytes=(
-                int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else None
+                int(torch.cuda.max_memory_allocated(cuda_device))
+                if cuda_device is not None else None
             ),
             lambda_state=self.config.lambda_state if self.config.arm == "a1o" else 0.0,
             shared_grad_norm=shared_grad_norm,

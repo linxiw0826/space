@@ -13,7 +13,7 @@ from scripts.parta.audit_formal_startup import (validate_single_checkpoint_artif
                                                 validate_startup_configs,
                                                 checkpoint_artifact,
                                                 validate_startup_input)
-from parta.provenance import sha256_file
+from parta.provenance import sha256_file, stable_sha256
 
 
 def _record(script, sha="a" * 64, revision="b" * 40):

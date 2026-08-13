@@ -279,8 +279,10 @@ def validate_unified_rows(rows: Sequence[Mapping[str, Any]]) -> None:
         if split not in SPLITS:
             raise ContractError(f"unknown split: {split}")
         qa_id = str(row.get("qa_id"))
-        if not qa_id or qa_id == "None" or qa_id in seen_qa:
-            raise ContractError(f"duplicate or missing qa_id: {qa_id}")
+        if not qa_id or qa_id == "None":
+            raise ContractError(f"missing qa_id: {qa_id}")
+        if qa_id in seen_qa:
+            raise ContractError(f"duplicate qa_id: {qa_id}")
         seen_qa.add(qa_id)
         key = (source, str(row.get("scene_id")))
         previous = scene_splits.setdefault(key, split)
