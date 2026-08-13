@@ -105,7 +105,10 @@ class PartACanonicalDataset:
             )
             scene_map = {(row["source_dataset"], row["scene_id"]): row for row in scenes}
             frame_map = {(row["source_dataset"], row["frame_key"]): row for row in frames}
-            fixture_ids = set(T0_FIXTURES[source])
+            # Generic canonical reads may include validated sources that are
+            # intentionally outside the fixed T0-A fixture registry.  The
+            # strict fixture path remains guarded above by require_fixtures.
+            fixture_ids = set(T0_FIXTURES.get(source, ()))
             for row in qa_rows:
                 if row["qa_id"] in seen_qa_ids:
                     raise ContractError(f"duplicate cross-source qa_id: {row['qa_id']}")

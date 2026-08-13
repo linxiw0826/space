@@ -237,6 +237,78 @@ def test_dataset_rejects_unsafe_or_unfrozen_qa_filename(tmp_path, qa_filename):
         )
 
 
+def test_generic_canonical_dataset_accepts_known_source_without_t0_fixtures(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "scannetppv2"
+    root.mkdir()
+    for filename in (
+        "scene_states.jsonl",
+        "frame_states.jsonl",
+        "qa_manifest_exact_verified.jsonl",
+    ):
+        (root / filename).touch()
+
+    rows = {
+        "scene_states.jsonl": [
+            {"source_dataset": "scannetppv2", "scene_id": "scene"}
+        ],
+        "frame_states.jsonl": [
+            {
+                "source_dataset": "scannetppv2",
+                "scene_id": "scene",
+                "frame_key": "frame",
+            }
+        ],
+        "qa_manifest_exact_verified.jsonl": [
+            {
+                "source_dataset": "scannetppv2",
+                "scene_id": "scene",
+                "qa_id": "scannetppv2:q",
+                "actual_frame_keys": ["frame"],
+            }
+        ],
+    }
+    validation_calls = []
+    monkeypatch.setattr(
+        "parta.canonical_data.read_jsonl", lambda path: iter(rows[path.name])
+    )
+    monkeypatch.setattr(
+        "parta.canonical_data.validate_records",
+        lambda *args, **kwargs: validation_calls.append(kwargs),
+    )
+
+    dataset = PartACanonicalDataset(
+        {"scannetppv2": root}, fixture_only=False, require_fixtures=False
+    )
+
+    assert len(dataset) == 1
+    assert dataset[0].qa["qa_id"] == "scannetppv2:q"
+    assert validation_calls == [
+        {"require_fixtures": False, "expected_sources": ("scannetppv2",)}
+    ]
+
+
+def test_fixture_only_still_requires_strict_fixture_validation():
+    with pytest.raises(
+        ValueError, match="fixture_only=True requires require_fixtures=True"
+    ):
+        PartACanonicalDataset(
+            {"scannetppv2": "/unused"},
+            fixture_only=True,
+            require_fixtures=False,
+        )
+
+
+def test_strict_fixture_mode_rejects_non_t0_source_before_reading():
+    with pytest.raises(ContractError, match="requires exactly ADT and Hypersim roots"):
+        PartACanonicalDataset(
+            {"scannetppv2": "/unused"},
+            fixture_only=False,
+            require_fixtures=True,
+        )
+
+
 @pytest.mark.parametrize(
     "media",
     [
