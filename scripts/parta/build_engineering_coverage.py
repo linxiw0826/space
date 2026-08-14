@@ -13,6 +13,11 @@ PROJECT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT / "src"))
 
 from parta.provenance import sha256_file, stable_sha256  # noqa: E402
+from parta.resource_profile_contract import (LAMBDA_STATE,
+    normalize_profile_worker_argv, normalized_contract_sha256,
+    validate_rank_failure_rows)  # noqa: E402
+from parta.resource_profile_contract import validate_preexecution_profile  # noqa: E402
+from parta.resource_profile_contract import validate_resolved_profile  # noqa: E402
 from parta.t0 import T0_A_REQUIRED_CHECKS  # noqa: E402
 from parta.unified_data import (FROZEN_SOURCE_INVENTORY, FROZEN_SOURCE_REGISTRY,
                                 FROZEN_TOTAL_INVENTORY)  # noqa: E402
@@ -155,13 +160,23 @@ def main() -> None:
             or profile.get("promotable") is not False
             or profile.get("producer") != {"path": str(profile_producer),
                 "sha256": sha256_file(profile_producer), "git_revision": revision}
-            or sorted(item.get("frame_count") for item in profile.get("measurements", ())) != [16, 24, 32]):
+            or profile.get("required_world_size") != 4
+            or {(item.get("distributed_strategy"), item.get("frame_count"))
+                for item in profile.get("measurements", ())}
+               != {("ddp", 32), ("fsdp", 32)}):
         raise ValueError("resource profile producer evidence is invalid")
+    preflight_normalized = {}
+    runtime_matched_normalized = {}
     for measurement in profile["measurements"]:
         artifacts = measurement.get("artifacts", {})
-        required = {"command_record", "run_status", "resolved_config"}
-        required |= set() if measurement.get("oom") else {"engineering_receipt", "train_steps"}
-        if set(artifacts) != required:
+        required = ({"command_record", "oom_rank_evidence", "preflight_matched_contract"}
+                    if measurement.get("oom")
+                    else {"command_record", "run_status", "resolved_config",
+                          "engineering_receipt", "train_steps", "matched_contract",
+                          "preflight_matched_contract"})
+        if not required.issubset(artifacts) or (
+            not measurement.get("oom") and set(artifacts) != required
+        ):
             raise ValueError("resource profile artifact registry is incomplete")
         reopened = {}
         for name, item in artifacts.items():
@@ -170,27 +185,89 @@ def main() -> None:
                 raise ValueError("resource profile artifact hash mismatch")
             reopened[name] = load(path) if path.suffix == ".json" else None
         command = reopened["command_record"]
-        status = reopened["run_status"]
-        resolved_point = reopened["resolved_config"]
+        normalized = normalize_profile_worker_argv(command.get("argv", ()))
+        if (measurement.get("normalized_execution_contract") != normalized
+                or measurement.get("normalized_execution_contract_sha256")
+                   != normalized_contract_sha256(normalized)
+                or float(normalized["lambda_state"]) != LAMBDA_STATE):
+            raise ValueError("resource profile command/measurement contract mismatch")
+        preflight = reopened["preflight_matched_contract"]
+        validate_preexecution_profile(preflight, command.get("argv", ()),
+            manifest=normalized["manifest"], manifest_report=normalized["manifest_report"],
+            engineering_subset=normalized["engineering_subset"])
+        if preflight.get("distributed_strategy") != measurement["distributed_strategy"]:
+            raise ValueError("resource profile preflight strategy mismatch")
+        preflight_normalized[measurement["distributed_strategy"]] = {
+            key: value for key, value in preflight.items() if key != "distributed_strategy"
+        }
+        if "matched_contract" in reopened:
+            matched = reopened["matched_contract"]
+            execution = dict(matched.get("execution_contract", {}))
+            if execution.pop("distributed_strategy", None) != measurement["distributed_strategy"]:
+                raise ValueError("resource profile matched-contract strategy mismatch")
+            runtime_matched_normalized[measurement["distributed_strategy"]] = {
+                **matched, "execution_contract": execution
+            }
+        status = reopened.get("run_status", {})
+        resolved_point = reopened.get("resolved_config", {})
+        if not measurement.get("oom"):
+            validate_resolved_profile(resolved_point, normalized,
+                                      measurement["distributed_strategy"])
         argv = command.get("argv", {})
         if (command.get("script_path") != str((PROJECT / "scripts/parta/train_parta.py").resolve())
                 or command.get("script_sha256") != sha256_file(PROJECT / "scripts/parta/train_parta.py")
                 or command.get("git_revision") != revision
-                or measurement.get("frame_count") != int(resolved_point.get("required_frame_count", -1))):
+                or (not measurement.get("oom") and (
+                    measurement.get("frame_count") != int(resolved_point.get("required_frame_count", -1))
+                    or measurement.get("distributed_strategy")
+                       != resolved_point.get("distributed_strategy")))):
             raise ValueError("resource profile worker identity mismatch")
         if measurement.get("oom"):
-            if status.get("status") not in {"failed", "complete_failed"} \
-                    or "out of memory" not in str(status.get("error", "")).lower():
+            rank_evidence = reopened["oom_rank_evidence"]
+            try:
+                validate_rank_failure_rows(rank_evidence.get("ranks", ()))
+            except ValueError:
                 raise ValueError("resource profile OOM evidence is not real")
         else:
+            per_rank = measurement.get("per_rank_peak_memory_bytes")
+            if (measurement.get("world_size") != 4
+                    or not isinstance(per_rank, list) or len(per_rank) != 4
+                    or [item.get("rank") for item in per_rank] != [0, 1, 2, 3]
+                    or any(not isinstance(item.get("peak_allocated_bytes"), int)
+                           or item["peak_allocated_bytes"] <= 0
+                           or not isinstance(item.get("peak_reserved_bytes"), int)
+                           or item["peak_reserved_bytes"] <= 0
+                           or not isinstance(item.get("total_memory_bytes"), int)
+                           or item["total_memory_bytes"] <= 0 for item in per_rank)
+                    or any("NVIDIA H20" not in str(item.get("device_name")) for item in per_rank)):
+                raise ValueError("resource profile lacks four-rank H20 CUDA peak evidence")
             receipt = reopened["engineering_receipt"]
             steps_path = Path(artifacts["train_steps"]["path"])
             steps = [json.loads(line) for line in steps_path.read_text(encoding="utf-8").splitlines() if line]
             if (status.get("status") != "complete"
                     or receipt.get("engineering_mode") != "resource_profile"
                     or receipt.get("promotable") is not False
-                    or len(steps) != measurement.get("forward_backward_steps")):
+                    or len(steps) != measurement.get("forward_backward_steps")
+                    or receipt.get("all_losses_finite") is not True
+                    or measurement.get("finite") is not True):
                 raise ValueError("resource profile successful point cannot be reopened")
+    if (set(preflight_normalized) != {"ddp", "fsdp"}
+            or preflight_normalized["ddp"] != preflight_normalized["fsdp"]):
+        raise ValueError("resource profile preflight contracts differ beyond strategy")
+    if set(runtime_matched_normalized) == {"ddp", "fsdp"} and \
+            runtime_matched_normalized["ddp"] != runtime_matched_normalized["fsdp"]:
+        raise ValueError("resource profile runtime matched contracts differ beyond strategy")
+    safe = [measurement for measurement in profile["measurements"]
+            if not measurement.get("oom") and measurement.get("finite") is True
+            and all(item["peak_allocated_bytes"] < item["total_memory_bytes"] * 0.90
+                    for item in measurement["per_rank_peak_memory_bytes"])]
+    selected = min(
+        safe,
+        key=lambda item: (-item["throughput_samples_per_second"],
+                          item["peak_memory_bytes"], item["distributed_strategy"]),
+    ) if safe else None
+    if selected is None or profile.get("selected_strategy") != selected["distributed_strategy"]:
+        raise ValueError("resource profile selected strategy is missing or non-deterministic")
     preflight = t0a_config.get("resource_preflight", {})
     if preflight.get("passed") is not True or preflight.get("failures"):
         raise ValueError("resource preflight did not pass")

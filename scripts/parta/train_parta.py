@@ -59,12 +59,59 @@ from parta.unified_data import (  # noqa: E402
     load_engineering_subset_artifact,
     load_unified_rows,
 )
+from parta.resource_profile_contract import (normalize_profile_worker_argv,
+    normalized_contract_sha256)  # noqa: E402
 from parta_data_contract import CANONICAL_CATEGORIES  # noqa: E402
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s", level=logging.INFO
 )
 LOGGER = logging.getLogger("parta.train")
+
+
+def _write_rank_failure(error: BaseException, stage: str, output_dir: Path) -> None:
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    failure_dir = output_dir / "rank_failures"
+    failure_dir.mkdir(parents=True, exist_ok=True)
+    cuda_available = torch.cuda.is_available()
+    device = torch.device(f"cuda:{local_rank}") if cuda_available else None
+    message = str(error)
+    atomic_json_dump({
+        "schema_version": "parta_rank_failure_v1", "rank": rank, "local_rank": local_rank,
+        "stage": stage, "error_type": type(error).__name__, "reason": message,
+        "oom": isinstance(error, torch.OutOfMemoryError) or "out of memory" in message.lower(),
+        "device_name": torch.cuda.get_device_name(device) if device else None,
+        "total_memory_bytes": int(torch.cuda.get_device_properties(device).total_memory) if device else None,
+        "peak_allocated_bytes": int(torch.cuda.max_memory_allocated(device)) if device else None,
+        "peak_reserved_bytes": int(torch.cuda.max_memory_reserved(device)) if device else None,
+        "finite": None,
+    }, failure_dir / f"rank-{rank}.json")
+
+
+def _coordinate_step_failure(error: BaseException | None, stage: str, args,
+                             context) -> None:
+    """Keep formal failure coordination while profile ranks fail without collectives."""
+    if error is not None:
+        _write_rank_failure(error, stage, args.output_dir)
+    if args.engineering_mode == "resource_profile":
+        if error is not None:
+            # Publish first, then let the parent timeout terminate peer ranks.
+            raise error
+        return
+    if synchronize_failure(error is not None, context):
+        if error is not None:
+            raise error
+        raise RuntimeError(f"peer rank failed during {stage}")
+
+
+def _write_top_level_rank_failure_if_absent(error: BaseException,
+                                            output_dir: Path) -> None:
+    """Do not replace a more specific load/train-stage rank artifact."""
+    rank = int(os.environ.get("RANK", "0"))
+    existing = output_dir / "rank_failures" / f"rank-{rank}.json"
+    if not existing.is_file():
+        _write_rank_failure(error, "train_parta_main", output_dir)
 
 
 def parse_args() -> argparse.Namespace:
@@ -91,6 +138,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--distributed-strategy", choices=("none", "ddp", "fsdp"), default="none")
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="Run exactly two optimizer steps")
     parser.add_argument("--unified-gate", type=Path)
     parser.add_argument("--frozen-config-artifact", type=Path)
@@ -99,7 +147,7 @@ def parse_args() -> argparse.Namespace:
         "--engineering-mode",
         choices=("overfit", "matched_runner", "resource_profile"),
     )
-    parser.add_argument("--required-frame-count", choices=(16, 24, 32), type=int)
+    parser.add_argument("--required-frame-count", choices=(32,), type=int)
     parser.add_argument("--val-batches-per-source", type=int, default=8)
     return parser.parse_args()
 
@@ -244,6 +292,13 @@ def main() -> None:
     if context.world_size == 1 and args.distributed_strategy != "none":
         raise ValueError("distributed strategy requires torchrun WORLD_SIZE>1")
     effective_device = f"cuda:{context.local_rank}" if context.world_size > 1 else args.device
+    if args.engineering_mode == "resource_profile":
+        if context.world_size != 4:
+            raise ValueError("resource profile requires exactly four distributed ranks")
+        if not torch.cuda.is_available() or "NVIDIA H20" not in torch.cuda.get_device_name(
+            torch.device(effective_device)
+        ):
+            raise ValueError("resource profile requires NVIDIA H20 on every rank")
     if args.output_dir.exists() and args.resume is None and context.is_primary:
         raise FileExistsError(f"output exists; use --resume explicitly: {args.output_dir}")
     if context.is_primary:
@@ -327,6 +382,15 @@ def main() -> None:
         "val_batches_per_source": args.val_batches_per_source,
         "checkpoint_selection_rule": CHECKPOINT_SELECTION_RULE,
         "effective_device": effective_device,
+        "gradient_checkpointing": args.gradient_checkpointing,
+        "per_rank_batch_size": 1,
+        "effective_global_batch_size": context.world_size * config.gradient_accumulation_steps,
+        "required_frame_count": args.required_frame_count,
+        "engineering_mode": args.engineering_mode,
+        "dry_run": args.dry_run,
+        "engineering_subset": (
+            str(args.engineering_subset.resolve()) if args.engineering_subset else None
+        ),
     })
     if context.is_primary:
         atomic_json_dump(resolved, args.output_dir / "resolved_config.json")
@@ -336,15 +400,36 @@ def main() -> None:
     from run_t0_a import _checkpoint_artifact_provenance, _load_local  # noqa: PLC0415
     from parta.t0_runtime import PartAT0Collator
 
+    if args.engineering_mode == "resource_profile":
+        normalized_profile = normalize_profile_worker_argv(sys.argv)
+        preflight = {
+            "schema_version": "parta_profile_preexecution_matched_v1",
+            "status": "complete_preexecution",
+            "distributed_strategy": args.distributed_strategy,
+            "normalized_execution_contract": normalized_profile,
+            "normalized_execution_contract_sha256": normalized_contract_sha256(normalized_profile),
+            "manifest": {"path": str(args.manifest.resolve()), "sha256": file_sha256(args.manifest)},
+            "manifest_report": {"path": str(args.manifest_report.resolve()),
+                                "sha256": sha256_file(args.manifest_report)},
+            "engineering_subset": {"path": str(args.engineering_subset.resolve()),
+                                   "sha256": sha256_file(args.engineering_subset)},
+            "guide": _checkpoint_artifact_provenance(args.model_path),
+            "vggt": _checkpoint_artifact_provenance(args.vggt_path),
+        }
+        if context.is_primary:
+            atomic_json_dump(preflight, args.output_dir / "profile_preflight_matched_contract.json")
+        barrier(context)
+
     device = torch.device(effective_device)
     dtype = getattr(torch, args.dtype)
     processor, model, _ = _load_local(args.model_path, args.vggt_path, dtype, effective_device)
     model.config.use_cache = False
-    model.gradient_checkpointing_enable(
-        gradient_checkpointing_kwargs={"use_reentrant": False}
-    )
-    if hasattr(model, "enable_input_require_grads"):
-        model.enable_input_require_grads()
+    if args.gradient_checkpointing:
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
     shared_names = sorted(name for name, parameter in model.named_parameters() if parameter.requires_grad)
     if args.arm == "a1o":
         attach_a1o_head_without_advancing_shared_rng(
@@ -555,12 +640,9 @@ def main() -> None:
             images = media_loader.load(sample)
             fixture = collator(sample, images)
         except Exception as error:
-            local_error = error
             LOGGER.exception("Corrupt sample at index=%d qa_id=%s", index, sample.qa.get("qa_id"))
-        if synchronize_failure(local_error is not None, context):
-            if local_error is not None:
-                raise local_error
-            raise RuntimeError("a peer rank failed while loading/collating the matched batch")
+            local_error = error
+        _coordinate_step_failure(local_error, "load_collate", args, context)
         fixture = _fixture_on_device(fixture, device)
         target, _ = build_state_targets(sample)
         target = type(target)(**{
@@ -588,12 +670,9 @@ def main() -> None:
                 expected_frame_binding_sha256=[str(sample.qa["frame_binding_sha256"])],
             ))
         except Exception as error:
-            local_error = error
             LOGGER.exception("Training step failed at qa_id=%s", sample.qa.get("qa_id"))
-        if synchronize_failure(local_error is not None, context):
-            if local_error is not None:
-                raise local_error
-            raise RuntimeError("a peer rank failed during the matched optimizer step")
+            local_error = error
+        _coordinate_step_failure(local_error, "train_step", args, context)
         trainer.epoch = cursor.epoch
         trainer.sampler_position = cursor.position
         if trainer.global_step % config.save_steps == 0:
@@ -625,6 +704,30 @@ def main() -> None:
             selection["selected"]["checkpoint_sha256"] = sha256_file(final_path)
             atomic_json_dump(selection, args.output_dir / "checkpoint_selection.json")
         barrier(context)
+    local_cuda_peak = (
+        int(torch.cuda.max_memory_allocated(device)) if torch.cuda.is_available() else None
+    )
+    local_cuda_reserved_peak = (
+        int(torch.cuda.max_memory_reserved(device)) if torch.cuda.is_available() else None
+    )
+    local_cuda_total = (
+        int(torch.cuda.get_device_properties(device).total_memory)
+        if torch.cuda.is_available() else None
+    )
+    per_rank_cuda_peak = [{
+        "rank": context.rank,
+        "local_rank": context.local_rank,
+        "device_name": torch.cuda.get_device_name(device) if torch.cuda.is_available() else None,
+        "peak_allocated_bytes": local_cuda_peak,
+        "peak_reserved_bytes": local_cuda_reserved_peak,
+        "total_memory_bytes": local_cuda_total,
+    }]
+    if context.world_size > 1:
+        gathered: list[dict | None] = [None] * context.world_size
+        torch.distributed.all_gather_object(gathered, per_rank_cuda_peak[0])
+        per_rank_cuda_peak = sorted(
+            (item for item in gathered if item is not None), key=lambda item: item["rank"]
+        )
     if context.is_primary and args.arm == "a1o":
         drop_path = args.output_dir / "checkpoint-a1o-drop.pt"
         export_head_free_checkpoint(final_path, drop_path)
@@ -693,10 +796,22 @@ def main() -> None:
                     int(torch.cuda.get_device_properties(device).total_memory)
                     if torch.cuda.is_available() else None
                 ),
+                "per_rank_cuda_peak_memory_bytes": per_rank_cuda_peak,
+                "resolved_execution_contract": execution_contract,
             }
             atomic_json_dump(receipt, args.output_dir / "engineering_receipt.json")
     barrier(context)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BaseException as error:
+        # Every torchrun rank writes independent evidence, including failures
+        # before the primary run_status/resolved_config artifacts exist.
+        try:
+            output_text = sys.argv[sys.argv.index("--output-dir") + 1]
+            _write_top_level_rank_failure_if_absent(error, Path(output_text))
+        except BaseException:
+            pass
+        raise

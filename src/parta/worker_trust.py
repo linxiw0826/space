@@ -15,6 +15,7 @@ TRAIN_WORKER_VALUE_FLAGS = frozenset({
     "--max-steps", "--save-steps", "--dtype", "--device", "--distributed-strategy",
     "--num-workers", "--engineering-subset", "--engineering-mode",
     "--required-frame-count", "--max-grad-norm",
+    "--lambda-state",
 })
 TRAIN_WORKER_SWITCH_FLAGS = frozenset({"--dry-run", "--gradient-checkpointing"})
 
@@ -93,3 +94,40 @@ def validate_python_worker(record: Mapping[str, Any], argv: Sequence[str], *,
     for flag, expected in allowed_value_flags.items():
         if expected is not None and observed.get(flag) != expected:
             raise ValueError("untrusted repository worker declaration")
+
+
+def validate_torchrun_worker(record: Mapping[str, Any], argv: Sequence[str], *,
+                             script: Path, script_sha256: str, git_revision: str,
+                             engineering_mode: str,
+                             allowed_value_flags: Mapping[str, str | None],
+                             allowed_switch_flags: Sequence[str] = (),
+                             required_world_size: int = 4,
+                             source_registry: Sequence[str] = (
+                                 "adt", "hypersim", "scannetppv2"
+                             )) -> None:
+    """Validate the canonical single-node torchrun wrapper and its worker argv."""
+    prefix = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--nproc_per_node",
+        str(required_world_size),
+    ]
+    canonical = script.resolve()
+    if list(argv[:len(prefix)]) != prefix or len(argv) <= len(prefix) \
+            or Path(str(argv[len(prefix)])).resolve() != canonical:
+        raise ValueError("untrusted torchrun worker declaration")
+    worker_argv = [sys.executable, str(canonical), *argv[len(prefix) + 1:]]
+    worker_record = dict(record)
+    worker_record["python_executable"] = sys.executable
+    validate_python_worker(
+        worker_record,
+        worker_argv,
+        script=canonical,
+        script_sha256=script_sha256,
+        git_revision=git_revision,
+        engineering_mode=engineering_mode,
+        allowed_value_flags=allowed_value_flags,
+        allowed_switch_flags=allowed_switch_flags,
+        source_registry=source_registry,
+    )

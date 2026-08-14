@@ -179,7 +179,7 @@ D-62原coverage matrix（作为历史设计记录）为：
 
 ```text
 T0-A + 三源T0-B + fixed-train-subset overfit/matched real runner
-     + independent 16/24/32 resource profile
+     + independent 4×H20 32-frame worst-case resource profile
      + checkpoint/resume + head-free val audit + validators/resource gates
      → pre-authorization → Gate@CONFIG: APPROVE → freeze → formal A0/A1-O from step 0
 ```
@@ -252,10 +252,26 @@ checkpoint/config后one-shot matched运行，不用于调参。主门是scene/vi
 
 ### Next execution-server GPU work
 
-- 在真实`4 × H20`上运行32帧worst-case resource profile，必须记录每rank CUDA peak
-  allocated/reserved memory、吞吐、通信和OOM/finite状态；
-- 对DDP与FSDP可行性做fail-closed比较，冻结per-rank batch、gradient accumulation、
-  gradient checkpointing和effective global batch；
+- 在真实`4 × H20`上仅以A1-O运行32帧worst-case resource profile；同一profile必须分别运行
+  一个DDP候选和一个FSDP候选，必须记录每rank CUDA peak allocated/reserved/total memory、
+  吞吐和OOM/finite状态；两个候选都必须形成封闭证据，允许其中一个OOM；
+- 两个候选固定`lambda_state=0.02150771327925621`，除strategy与各自output/run-dir外，LR、
+  weight decay、max grad norm、per-rank batch=1、gradient accumulation、num workers、
+  gradient checkpointing、dtype、模型与数据身份及effective global batch必须完全一致，并以
+  normalized execution-contract hash绑定；
+- OOM由每rank worker独立落盘并由父profile聚合；早期OOM或被torchrun终止的peer必须保留
+  rank/stage/reason/nullable memory字段。OOM候选的吞吐不可测，必须为null，禁止伪造；
+- 任一rank在backward/optimizer异常时必须先原子写本rank failure artifact后直接退出，禁止在非对称
+  失败后进入新的NCCL collective；父profile必须使用硬超时，超时后terminate并在需要时kill，保存
+  timeout artifact，禁止无限等待；
+- DDP/FSDP各自必须在任何模型/VGGT/head/wrap/optimizer重内存操作前，于其run-dir原子生成独立
+  fresh pre-execution matched-contract，绑定command/data/manifest/GUIDE/VGGT identity和完整
+  normalized execution contract；OOM候选也不得缺失。profile producer必须重开两个preflight
+  payload并验证除distributed strategy外完全一致；成功候选还须追加并核对runtime matched payload；
+- 至少一个候选必须非OOM、finite且每rank peak allocated低于对应总显存90%。按
+  `max throughput → min max-rank allocated → strategy lexical`确定性选择策略，并将所选策略、
+  per-rank batch、gradient accumulation、gradient checkpointing和effective global batch冻结为
+  matched A0/A1-O共同正式配置；
 - 使用同一分布式runner验证A0/A1-O matched startup、checkpoint/resume和head-free forward；
 - 汇总证据后请求`Gate@CONFIG`；APPROVE前不得开始正式训练。
 
@@ -300,7 +316,7 @@ checkpoint/config后one-shot matched运行，不用于调参。主门是scene/vi
   → 单卡T0-B PASS（30 batches；10/source；13 checks PASS）
     ↓
 当前四卡GPU Gate
-  4 × H20、32帧worst-case resource profile
+  4 × H20、A1-O 32帧worst-case DDP+FSDP resource profile
   → 真实每rank CUDA peak、吞吐、DDP/FSDP、checkpoint/resume和matched runner证据
   → 证据汇总 → Gate@CONFIG
     ├─ HOLD：补齐证据/配置

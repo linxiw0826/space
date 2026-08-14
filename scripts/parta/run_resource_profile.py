@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run independent, non-promotable 16/24/32 real forward/backward probes."""
+"""Run the independent, non-promotable four-GPU 32-frame worst-case probe."""
 
 from __future__ import annotations
 
@@ -8,16 +8,24 @@ import json
 import subprocess
 import sys
 import time
+import hashlib
+import os
+import signal
 from pathlib import Path
 
 
-FRAME_COUNTS = (16, 24, 32)
 SOURCE_REGISTRY = ("adt", "hypersim", "scannetppv2")
 PROJECT = Path(__file__).resolve().parents[2]
 TRAIN_RUNNER = (PROJECT / "scripts/parta/train_parta.py").resolve()
 sys.path.insert(0, str(PROJECT / "src"))
+from parta.resource_profile_contract import (FRAME_COUNT, LAMBDA_STATE,
+    STRATEGIES, WORLD_SIZE as REQUIRED_WORLD_SIZE, normalize_profile_worker_argv,
+    normalized_contract_sha256, validate_profile_pair)  # noqa: E402
+from parta.resource_profile_contract import validate_preexecution_profile  # noqa: E402
+from parta.resource_profile_contract import validate_resolved_profile  # noqa: E402
+from parta.resource_profile_contract import validate_rank_failure_rows  # noqa: E402
 from parta.worker_trust import (TRAIN_WORKER_SWITCH_FLAGS, train_worker_flag_contract,
-                                validate_python_worker)  # noqa: E402
+                                validate_torchrun_worker)  # noqa: E402
 
 
 def _json(path: Path) -> dict:
@@ -34,46 +42,114 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def run_with_timeout(argv: list[str], timeout_seconds: int, evidence_path: Path,
+                     strategy: str) -> subprocess.CompletedProcess:
+    process = subprocess.Popen(argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               start_new_session=True)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            stdout, stderr = process.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            stdout, stderr = process.communicate()
+        evidence_path.parent.mkdir(parents=True, exist_ok=True)
+        evidence_path.write_text(json.dumps({"schema_version": "parta_profile_timeout_v1",
+            "strategy": strategy, "timeout_seconds": timeout_seconds,
+            "terminated": True, "stdout_sha256": hashlib.sha256((stdout or "").encode()).hexdigest(),
+            "stderr_sha256": hashlib.sha256((stderr or "").encode()).hexdigest()},
+            indent=2, sort_keys=True) + "\n")
+        raise RuntimeError(f"profile worker timed out: {strategy}; evidence={evidence_path}")
+    return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+
+
+def collect_rank_failure_evidence(run_dir: Path) -> list[dict]:
+    """Load four rank records and require at least one authentic on-disk OOM."""
+    rows = []
+    real_oom = False
+    failure_dir = run_dir / "rank_failures"
+    for rank in range(REQUIRED_WORLD_SIZE):
+        rank_path = failure_dir / f"rank-{rank}.json"
+        if rank_path.is_file():
+            row = _json(rank_path)
+            real_oom = real_oom or row.get("oom") is True
+        else:
+            row = {
+                "schema_version": "parta_rank_failure_v1", "rank": rank,
+                "local_rank": rank, "stage": "torchrun_peer_termination",
+                "reason": "rank artifact unavailable after torchrun termination",
+                "oom": None, "device_name": None, "total_memory_bytes": None,
+                "peak_allocated_bytes": None, "peak_reserved_bytes": None,
+                "finite": None,
+            }
+        rows.append(row)
+    validate_rank_failure_rows(rows)
+    if not real_oom:
+        raise ValueError("OOM worker lacks a real on-disk rank artifact with oom=true")
+    return rows
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--engineering-subset", type=Path, required=True)
-    parser.add_argument("--point-command", action="append", required=True, metavar="FRAMES=JSON")
+    parser.add_argument("--point-command", action="append", required=True,
+                        metavar="STRATEGY=JSON")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--timeout-seconds", type=int, default=1800)
     args = parser.parse_args()
-    commands: dict[int, Path] = {}
+    commands: dict[str, Path] = {}
     for value in args.point_command:
-        frame_text, path_text = value.split("=", 1)
-        frame_count = int(frame_text)
-        if frame_count in commands:
-            raise ValueError(f"duplicate profile point: {frame_count}")
-        commands[frame_count] = Path(path_text)
-    if tuple(sorted(commands)) != FRAME_COUNTS:
-        raise ValueError("resource profile requires exactly 16/24/32 frame commands")
+        strategy, path_text = value.split("=", 1)
+        if strategy in commands:
+            raise ValueError(f"duplicate profile strategy: {strategy}")
+        commands[strategy] = Path(path_text)
+    if tuple(sorted(commands)) != STRATEGIES:
+        raise ValueError("resource profile requires exactly one DDP and one FSDP command")
     measurements = []
+    reopened_preflight = {}
+    reopened_runtime_matched = {}
+    normalized_contract = None
     producer_revision = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=PROJECT, text=True
     ).strip()
     train_runner_sha256 = _sha256(TRAIN_RUNNER)
-    for frame_count in FRAME_COUNTS:
-        command_record = _json(commands[frame_count])
+    command_payloads = {strategy: _json(path).get("argv") for strategy, path in commands.items()}
+    normalized_contract, normalized_contract_hash = validate_profile_pair(command_payloads)
+    for strategy in STRATEGIES:
+        frame_count = FRAME_COUNT
+        command_record = _json(commands[strategy])
         argv = command_record.get("argv")
         run_dir = Path(str(command_record.get("run_dir", ""))).resolve()
         receipt = run_dir / "engineering_receipt.json"
-        command_path = commands[frame_count].resolve()
+        command_path = commands[strategy].resolve()
         if not isinstance(argv, list) or not argv or run_dir.exists():
             raise ValueError(f"invalid or stale profile command for {frame_count} frames")
-        validate_python_worker(command_record, argv, script=TRAIN_RUNNER,
+        validate_torchrun_worker(command_record, argv, script=TRAIN_RUNNER,
                                script_sha256=train_runner_sha256,
                                git_revision=producer_revision,
                                engineering_mode="resource_profile",
                                allowed_value_flags=train_worker_flag_contract("resource_profile"),
-                               allowed_switch_flags=TRAIN_WORKER_SWITCH_FLAGS)
+                               allowed_switch_flags=TRAIN_WORKER_SWITCH_FLAGS,
+                               required_world_size=REQUIRED_WORLD_SIZE)
         required_pairs = {
             "--engineering-mode": "resource_profile",
             "--engineering-subset": str(args.engineering_subset.resolve()),
             "--required-frame-count": str(frame_count),
             "--output-dir": str(run_dir),
+            "--distributed-strategy": strategy,
+            "--arm": "a1o",
+            "--lambda-state": str(LAMBDA_STATE),
+            "--matched-contract": str((run_dir / "matched_fairness_contract.json").resolve()),
+            "--gradient-accumulation-steps": "1",
         }
         if "--dry-run" not in argv:
             raise ValueError(f"profile command is not the canonical non-promotable worker: {frame_count}")
@@ -81,12 +157,23 @@ def main() -> None:
             if flag not in argv or argv.index(flag) + 1 >= len(argv):
                 raise ValueError(f"profile command lacks {flag}: {frame_count}")
             actual = argv[argv.index(flag) + 1]
-            if flag in {"--engineering-subset", "--output-dir"}:
+            if flag in {"--engineering-subset", "--output-dir", "--matched-contract"}:
                 actual = str(Path(actual).resolve())
             if actual != expected_value:
                 raise ValueError(f"profile command has wrong {flag}: {frame_count}")
+        if "--gradient-checkpointing" not in argv:
+            raise ValueError("resource profile requires auditable gradient checkpointing")
+        point_contract = normalize_profile_worker_argv(argv)
+        if normalized_contract is None:
+            normalized_contract = point_contract
+        elif point_contract != normalized_contract:
+            raise ValueError("DDP and FSDP profile execution contracts differ")
+        point_contract_sha256 = normalized_contract_sha256(point_contract)
         started = time.time_ns()
-        completed = subprocess.run(argv, check=False, text=True, capture_output=True)
+        completed = run_with_timeout(
+            argv, args.timeout_seconds,
+            args.output.parent / f"{args.output.stem}.{strategy}.timeout.json", strategy,
+        )
         if completed.returncode:
             status_path = run_dir / "run_status.json"
             status = _json(status_path) if status_path.is_file() else {}
@@ -98,30 +185,79 @@ def main() -> None:
                 raise RuntimeError(f"profile worker failed without OOM evidence: {frame_count}")
             resolved_path = run_dir / "resolved_config.json"
             resolved_failure = _json(resolved_path) if resolved_path.is_file() else {}
-            total_memory = resolved_failure.get("cuda_total_memory_bytes")
-            if not isinstance(total_memory, int) or total_memory <= 0:
-                raise RuntimeError("OOM worker lacks its own CUDA total-memory evidence")
+            rank_rows = collect_rank_failure_evidence(run_dir)
+            aggregate_path = args.output.parent / f"{args.output.stem}.{strategy}.oom.json"
+            aggregate_path.parent.mkdir(parents=True, exist_ok=True)
+            aggregate_path.write_text(json.dumps({"strategy": strategy, "ranks": rank_rows,
+                "worker_output_sha256": hashlib.sha256(worker_error.encode()).hexdigest()},
+                indent=2, sort_keys=True) + "\n")
+            existing_artifacts = {
+                "command_record": {"path": str(command_path), "sha256": _sha256(command_path)},
+                "oom_rank_evidence": {"path": str(aggregate_path.resolve()),
+                                      "sha256": _sha256(aggregate_path)},
+            }
+            preflight_path = run_dir / "profile_preflight_matched_contract.json"
+            if not preflight_path.is_file():
+                raise RuntimeError("OOM candidate lacks pre-execution matched artifact")
+            existing_artifacts["preflight_matched_contract"] = {
+                "path": str(preflight_path.resolve()), "sha256": _sha256(preflight_path)
+            }
+            preflight_payload = _json(preflight_path)
+            validate_preexecution_profile(preflight_payload, argv, manifest=args.manifest,
+                manifest_report=Path(point_contract["manifest_report"]),
+                engineering_subset=args.engineering_subset)
+            if preflight_payload.get("distributed_strategy") != strategy:
+                raise ValueError("OOM preflight matched strategy mismatch")
+            reopened_preflight[strategy] = {
+                key: value for key, value in preflight_payload.items()
+                if key != "distributed_strategy"
+            }
+            if status_path.is_file():
+                existing_artifacts["run_status"] = {"path": str(status_path),
+                                                    "sha256": _sha256(status_path)}
+            if resolved_path.is_file():
+                existing_artifacts["resolved_config"] = {"path": str(resolved_path),
+                                                         "sha256": _sha256(resolved_path)}
+            matched_path = run_dir / "matched_fairness_contract.json"
+            if matched_path.is_file():
+                existing_artifacts["runtime_matched_contract"] = {
+                    "path": str(matched_path.resolve()), "sha256": _sha256(matched_path)
+                }
+                matched_payload = _json(matched_path)
+                execution = dict(matched_payload.get("execution_contract", {}))
+                if execution.pop("distributed_strategy", None) != strategy:
+                    raise ValueError("OOM matched contract strategy mismatch")
+                reopened_runtime_matched[strategy] = {
+                    **matched_payload, "execution_contract": execution
+                }
+            totals = [row["total_memory_bytes"] for row in rank_rows
+                      if isinstance(row.get("total_memory_bytes"), int)]
             measurements.append({
                 "frame_count": frame_count,
+                "distributed_strategy": strategy,
                 "peak_memory_bytes": None,
-                "total_memory_bytes": total_memory,
+                "peak_reserved_memory_bytes": None,
+                "total_memory_bytes": min(totals) if totals else None,
                 "step_time_seconds": None,
                 "throughput_samples_per_second": None,
                 "oom": True,
-                "batch_size": int(resolved_failure.get("world_size", 0)),
+                "batch_size": 1,
+                "per_rank_batch_size": 1,
+                "world_size": REQUIRED_WORLD_SIZE,
+                "per_rank_peak_memory_bytes": rank_rows,
+                "finite": None,
                 "gradient_accumulation_steps": int(
-                    resolved_failure.get("gradient_accumulation_steps", 0)
+                    point_contract["gradient_accumulation_steps"]
                 ),
                 "forward_backward_steps": 0,
-                "artifacts": {
-                    "command_record": {"path": str(command_path), "sha256": _sha256(command_path)},
-                    "run_status": {"path": str(status_path), "sha256": _sha256(status_path)},
-                    "resolved_config": {"path": str(resolved_path), "sha256": _sha256(resolved_path)},
-                },
+                "normalized_execution_contract": point_contract,
+                "normalized_execution_contract_sha256": point_contract_sha256,
+                "artifacts": existing_artifacts,
                 "run_status_sha256": _sha256(status_path) if status_path.is_file() else None,
-                "resolved_config_sha256": _sha256(resolved_path),
+                "resolved_config_sha256": _sha256(resolved_path) if resolved_path.is_file() else None,
                 "oom_evidence": {"error_type": status.get("error_type"),
                                  "error": status.get("error"),
+                                 "worker_output_contains_oom": is_oom,
                                  "worker_output_sha256": __import__("hashlib").sha256(
                                      worker_error.encode("utf-8")
                                  ).hexdigest()},
@@ -148,19 +284,48 @@ def main() -> None:
             raise ValueError(f"profile worker did not use only {frame_count} exact frames")
         if int(point.get("optimizer_steps", 0)) != len(steps):
             raise ValueError(f"profile point lacks a real forward/backward transaction: {frame_count}")
-        peak = max(row["peak_cuda_memory_bytes"] for row in steps)
+        if int(resolved.get("world_size", 0)) != REQUIRED_WORLD_SIZE:
+            raise ValueError("resource profile did not run on exactly four ranks")
+        validate_resolved_profile(resolved, point_contract, strategy)
+        if point.get("resolved_execution_contract", {}).get("distributed_strategy") != strategy:
+            raise ValueError("profile receipt resolved execution contract mismatch")
+        per_rank_peak = point.get("per_rank_cuda_peak_memory_bytes")
+        if (not isinstance(per_rank_peak, list)
+                or len(per_rank_peak) != REQUIRED_WORLD_SIZE
+                or [item.get("rank") for item in per_rank_peak] != list(range(REQUIRED_WORLD_SIZE))
+                or any(not isinstance(item.get("peak_allocated_bytes"), int)
+                       or item["peak_allocated_bytes"] <= 0
+                       or not isinstance(item.get("peak_reserved_bytes"), int)
+                       or item["peak_reserved_bytes"] <= 0
+                       or not isinstance(item.get("total_memory_bytes"), int)
+                       or item["total_memory_bytes"] <= 0 for item in per_rank_peak)
+                or any("NVIDIA H20" not in str(item.get("device_name"))
+                       for item in per_rank_peak)):
+            raise ValueError("profile worker lacks four-rank H20 CUDA peak-memory evidence")
+        if point.get("all_losses_finite") is not True:
+            raise ValueError("profile worker produced non-finite losses")
+        peak = max(item["peak_allocated_bytes"] for item in per_rank_peak)
+        peak_reserved = max(item["peak_reserved_bytes"] for item in per_rank_peak)
         if peak is None:
             raise ValueError("profile worker lacks CUDA peak-memory evidence")
         measurements.append({
             "frame_count": frame_count,
+            "distributed_strategy": strategy,
             "peak_memory_bytes": peak,
+            "peak_reserved_memory_bytes": peak_reserved,
             "total_memory_bytes": int(point["cuda_total_memory_bytes"]),
             "step_time_seconds": sum(float(row["step_seconds"]) for row in steps) / len(steps),
             "throughput_samples_per_second": sum(
                 float(row["samples_per_second"]) for row in steps
             ) / len(steps),
             "oom": False,
-            "batch_size": int(resolved["world_size"]),
+            "batch_size": 1,
+            "per_rank_batch_size": 1,
+            "world_size": int(resolved["world_size"]),
+            "per_rank_peak_memory_bytes": per_rank_peak,
+            "finite": True,
+            "normalized_execution_contract": point_contract,
+            "normalized_execution_contract_sha256": point_contract_sha256,
             "gradient_accumulation_steps": int(resolved["gradient_accumulation_steps"]),
             "forward_backward_steps": len(steps),
             "artifacts": {
@@ -172,6 +337,14 @@ def main() -> None:
                 "engineering_receipt": {"path": str(receipt.resolve()), "sha256": _sha256(receipt)},
                 "train_steps": {"path": str((run_dir / "train_steps.jsonl").resolve()),
                                 "sha256": _sha256(run_dir / "train_steps.jsonl")},
+                "matched_contract": {
+                    "path": str((run_dir / "matched_fairness_contract.json").resolve()),
+                    "sha256": _sha256(run_dir / "matched_fairness_contract.json"),
+                },
+                "preflight_matched_contract": {
+                    "path": str((run_dir / "profile_preflight_matched_contract.json").resolve()),
+                    "sha256": _sha256(run_dir / "profile_preflight_matched_contract.json"),
+                },
             },
             "receipt_sha256": _sha256(receipt),
             "training_log_sha256": _sha256(run_dir / "train_steps.jsonl"),
@@ -179,6 +352,28 @@ def main() -> None:
                 binding for row in steps for binding in row.get("frame_binding_sha256", ())
             }),
         })
+        matched_payload = _json(run_dir / "matched_fairness_contract.json")
+        execution = dict(matched_payload.get("execution_contract", {}))
+        if execution.pop("distributed_strategy", None) != strategy:
+            raise ValueError("matched contract strategy mismatch")
+        reopened_runtime_matched[strategy] = {**matched_payload, "execution_contract": execution}
+        preflight_payload = _json(run_dir / "profile_preflight_matched_contract.json")
+        validate_preexecution_profile(preflight_payload, argv, manifest=args.manifest,
+            manifest_report=Path(point_contract["manifest_report"]),
+            engineering_subset=args.engineering_subset)
+        if preflight_payload.get("distributed_strategy") != strategy:
+            raise ValueError("preflight matched strategy mismatch")
+        reopened_preflight[strategy] = {
+            key: value for key, value in preflight_payload.items()
+            if key != "distributed_strategy"
+        }
+    if set(reopened_preflight) != set(STRATEGIES):
+        raise ValueError("both profile strategies require pre-execution matched artifacts")
+    if reopened_preflight["ddp"] != reopened_preflight["fsdp"]:
+        raise ValueError("DDP/FSDP preflight matched contracts differ beyond strategy")
+    if set(reopened_runtime_matched) == set(STRATEGIES) and \
+            reopened_runtime_matched["ddp"] != reopened_runtime_matched["fsdp"]:
+        raise ValueError("DDP/FSDP matched contracts differ beyond strategy")
     payload = {
         "schema_version": "parta_resource_profile_v2",
         "status": "complete",
@@ -193,8 +388,27 @@ def main() -> None:
                      "git_revision": producer_revision},
         "producer_git_revision": producer_revision,
         "train_runner": {"path": str(TRAIN_RUNNER), "sha256": train_runner_sha256},
+        "required_world_size": REQUIRED_WORLD_SIZE,
+        "required_device_name_substring": "NVIDIA H20",
         "measurements": measurements,
+        "normalized_execution_contract": normalized_contract,
+        "normalized_execution_contract_sha256": normalized_contract_hash,
+        "lambda_state": LAMBDA_STATE,
     }
+    safe = [item for item in measurements if not item["oom"] and item["finite"]
+            and all(rank["peak_allocated_bytes"] < rank["total_memory_bytes"] * 0.90
+                    for rank in item["per_rank_peak_memory_bytes"])]
+    selected = min(
+        safe,
+        key=lambda item: (-item["throughput_samples_per_second"],
+                          item["peak_memory_bytes"], item["distributed_strategy"]),
+    ) if safe else None
+    payload["selection_rule"] = (
+        "max_throughput_then_min_max_rank_allocated_then_strategy_lexical_v1"
+    )
+    payload["selected_strategy"] = (
+        selected["distributed_strategy"] if selected is not None else None
+    )
     if args.output.exists():
         raise FileExistsError(args.output)
     args.output.parent.mkdir(parents=True, exist_ok=True)

@@ -23,6 +23,11 @@ from parta.gate_orchestration import (  # noqa: E402
 from parta.provenance import atomic_json_dump, sha256_file, stable_sha256  # noqa: E402
 from parta.t0 import T0_A_REQUIRED_CHECKS  # noqa: E402
 from parta.unified_data import FROZEN_SOURCE_INVENTORY, FROZEN_TOTAL_INVENTORY  # noqa: E402
+from parta.resource_profile_contract import (LAMBDA_STATE,
+    normalize_profile_worker_argv, normalized_contract_sha256,
+    validate_rank_failure_rows)  # noqa: E402
+from parta.resource_profile_contract import validate_preexecution_profile  # noqa: E402
+from parta.resource_profile_contract import validate_resolved_profile  # noqa: E402
 
 
 def _json(path: Path) -> dict:
@@ -294,6 +299,8 @@ def _profile(args, contract):
         raise ValueError("resource profile is not an independent engineering transaction")
     if receipt.get("formal_training") is not False or receipt.get("promotable") is not False:
         raise ValueError("resource profile transaction must be non-formal and non-promotable")
+    if receipt.get("required_world_size") != 4:
+        raise ValueError("resource profile must use the frozen four-rank contract")
     if tuple(receipt.get("source_registry", ())) != FORMAL_SOURCE_REGISTRY:
         raise ValueError("resource profile does not bind the D-62 source registry")
     if receipt.get("manifest_sha256") != contract.get("manifest_sha256"):
@@ -313,31 +320,74 @@ def _profile(args, contract):
     measurements = receipt.get("measurements")
     if not isinstance(measurements, list):
         raise ValueError("resource profile lacks measurements")
+    if {(item.get("distributed_strategy"), item.get("frame_count")) for item in measurements} \
+            != {("ddp", 32), ("fsdp", 32)}:
+        raise ValueError("resource profile must contain DDP and FSDP 32-frame points")
+    preflight_normalized = {}
+    runtime_matched_normalized = {}
     for item in measurements:
         required = {
             "frame_count", "peak_memory_bytes", "total_memory_bytes",
             "step_time_seconds", "throughput_samples_per_second", "oom",
             "batch_size", "gradient_accumulation_steps", "forward_backward_steps",
+            "world_size", "per_rank_peak_memory_bytes",
+            "peak_reserved_memory_bytes", "distributed_strategy", "finite",
         }
         if not required.issubset(item):
             raise ValueError("resource profile measurement is incomplete")
         artifacts = item.get("artifacts", {})
-        required_artifacts = {"command_record", "run_status", "resolved_config"}
-        required_artifacts |= set() if item["oom"] else {"engineering_receipt", "train_steps"}
-        if set(artifacts) != required_artifacts:
+        required_artifacts = ({"command_record", "oom_rank_evidence", "preflight_matched_contract"} if item["oom"]
+                              else {"command_record", "run_status", "resolved_config",
+                                    "engineering_receipt", "train_steps", "matched_contract",
+                                    "preflight_matched_contract"})
+        if not required_artifacts.issubset(artifacts) or (
+            not item["oom"] and set(artifacts) != required_artifacts
+        ):
             raise ValueError("resource profile evidence paths are incomplete")
         for evidence in artifacts.values():
             path = Path(str(evidence.get("path", ""))).resolve()
             if not path.is_file() or evidence.get("sha256") != sha256_file(path):
                 raise ValueError("resource profile evidence hash mismatch")
         command = _json(Path(artifacts["command_record"]["path"]))
-        status = _json(Path(artifacts["run_status"]["path"]))
+        normalized = normalize_profile_worker_argv(command.get("argv", ()))
+        if (item.get("normalized_execution_contract") != normalized
+                or item.get("normalized_execution_contract_sha256")
+                   != normalized_contract_sha256(normalized)
+                or float(normalized["lambda_state"]) != LAMBDA_STATE):
+            raise ValueError("resource profile command/measurement contract mismatch")
+        preflight = _json(Path(artifacts["preflight_matched_contract"]["path"]))
+        validate_preexecution_profile(preflight, command.get("argv", ()),
+            manifest=normalized["manifest"], manifest_report=normalized["manifest_report"],
+            engineering_subset=normalized["engineering_subset"])
+        if preflight.get("distributed_strategy") != item["distributed_strategy"]:
+            raise ValueError("resource profile preflight strategy mismatch")
+        preflight_normalized[item["distributed_strategy"]] = {
+            key: value for key, value in preflight.items() if key != "distributed_strategy"
+        }
+        matched = (_json(Path(artifacts["matched_contract"]["path"]))
+                   if "matched_contract" in artifacts else None)
+        if matched is not None:
+            execution = dict(matched.get("execution_contract", {}))
+            if execution.pop("distributed_strategy", None) != item["distributed_strategy"]:
+                raise ValueError("resource profile matched-contract strategy mismatch")
+            runtime_matched_normalized[item["distributed_strategy"]] = {
+                **matched, "execution_contract": execution
+            }
+        status = (_json(Path(artifacts["run_status"]["path"]))
+                  if "run_status" in artifacts else {})
+        if not item["oom"]:
+            validate_resolved_profile(_json(Path(artifacts["resolved_config"]["path"])),
+                                      normalized, item["distributed_strategy"])
         if (Path(str(command.get("script_path", ""))).resolve() != canonical_runner
                 or command.get("script_sha256") != sha256_file(canonical_runner)
                 or command.get("git_revision") != current_revision):
             raise ValueError("resource profile command record is not canonical")
-        if item["oom"] and "out of memory" not in str(status.get("error", "")).lower():
-            raise ValueError("resource profile OOM status cannot be reopened")
+        if item["oom"]:
+            rank_evidence = _json(Path(artifacts["oom_rank_evidence"]["path"]))
+            try:
+                validate_rank_failure_rows(rank_evidence.get("ranks", ()))
+            except ValueError:
+                raise ValueError("resource profile OOM evidence cannot be reopened")
         if item["oom"]:
             if (item.get("peak_memory_bytes") is not None
                     or item.get("step_time_seconds") is not None
@@ -349,12 +399,51 @@ def _profile(args, contract):
               or item.get("step_time_seconds") is None
               or item.get("throughput_samples_per_second") is None):
             raise ValueError("non-OOM profile point lacks real measured forward/backward metrics")
-    safe = [item for item in measurements if not item["oom"] and
-            item["peak_memory_bytes"] < item["total_memory_bytes"] * 0.90]
-    recommendation = max(safe, key=lambda item: item["frame_count"])["frame_count"] if safe else None
+        if not item["oom"]:
+            per_rank = item.get("per_rank_peak_memory_bytes")
+            if (item.get("world_size") != 4
+                    or not isinstance(per_rank, list) or len(per_rank) != 4
+                    or [rank.get("rank") for rank in per_rank] != [0, 1, 2, 3]
+                    or any(not isinstance(rank.get("peak_allocated_bytes"), int)
+                           or rank["peak_allocated_bytes"] <= 0
+                           or not isinstance(rank.get("peak_reserved_bytes"), int)
+                           or rank["peak_reserved_bytes"] <= 0
+                           or not isinstance(rank.get("total_memory_bytes"), int)
+                           or rank["total_memory_bytes"] <= 0 for rank in per_rank)
+                    or any("NVIDIA H20" not in str(rank.get("device_name")) for rank in per_rank)):
+                raise ValueError("resource profile lacks four-rank H20 CUDA peak evidence")
+            if item.get("finite") is not True:
+                raise ValueError("resource profile successful point is non-finite")
+    if (set(preflight_normalized) != {"ddp", "fsdp"}
+            or preflight_normalized["ddp"] != preflight_normalized["fsdp"]):
+        raise ValueError("profile preflight contracts differ beyond strategy")
+    if set(runtime_matched_normalized) == {"ddp", "fsdp"} and \
+            runtime_matched_normalized["ddp"] != runtime_matched_normalized["fsdp"]:
+        raise ValueError("profile runtime matched contracts differ beyond strategy")
+    safe = [item for item in measurements if not item["oom"] and item.get("finite") is True
+            and all(rank["peak_allocated_bytes"] < rank["total_memory_bytes"] * 0.90
+                    for rank in item["per_rank_peak_memory_bytes"])]
+    selected = min(
+        safe,
+        key=lambda item: (-item["throughput_samples_per_second"],
+                          item["peak_memory_bytes"], item["distributed_strategy"]),
+    ) if safe else None
+    selected_strategy = selected["distributed_strategy"] if selected else None
+    if receipt.get("selected_strategy") != selected_strategy:
+        raise ValueError("resource profile receipt selection is non-deterministic")
     return {
         "measurements": measurements,
-        "recommendation": {"status": "provisional_not_frozen", "frame_count": recommendation},
+        "normalized_execution_contract": receipt.get("normalized_execution_contract"),
+        "normalized_execution_contract_sha256": receipt.get(
+            "normalized_execution_contract_sha256"
+        ),
+        "recommendation": {
+            "status": "provisional_not_frozen", "frame_count": 32,
+            "selected_strategy": selected["distributed_strategy"] if selected else None,
+            "selection_rule": (
+                "max_throughput_then_min_max_rank_allocated_then_strategy_lexical_v1"
+            ),
+        },
         "independent_profile_receipt_sha256": sha256_file(args.profile_receipt),
     }
 

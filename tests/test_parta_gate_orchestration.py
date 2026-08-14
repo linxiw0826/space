@@ -55,22 +55,94 @@ def test_engineering_coverage_requires_exact_machine_matrix():
     )
 
 
-def test_independent_profile_requires_real_forward_backward_and_all_points():
+def test_independent_profile_requires_four_h20_ranks_and_32_frame_worst_case():
+    contract = {"lambda_state": "0.02150771327925621", "per_rank_batch_size": 1}
     report = {
         "status": "complete_passed", "formal_gpu_evidence": True,
+        "normalized_execution_contract": contract,
+        "normalized_execution_contract_sha256": stable_sha256(contract),
         "measurements": [{
-            "frame_count": count, "peak_memory_bytes": 80, "total_memory_bytes": 100,
+            "frame_count": 32, "distributed_strategy": strategy,
+            "peak_memory_bytes": 80, "peak_reserved_memory_bytes": 85,
+            "total_memory_bytes": 100,
             "step_time_seconds": 1.0, "throughput_samples_per_second": 1.0,
-            "batch_size": 1, "gradient_accumulation_steps": 1,
-            "forward_backward_steps": 1, "oom": False,
-        } for count in (16, 24, 32)],
-        "recommendation": {"status": "provisional_not_frozen", "frame_count": 32},
+            "batch_size": 1, "per_rank_batch_size": 1, "gradient_accumulation_steps": 1,
+            "normalized_execution_contract": contract,
+            "normalized_execution_contract_sha256": stable_sha256(contract),
+            "forward_backward_steps": 1, "oom": False, "finite": True, "world_size": 4,
+            "per_rank_peak_memory_bytes": [
+                {"rank": rank, "device_name": "NVIDIA H20",
+                 "peak_allocated_bytes": 80, "peak_reserved_bytes": 85,
+                 "total_memory_bytes": 100}
+                for rank in range(4)
+            ],
+        } for strategy in ("ddp", "fsdp")],
+        "recommendation": {
+            "status": "provisional_not_frozen", "frame_count": 32,
+            "selected_strategy": "ddp",
+            "selection_rule": (
+                "max_throughput_then_min_max_rank_allocated_then_strategy_lexical_v1"
+            ),
+        },
     }
     assert validate_phase_report("resource_profile", report, ProvisionalGateDefaults()) == []
     report["measurements"][0]["forward_backward_steps"] = 0
     assert "measurement_no_forward_backward" in validate_phase_report(
         "resource_profile", report, ProvisionalGateDefaults()
     )
+
+
+def test_profile_defaults_reject_legacy_multi_point_contract():
+    with pytest.raises(ValueError, match="only the frozen 32-frame"):
+        ProvisionalGateDefaults(profile_frame_counts=(16, 24, 32)).validate()
+
+
+def test_profile_allows_one_closed_oom_candidate():
+    contract = {"lambda_state": "0.02150771327925621", "per_rank_batch_size": 1}
+    successful = {
+        "frame_count": 32, "distributed_strategy": "fsdp", "peak_memory_bytes": 80,
+        "peak_reserved_memory_bytes": 85, "total_memory_bytes": 100,
+        "step_time_seconds": 1.0, "throughput_samples_per_second": 1.0,
+        "batch_size": 1, "per_rank_batch_size": 1, "gradient_accumulation_steps": 1,
+        "normalized_execution_contract": contract,
+        "normalized_execution_contract_sha256": stable_sha256(contract),
+        "forward_backward_steps": 1, "oom": False, "finite": True, "world_size": 4,
+        "per_rank_peak_memory_bytes": [
+            {"rank": rank, "device_name": "NVIDIA H20", "peak_allocated_bytes": 80,
+             "peak_reserved_bytes": 85, "total_memory_bytes": 100}
+            for rank in range(4)
+        ],
+    }
+    oom = {
+        "frame_count": 32, "distributed_strategy": "ddp", "peak_memory_bytes": None,
+        "peak_reserved_memory_bytes": None, "total_memory_bytes": 100,
+        "step_time_seconds": None, "throughput_samples_per_second": None,
+        "batch_size": 1, "per_rank_batch_size": 1, "gradient_accumulation_steps": 1,
+        "normalized_execution_contract": contract,
+        "normalized_execution_contract_sha256": stable_sha256(contract),
+        "forward_backward_steps": 0, "oom": True, "finite": None, "world_size": 4,
+        "per_rank_peak_memory_bytes": [
+            {"schema_version": "parta_rank_failure_v1", "rank": rank,
+             "stage": "torchrun_peer_termination", "reason": "peer terminated",
+             "oom": rank == 2, "peak_allocated_bytes": None,
+             "peak_reserved_bytes": None, "total_memory_bytes": None}
+            for rank in range(4)
+        ], "oom_evidence": {"error": "out of memory"},
+    }
+    report = {
+        "status": "complete_passed", "formal_gpu_evidence": True,
+        "normalized_execution_contract": contract,
+        "normalized_execution_contract_sha256": stable_sha256(contract),
+        "measurements": [oom, successful],
+        "recommendation": {
+            "status": "provisional_not_frozen", "frame_count": 32,
+            "selected_strategy": "fsdp",
+            "selection_rule": (
+                "max_throughput_then_min_max_rank_allocated_then_strategy_lexical_v1"
+            ),
+        },
+    }
+    assert validate_phase_report("resource_profile", report, ProvisionalGateDefaults()) == []
 
 
 def test_unified_gate_fails_when_any_new_phase_is_missing():

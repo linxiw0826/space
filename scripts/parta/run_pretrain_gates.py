@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--overfit-examples", type=int, default=64)
     parser.add_argument("--overfit-steps", type=int, default=100)
     parser.add_argument("--overfit-minimum-loss-decrease-fraction", type=float, default=0.20)
-    parser.add_argument("--profile-frame-counts", type=int, nargs="+", default=(16, 24, 32))
+    parser.add_argument("--profile-frame-counts", type=int, nargs="+", default=(32,))
     parser.add_argument("--frozen-config-artifact", type=Path)
     parser.add_argument("--finalize-only", action="store_true")
     return parser.parse_args()

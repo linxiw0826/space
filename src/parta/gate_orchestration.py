@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .provenance import atomic_json_dump, sha256_file, stable_sha256
+from .resource_profile_contract import validate_rank_failure_rows
 
 
 FORMAL_SOURCE_REGISTRY = ("adt", "hypersim", "scannetppv2")
@@ -144,7 +145,7 @@ class ProvisionalGateDefaults:
     overfit_examples: int = 64
     overfit_steps: int = 100
     overfit_minimum_loss_decrease_fraction: float = 0.20
-    profile_frame_counts: tuple[int, ...] = (16, 24, 32)
+    profile_frame_counts: tuple[int, ...] = (32,)
     defaults_status: str = "pending_gate_config_after_d62_execution_evidence"
 
     def validate(self) -> None:
@@ -152,10 +153,8 @@ class ProvisionalGateDefaults:
             raise ValueError("overfit examples and steps must be positive")
         if not 0.0 < self.overfit_minimum_loss_decrease_fraction < 1.0:
             raise ValueError("overfit loss-decrease threshold must be in (0,1)")
-        if tuple(sorted(set(self.profile_frame_counts))) != self.profile_frame_counts:
-            raise ValueError("profile frame counts must be unique and sorted")
-        if any(count not in {16, 24, 32} for count in self.profile_frame_counts):
-            raise ValueError("profiling must cover the frozen 16/24/32 frame points")
+        if self.profile_frame_counts != (32,):
+            raise ValueError("profiling must cover only the frozen 32-frame worst-case point")
 
 
 @dataclass(frozen=True)
@@ -305,10 +304,15 @@ def validate_phase_report(
             failures.append("engineering_transaction_promotable")
     elif phase == "resource_profile":
         measurements = result.get("measurements")
+        top_contract = result.get("normalized_execution_contract")
+        top_contract_sha = result.get("normalized_execution_contract_sha256")
+        if (not isinstance(top_contract, Mapping)
+                or top_contract_sha != stable_sha256(top_contract)):
+            failures.append("profile_top_level_execution_contract")
         if not isinstance(measurements, list):
             failures.append("measurements")
         else:
-            observed = tuple(sorted(item.get("frame_count") for item in measurements))
+            observed = tuple(sorted({item.get("frame_count") for item in measurements}))
             if observed != defaults.profile_frame_counts:
                 failures.append("profile_frame_counts")
             feasible = []
@@ -317,12 +321,17 @@ def validate_phase_report(
                     "peak_memory_bytes", "total_memory_bytes", "step_time_seconds",
                     "throughput_samples_per_second", "batch_size",
                     "gradient_accumulation_steps", "forward_backward_steps", "oom",
+                    "world_size", "per_rank_peak_memory_bytes",
+                    "peak_reserved_memory_bytes", "distributed_strategy", "finite",
+                    "per_rank_batch_size", "normalized_execution_contract",
+                    "normalized_execution_contract_sha256",
                 ):
                     if name not in item:
                         failures.append(f"measurement.{name}")
-                always_numeric = (item.get("total_memory_bytes"), item.get("batch_size"),
-                                  item.get("gradient_accumulation_steps"))
-                measured_numeric = (item.get("peak_memory_bytes"), item.get("step_time_seconds"),
+                always_numeric = (item.get("batch_size"), item.get("per_rank_batch_size"),
+                                  item.get("gradient_accumulation_steps"), item.get("world_size"))
+                measured_numeric = (item.get("peak_memory_bytes"),
+                                    item.get("peak_reserved_memory_bytes"), item.get("step_time_seconds"),
                                     item.get("throughput_samples_per_second"))
                 if any(not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0
                        for value in always_numeric):
@@ -332,6 +341,14 @@ def validate_phase_report(
                         item.get("oom_evidence"), Mapping
                     ):
                         failures.append("oom_measurement_contract")
+                    if not isinstance(item.get("per_rank_peak_memory_bytes"), list) \
+                            or len(item["per_rank_peak_memory_bytes"]) != 4:
+                        failures.append("oom_rank_evidence")
+                    else:
+                        try:
+                            validate_rank_failure_rows(item["per_rank_peak_memory_bytes"])
+                        except ValueError:
+                            failures.append("oom_rank_evidence")
                 elif any(not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0
                          for value in measured_numeric):
                     failures.append("measurement_nonpositive_or_nonfinite")
@@ -340,24 +357,72 @@ def validate_phase_report(
                     or item["forward_backward_steps"] < 1
                 ):
                     failures.append("measurement_no_forward_backward")
-                elif not item.get("oom") and item["peak_memory_bytes"] < item["total_memory_bytes"] * 0.90:
-                    feasible.append(item["frame_count"])
+                if item.get("world_size") != 4:
+                    failures.append("profile_world_size")
+                if item.get("distributed_strategy") not in {"ddp", "fsdp"}:
+                    failures.append("profile_strategy")
+                contract = item.get("normalized_execution_contract")
+                if (not isinstance(contract, Mapping)
+                        or item.get("normalized_execution_contract_sha256")
+                           != stable_sha256(contract)
+                        or contract != top_contract
+                        or item.get("normalized_execution_contract_sha256") != top_contract_sha):
+                    failures.append("profile_execution_contract")
+                per_rank = item.get("per_rank_peak_memory_bytes")
+                if not item.get("oom") and (
+                    not isinstance(per_rank, list) or len(per_rank) != 4
+                    or [rank.get("rank") for rank in per_rank] != [0, 1, 2, 3]
+                    or any(not isinstance(rank.get("peak_allocated_bytes"), int)
+                           or rank["peak_allocated_bytes"] <= 0
+                           or not isinstance(rank.get("peak_reserved_bytes"), int)
+                           or rank["peak_reserved_bytes"] <= 0
+                           or not isinstance(rank.get("total_memory_bytes"), int)
+                           or rank["total_memory_bytes"] <= 0 for rank in per_rank)
+                    or any("NVIDIA H20" not in str(rank.get("device_name")) for rank in per_rank)
+                ):
+                    failures.append("per_rank_h20_cuda_peak")
+                elif (not item.get("oom") and item.get("finite") is True
+                      and all(rank["peak_allocated_bytes"] < rank["total_memory_bytes"] * 0.90
+                              for rank in per_rank)):
+                    feasible.append(item["distributed_strategy"])
+                elif not item.get("oom") and item.get("finite") is not True:
+                    failures.append("profile_nonfinite")
+            if isinstance(measurements, list) and {
+                (item.get("distributed_strategy"), item.get("frame_count")) for item in measurements
+            } != {("ddp", 32), ("fsdp", 32)}:
+                failures.append("profile_strategy_frame_matrix")
             if not feasible:
                 failures.append("no_safe_feasible_configuration")
         recommendation = result.get("recommendation", {})
         if recommendation.get("status") != "provisional_not_frozen":
             failures.append("recommendation_not_provisional")
+        if recommendation.get("selection_rule") != (
+            "max_throughput_then_min_max_rank_allocated_then_strategy_lexical_v1"
+        ):
+            failures.append("recommendation_selection_rule")
         if isinstance(measurements, list):
             safe = {
-                item.get("frame_count") for item in measurements
+                item.get("distributed_strategy") for item in measurements
                 if not item.get("oom")
-                and isinstance(item.get("peak_memory_bytes"), (int, float))
-                and isinstance(item.get("total_memory_bytes"), (int, float))
-                and item.get("total_memory_bytes", 0) > 0
-                and item["peak_memory_bytes"] < item["total_memory_bytes"] * 0.90
+                and item.get("finite") is True
+                and isinstance(item.get("per_rank_peak_memory_bytes"), list)
+                and all(rank.get("peak_allocated_bytes", float("inf"))
+                        < rank.get("total_memory_bytes", 0) * 0.90
+                        for rank in item["per_rank_peak_memory_bytes"])
             }
-            if recommendation.get("frame_count") not in safe:
+            if recommendation.get("selected_strategy") not in safe:
                 failures.append("recommendation_not_safe")
+            safe_items = [item for item in measurements
+                          if item.get("distributed_strategy") in safe]
+            selected = min(
+                safe_items,
+                key=lambda item: (-item["throughput_samples_per_second"],
+                                  item["peak_memory_bytes"], item["distributed_strategy"]),
+            ) if safe_items else None
+            if recommendation.get("selected_strategy") != (
+                selected.get("distributed_strategy") if selected else None
+            ):
+                failures.append("recommendation_not_deterministic")
     else:
         raise ValueError(f"unknown phase: {phase}")
     return sorted(set(failures))
