@@ -1,0 +1,9 @@
+torch==2.4.1
+torchvision
+timm==0.4.12
+decord==0.6.0
+einops
+numpy
+Pillow
+safetensors
+tensorboard
