@@ -1,5 +1,7 @@
 import ast
+import os
 from pathlib import Path
+import subprocess
 
 import pytest
 import torch
@@ -12,6 +14,39 @@ from model.mope_new_encoder import (
     load_annotation_for_mope_new,
     select_ordered_images,
 )
+
+
+@pytest.mark.parametrize(
+    ("script_name", "experiment_name"),
+    [
+        ("eval_e00b_mope_new_vsibench.sh", "e00b_mope_new_projector_only_4b"),
+        ("eval_e02c_mope_new_vsibench.sh", "e02c_mope_new_crossattn_joint_4b"),
+        ("eval_e03a_mope_new_vsibench.sh", "e03a_mope_new_crossattn_two_stage_4b"),
+    ],
+)
+def test_eval_dry_run_uses_server_roots_and_timestamped_log(script_name, experiment_name):
+    root = Path.cwd()
+    env = os.environ.copy()
+    env.update(
+        {
+            "SPACE_ROOT": str(root),
+            "SPACE_OUTPUT_ROOT": "/contract/output",
+            "SPACE_LOG_ROOT": "/contract/logs",
+            "MOPE_NEW_ALLOW_MISSING_ASSETS": "1",
+            "DRY_RUN": "1",
+        }
+    )
+    result = subprocess.run(
+        ["bash", str(root / "scripts/idea1_feature/eval" / script_name)],
+        cwd=root,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert f"checkpoint=/contract/output/train/{experiment_name}" in result.stdout
+    assert f"output=/contract/output/eval/vsibench/{experiment_name}" in result.stdout
+    assert f"Log=/contract/logs/eval/{experiment_name}_vsibench_" in result.stdout
 
 
 def test_shared_preprocessing_contract_for_ordered_images(tmp_path):
