@@ -1,6 +1,6 @@
 # Part A A1-O Architecture
 
-更新时间：2026-08-13（D-62 v2三源runtime数据合同与单卡T0-B正式GPU证据PASS）
+更新时间：2026-08-17（D-62 v2三源runtime数据合同与单卡T0-B正式GPU证据PASS）
 状态：D-62 v2 canonical、train/val manifest、engineering registry、K=384审计、
 三源validator与单卡T0-B均`complete_passed`。当前不再等待D-62 runtime artifacts或T0-B；
 下一个权威Gate是真实四卡32帧worst-case resource profile与matched runner。
@@ -169,6 +169,10 @@ GUIDE/VGGT digest与forward身份。
 - 梯度校准valid fraction为`1.0`，得到候选
   `lambda_state=0.02150771327925621`。该值仍须由`Gate@CONFIG`冻结；
 - `checkpoint-resume-probe.pt`已生成，作为恢复等价性证据保留。
+
+因此T0-B Gate已经关闭为PASS，不是当前pending，也不需要为四卡profiling重跑。当前pending只包括
+真实`4 × H20` A1-O 32帧worst-case DDP/FSDP profiling及其后的`Gate@CONFIG`审批；profiling
+不改变或替代上述T0-B结论。
 
 **T0-B没有记录CUDA peak memory。** `/usr/bin/time -v`报告的
 `Maximum resident set size=39,816,712 KiB`是主机RAM RSS，不是GPU显存。目前能做的
