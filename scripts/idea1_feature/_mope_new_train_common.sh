@@ -29,19 +29,19 @@ case "${MOPE_NEW_EXPERIMENT}" in
   e00b-new)
     OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_ROOT}/train/e00b_mope_new_projector_only_4b}"
     TUNE_LLM=False
-    GRAD_ACCUM=5
+    GRAD_ACCUM=6
     WARMSTART=""
     ;;
   e02c-new)
     OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_ROOT}/train/e02c_mope_new_crossattn_joint_4b}"
     TUNE_LLM=True
-    GRAD_ACCUM=4
+    GRAD_ACCUM=6
     WARMSTART=""
     ;;
   e03a-new)
     OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_ROOT}/train/e03a_mope_new_crossattn_two_stage_4b}"
     TUNE_LLM=True
-    GRAD_ACCUM=4
+    GRAD_ACCUM=6
     WARMSTART="${MOPE_PROJECTOR_WARMSTART_PATH:-${OUTPUT_ROOT}/train/e00b_mope_new_projector_only_4b}"
     ;;
   *) echo "Unknown MoPE-new experiment: ${MOPE_NEW_EXPERIMENT}" >&2; exit 2 ;;
@@ -96,7 +96,7 @@ COMMAND=(python -m torch.distributed.run "--nproc_per_node=${NPROC_PER_NODE}" "-
 [[ -n "${WARMSTART}" ]] && COMMAND+=(--mope_projector_warmstart_path "${WARMSTART}")
 [[ -n "${RESUME_FROM_CHECKPOINT}" ]] && COMMAND+=(--resume_from_checkpoint "${RESUME_FROM_CHECKPOINT}")
 
-echo "Experiment=${MOPE_NEW_EXPERIMENT} train_llm=${TUNE_LLM} train_projector=True train_mope=False grad_accum=${GRAD_ACCUM}"
+echo "Experiment=${MOPE_NEW_EXPERIMENT} train_llm=${TUNE_LLM} train_projector=True train_mope=False grad_accum=${GRAD_ACCUM} effective_batch=$((2 * NPROC_PER_NODE * GRAD_ACCUM))"
 echo "MoPE=${MOPE_NEW_CKPT} frames=16 sampling_rate=4 input=224 pool=none expected=[B,1568,768]"
 echo "Output=${OUTPUT_DIR} warmstart=${WARMSTART:-none} resume=${RESUME_FROM_CHECKPOINT:-none}"
 echo "Log=${LOG_FILE}"
