@@ -4,11 +4,14 @@ set -euo pipefail
 : "${MOPE_NEW_EXPERIMENT:?wrapper must set MOPE_NEW_EXPERIMENT}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SPACE_ROOT="${SPACE_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
+# Load the per-server output/log roots before deriving experiment paths.
+source "${SPACE_ROOT}/scripts/_common/env/activate.sh"
 MODEL_SIZE="${MODEL_SIZE:-4b}"
 [[ "${MODEL_SIZE}" == "4b" ]] || { echo "Only the verified 4b recipe is enabled" >&2; exit 2; }
 DRY_RUN="${DRY_RUN:-0}"
 ALLOW_MISSING="${MOPE_NEW_ALLOW_MISSING_ASSETS:-0}"
 OUTPUT_ROOT="${SPACE_OUTPUT_ROOT:-${SPACE_ROOT}/output}"
+LOG_DIR="${LOG_DIR:-${SPACE_LOG_ROOT:-${SPACE_ROOT}/logs}/train}"
 MOPE_NEW_SOURCE_ROOT="${MOPE_NEW_SOURCE_ROOT:-${SPACE_ROOT}/refs/mope_new}"
 MOPE_NEW_CKPT="${MOPE_NEW_CKPT:-/data2/mope-jepa-assets/jepa_checkpoints/native_mope8_dense4_moe4_top2_wisa_dyn_3dpos/checkpoint-50.pth}"
 GUIDE_CKPT_PATH="${GUIDE_CKPT_PATH:-${OUTPUT_ROOT}/train/guide_reproduced/4b}"
@@ -43,6 +46,8 @@ case "${MOPE_NEW_EXPERIMENT}" in
     ;;
   *) echo "Unknown MoPE-new experiment: ${MOPE_NEW_EXPERIMENT}" >&2; exit 2 ;;
 esac
+
+LOG_FILE="${LOG_FILE:-${LOG_DIR}/$(basename "${OUTPUT_DIR}")_$(date +%Y%m%d_%H%M%S).log}"
 
 RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
 if [[ -n "${RESUME_FROM_CHECKPOINT}" ]]; then
@@ -94,8 +99,8 @@ COMMAND=(python -m torch.distributed.run "--nproc_per_node=${NPROC_PER_NODE}" "-
 echo "Experiment=${MOPE_NEW_EXPERIMENT} train_llm=${TUNE_LLM} train_projector=True train_mope=False grad_accum=${GRAD_ACCUM}"
 echo "MoPE=${MOPE_NEW_CKPT} frames=16 sampling_rate=4 input=224 pool=none expected=[B,1568,768]"
 echo "Output=${OUTPUT_DIR} warmstart=${WARMSTART:-none} resume=${RESUME_FROM_CHECKPOINT:-none}"
+echo "Log=${LOG_FILE}"
 printf 'COMMAND:'; printf ' %q' "${COMMAND[@]}"; printf '\n'
 [[ "${DRY_RUN}" == "1" ]] && exit 0
-source "${SPACE_ROOT}/scripts/_common/env/activate.sh"
-mkdir -p "${OUTPUT_DIR}"
-exec "${COMMAND[@]}"
+mkdir -p "${OUTPUT_DIR}" "${LOG_DIR}"
+exec "${COMMAND[@]}" > "${LOG_FILE}" 2>&1
