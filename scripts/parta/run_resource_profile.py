@@ -71,6 +71,43 @@ def run_with_timeout(argv: list[str], timeout_seconds: int, evidence_path: Path,
     return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
 
 
+def write_worker_failure_diagnostics(
+    output_path: Path,
+    strategy: str,
+    frame_count: int,
+    run_dir: Path,
+    completed: subprocess.CompletedProcess,
+) -> Path:
+    """Persist captured worker output before classifying a failed profile run."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    stem = f"{output_path.stem}.{strategy}.worker_failure"
+    stdout_path = output_path.parent / f"{stem}.stdout.log"
+    stderr_path = output_path.parent / f"{stem}.stderr.log"
+    diagnostic_path = output_path.parent / f"{stem}.json"
+    stdout = completed.stdout or ""
+    stderr = completed.stderr or ""
+    stdout_path.write_text(stdout, encoding="utf-8")
+    stderr_path.write_text(stderr, encoding="utf-8")
+    diagnostic_path.write_text(json.dumps({
+        "schema_version": "parta_profile_worker_failure_v1",
+        "strategy": strategy,
+        "frame_count": frame_count,
+        "returncode": completed.returncode,
+        "run_dir": str(run_dir.resolve()),
+        "stdout": {
+            "path": str(stdout_path.resolve()),
+            "sha256": hashlib.sha256(stdout.encode()).hexdigest(),
+            "size_bytes": len(stdout.encode()),
+        },
+        "stderr": {
+            "path": str(stderr_path.resolve()),
+            "sha256": hashlib.sha256(stderr.encode()).hexdigest(),
+            "size_bytes": len(stderr.encode()),
+        },
+    }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return diagnostic_path
+
+
 def collect_rank_failure_evidence(run_dir: Path) -> list[dict]:
     """Load four rank records and require at least one authentic on-disk OOM."""
     rows = []
@@ -175,6 +212,9 @@ def main() -> None:
             args.output.parent / f"{args.output.stem}.{strategy}.timeout.json", strategy,
         )
         if completed.returncode:
+            diagnostic_path = write_worker_failure_diagnostics(
+                args.output, strategy, frame_count, run_dir, completed
+            )
             status_path = run_dir / "run_status.json"
             status = _json(status_path) if status_path.is_file() else {}
             worker_error = "\n".join((completed.stdout or "", completed.stderr or ""))
@@ -182,7 +222,10 @@ def main() -> None:
                       or "out of memory" in str(status.get("error", "")).lower()
                       or "out of memory" in worker_error.lower())
             if not is_oom:
-                raise RuntimeError(f"profile worker failed without OOM evidence: {frame_count}")
+                raise RuntimeError(
+                    "profile worker failed without OOM evidence: "
+                    f"{frame_count}; diagnostics={diagnostic_path}"
+                )
             resolved_path = run_dir / "resolved_config.json"
             resolved_failure = _json(resolved_path) if resolved_path.is_file() else {}
             rank_rows = collect_rank_failure_evidence(run_dir)

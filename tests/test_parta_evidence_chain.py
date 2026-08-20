@@ -1,5 +1,6 @@
 import sys
 import os
+import subprocess
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,7 +17,8 @@ from parta.resource_profile_contract import (LAMBDA_STATE, normalize_profile_wor
     validate_preexecution_profile, validate_resolved_profile)
 from scripts.parta.freeze_pretrain_config import validate_profile_selected_config
 from scripts.parta.run_resource_profile import (collect_rank_failure_evidence,
-                                                 run_with_timeout)
+                                                 run_with_timeout,
+                                                 write_worker_failure_diagnostics)
 from scripts.parta import train_parta as train_parta_script
 from scripts.parta.audit_three_source_validator import validate_recomputed_summary
 from scripts.parta.audit_formal_startup import (validate_single_checkpoint_artifact,
@@ -268,6 +270,25 @@ def test_profile_worker_timeout_is_terminated_and_structured(tmp_path):
         time.sleep(0.1)
     else:
         pytest.fail("timeout left a torchrun child process alive")
+
+
+def test_profile_worker_failure_diagnostics_preserve_stdout_and_stderr(tmp_path):
+    output = tmp_path / "resource_profile_report.json"
+    completed = subprocess.CompletedProcess(
+        ["torchrun"], 7, stdout="worker stdout\n", stderr="worker stderr\n"
+    )
+
+    diagnostic_path = write_worker_failure_diagnostics(
+        output, "ddp", 32, tmp_path / "ddp", completed
+    )
+
+    payload = __import__("json").loads(diagnostic_path.read_text())
+    assert payload["schema_version"] == "parta_profile_worker_failure_v1"
+    assert payload["strategy"] == "ddp"
+    assert payload["frame_count"] == 32
+    assert payload["returncode"] == 7
+    assert Path(payload["stdout"]["path"]).read_text() == "worker stdout\n"
+    assert Path(payload["stderr"]["path"]).read_text() == "worker stderr\n"
 
 
 def test_training_failure_coordination_branches_by_engineering_mode(tmp_path, monkeypatch):

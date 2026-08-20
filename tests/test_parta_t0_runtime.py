@@ -141,6 +141,17 @@ class FakeGuideModel(torch.nn.Module):
         return FakeOutput(hidden, valid, logits, loss)
 
 
+class FakeDistributedWrapper(torch.nn.Module):
+    def __init__(self, module):
+        super().__init__()
+        self.module = module
+        self.forward_calls = 0
+
+    def forward(self, **kwargs):
+        self.forward_calls += 1
+        return self.module(**kwargs)
+
+
 def sample(media_kind, count):
     source = "adt" if media_kind == "video" else "hypersim"
     qa = {
@@ -220,6 +231,36 @@ def test_fake_processor_model_end_to_end_video_and_image_exact_order():
         )
         branch.losses["loss_state"].backward()
         assert model.geometry_merger.weight.grad is not None
+
+
+def test_forward_visual_tap_inspects_nested_wrapper_but_forwards_through_outer_wrapper():
+    processor = FakeProcessor()
+    fixture = PartAT0Collator(processor)(
+        sample("video", 2),
+        tuple(Image.new("RGB", (2, 2), (index, 0, 0)) for index in range(2)),
+    )
+    guide = FakeGuideModel()
+    inner_wrapper = FakeDistributedWrapper(guide)
+    outer_wrapper = FakeDistributedWrapper(inner_wrapper)
+
+    output = forward_visual_tap(outer_wrapper, fixture)
+
+    assert output.visual_state_valid_mask.sum().item() == 2
+    assert outer_wrapper.forward_calls == 1
+    assert inner_wrapper.forward_calls == 1
+
+
+def test_forward_visual_tap_does_not_unwrap_ordinary_configured_model():
+    processor = FakeProcessor()
+    fixture = PartAT0Collator(processor)(
+        sample("image", 1), (Image.new("RGB", (2, 2), (0, 0, 0)),)
+    )
+    guide = FakeGuideModel()
+    guide.module = torch.nn.Module()
+
+    output = forward_visual_tap(guide, fixture)
+
+    assert output.visual_state_valid_mask.sum().item() == 1
 
 
 def test_cli_failure_is_nonzero_and_atomic_report_exists(tmp_path):

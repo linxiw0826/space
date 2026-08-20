@@ -271,10 +271,24 @@ def _question_answer(conversations: Sequence[Mapping[str, Any]]) -> tuple[str, s
 
 def forward_visual_tap(model: torch.nn.Module, fixture: ProcessedFixture) -> Any:
     """Forward only reviewed model kwargs plus the explicit tap request."""
-    inner = getattr(model, "model", model)
+    # DDP/FSDP expose the wrapped model through ``module``.  Contract inspection
+    # must reach that model, while the actual forward below must still use the
+    # outer wrapper so distributed synchronization is not bypassed.  Stop as
+    # soon as a model owns a config so an ordinary model that happens to contain
+    # a child named ``module`` is not accidentally unwrapped.
+    contract_model = model
+    seen: set[int] = set()
+    while getattr(contract_model, "config", None) is None:
+        wrapped = getattr(contract_model, "module", None)
+        if not isinstance(wrapped, torch.nn.Module) or id(wrapped) in seen:
+            break
+        seen.add(id(contract_model))
+        contract_model = wrapped
+
+    inner = getattr(contract_model, "model", contract_model)
     if getattr(inner, "_mope_encoder", None) is not None or getattr(inner, "_mope_projector", None) is not None:
         raise ContractError("T0-A must remain MoPE-free")
-    if getattr(getattr(model, "config", None), "use_geometry_encoder", None) is not True:
+    if getattr(getattr(contract_model, "config", None), "use_geometry_encoder", None) is not True:
         raise ContractError("T0-A requires the reproduced GUIDE geometry encoder")
     if "geometry_encoder_inputs" not in fixture.model_kwargs:
         raise ContractError("T0-A requires visual-derived GUIDE geometry inputs")
