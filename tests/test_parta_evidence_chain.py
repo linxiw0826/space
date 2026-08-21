@@ -27,11 +27,36 @@ from scripts.parta.audit_formal_startup import (validate_single_checkpoint_artif
                                                 checkpoint_artifact,
                                                 validate_startup_input)
 from parta.provenance import sha256_file, stable_sha256
+from parta import distributed as parta_distributed
 
 
 def _record(script, sha="a" * 64, revision="b" * 40):
     return {"python_executable": sys.executable, "script_path": str(script.resolve()),
             "script_sha256": sha, "git_revision": revision}
+
+
+def test_distributed_barrier_is_bound_to_local_cuda_device(monkeypatch):
+    calls = []
+    monkeypatch.setattr(parta_distributed.torch.distributed, "barrier",
+                        lambda **kwargs: calls.append(kwargs))
+    parta_distributed.barrier(
+        parta_distributed.DistributedContext(rank=2, local_rank=3, world_size=4)
+    )
+    assert calls == [{"device_ids": [3]}]
+
+
+def test_destroy_distributed_is_safe_and_only_destroys_initialized_group(monkeypatch):
+    calls = []
+    monkeypatch.setattr(parta_distributed.torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(parta_distributed.torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(parta_distributed.torch.distributed, "destroy_process_group",
+                        lambda: calls.append("destroyed"))
+    parta_distributed.destroy_distributed()
+    assert calls == ["destroyed"]
+
+    monkeypatch.setattr(parta_distributed.torch.distributed, "is_initialized", lambda: False)
+    parta_distributed.destroy_distributed()
+    assert calls == ["destroyed"]
 
 
 def test_head_free_audit_producer_record_has_real_canonical_schema():

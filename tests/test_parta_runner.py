@@ -2,11 +2,14 @@ import copy
 import json
 import random
 import sys
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
+from transformers.utils import ModelOutput
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -33,7 +36,7 @@ from parta.runner import (
     validate_single_step_execution_contract,
 )
 from parta.state_head import StateHeadConfig
-from parta.state_loss import StateTargets
+from parta.state_loss import StateLossConfig, StateTargets
 from parta.training import (
     attach_a1o_state_head, consume_a1o_forward_result,
     install_a1o_forward_integration, prepare_a1o_forward_request,
@@ -55,6 +58,27 @@ class TinyModel(torch.nn.Module):
             visual_state_valid_mask=torch.ones(hidden.shape[:2], dtype=torch.bool)
             if return_tap
             else None,
+        )
+
+
+@dataclass
+class TinyHFOutput(ModelOutput):
+    loss: torch.Tensor | None = None
+    logits: torch.Tensor | None = None
+    visual_state_hidden: torch.Tensor | None = None
+    visual_state_valid_mask: torch.Tensor | None = None
+
+
+class TinyHFModel(TinyModel):
+    def forward(self, features, return_tap=False):
+        hidden = self.shared(features)
+        logits = self.qa(hidden)
+        return TinyHFOutput(
+            loss=logits.square().mean(),
+            logits=logits,
+            visual_state_hidden=hidden if return_tap else None,
+            visual_state_valid_mask=torch.ones(hidden.shape[:2], dtype=torch.bool)
+            if return_tap else None,
         )
 
 
@@ -162,10 +186,86 @@ def test_a1o_side_branch_executes_inside_parent_forward():
             "parta.state_loss", fromlist=["StateLossConfig"]
         ).StateLossConfig(),
     )
-    model(torch.randn(1, 16, 8), return_tap=True)
+    output = model(torch.randn(1, 16, 8), return_tap=True)
     branch = consume_a1o_forward_result(model)
     assert branch.predictions.existence_logits.shape == (1, 384)
     assert torch.isfinite(branch.losses["loss_state"])
+    # The zero-valued graph anchor makes the head reachable from the actual
+    # forward return without changing the QA scalar.
+    assert output.qa_loss.grad_fn is not None
+
+
+def test_a1o_model_output_exposes_exact_non_detached_state_loss_mapping():
+    model = TinyHFModel()
+    attach_a1o_state_head(model, StateHeadConfig(
+        hidden_size=8, num_categories=4, num_slots=384, num_layers=1,
+        num_heads=2, ffn_dim=16,
+    ))
+    install_a1o_forward_integration(model)
+    prepare_a1o_forward_request(
+        model, frame_token_counts=[[1] * 16], frame_ids=[list(range(16))],
+        media_kinds=["video"], targets=[_target()], loss_config=StateLossConfig(),
+    )
+    output = model(torch.randn(1, 16, 8), return_tap=True)
+    branch = consume_a1o_forward_result(model)
+    assert output["loss"] is output.loss
+    assert output["parta_state_loss"] is branch.losses["loss_state"]
+    assert output["parta_state_loss"].grad_fn is not None
+
+
+def test_a1o_ddp_find_unused_supports_multiple_forward_backward_steps():
+    """Regression for DDP's head parameter "marked ready twice" failure."""
+    if not torch.distributed.is_available():
+        pytest.skip("torch.distributed is unavailable")
+    if torch.distributed.is_initialized():
+        pytest.skip("test requires ownership of the default process group")
+
+    with tempfile.NamedTemporaryFile() as rendezvous:
+        torch.distributed.init_process_group(
+            "gloo", init_method=f"file://{rendezvous.name}", rank=0, world_size=1
+        )
+        try:
+            model = TinyModel()
+            attach_a1o_state_head(model, StateHeadConfig(
+                hidden_size=8, num_categories=4, num_slots=384, num_layers=1,
+                num_heads=2, ffn_dim=16,
+            ))
+            install_a1o_forward_integration(model)
+            ddp = torch.nn.parallel.DistributedDataParallel(
+                model, find_unused_parameters=True
+            )
+            optimizer = torch.optim.SGD(ddp.parameters(), lr=1e-4)
+
+            for step in range(3):
+                optimizer.zero_grad(set_to_none=True)
+                target = _target()
+                # Exercise a changing autograd graph: the category and
+                # visibility components are entirely masked on the middle
+                # iteration and active on the surrounding iterations.
+                if step == 1:
+                    target.category_valid.zero_()
+                    target.visibility_valid.zero_()
+                prepare_a1o_forward_request(
+                    ddp,
+                    frame_token_counts=[[1] * 16],
+                    frame_ids=[list(range(16))],
+                    media_kinds=["video"],
+                    targets=[target],
+                    loss_config=StateLossConfig(),
+                )
+                output = ddp(torch.randn(1, 16, 8), return_tap=True)
+                branch = consume_a1o_forward_result(ddp)
+                total = output.qa_loss + 0.02 * branch.losses["loss_state"]
+                total.backward()
+                if step == 1:
+                    assert model.parta_state_head.visibility.bias.grad is None
+                    assert model.parta_state_head.category.bias.grad is None
+                else:
+                    assert model.parta_state_head.visibility.bias.grad is not None
+                    assert model.parta_state_head.category.bias.grad is not None
+                optimizer.step()
+        finally:
+            torch.distributed.destroy_process_group()
 
 
 def test_matched_identity_rejects_non_whitelisted_drift():

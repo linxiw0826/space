@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import MutableMapping
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -49,9 +50,39 @@ def install_a1o_forward_integration(model: nn.Module) -> None:
         valid = getattr(output, "visual_state_valid_mask", None)
         if hidden is None or valid is None:
             raise ValueError("A1-O forward lacks authoritative visual state tap")
-        module._parta_side_result = _run_a1o_side_branch_unwrapped(
+        result = _run_a1o_side_branch_unwrapped(
             module, hidden, valid, **request
         )
+        # DDP's unused-parameter traversal can only inspect tensors reachable
+        # from the value returned by ``forward``.  Keeping the side result only
+        # on a transient module attribute therefore makes DDP first mark the
+        # head unused, before autograd later reaches it through the trainer's
+        # state loss ("marked ready twice").  Anchor the state-loss graph in
+        # the ordinary scalar model loss with an exactly-zero coefficient.
+        # This preserves the QA loss value and the existing consume seam while
+        # making the complete side graph visible to DDP.  It is also harmless
+        # for FSDP and ordinary unwrapped execution.
+        loss_name = "loss" if hasattr(output, "loss") else "qa_loss"
+        qa_loss = getattr(output, loss_name, None)
+        state_loss = result.losses.get("loss_state")
+        if not isinstance(qa_loss, torch.Tensor) or qa_loss.ndim != 0:
+            raise TypeError("A1-O forward requires a scalar model loss for DDP graph anchoring")
+        if not isinstance(state_loss, torch.Tensor) or state_loss.ndim != 0:
+            raise TypeError("A1-O side branch requires a scalar loss_state")
+        anchored_loss = qa_loss + state_loss * qa_loss.new_zeros(())
+        setattr(output, loss_name, anchored_loss)
+        # Hugging Face ModelOutput is both a dataclass and an OrderedDict. Its
+        # attribute setter does not update an already-present mapping entry,
+        # while DDP may traverse either representation depending on PyTorch.
+        if isinstance(output, MutableMapping) and loss_name in output:
+            output[loss_name] = anchored_loss
+        # Preserve the exact, non-detached tensor in mapping-style outputs
+        # (notably transformers.ModelOutput).  This gives DDP a direct return
+        # edge in addition to the scalar anchor and makes the integration
+        # contract independently auditable by the caller.
+        if isinstance(output, MutableMapping):
+            output["parta_state_loss"] = state_loss
+        module._parta_side_result = result
         return output
 
     model._parta_forward_hook_handle = model.register_forward_hook(_hook, with_kwargs=True)

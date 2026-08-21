@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+import atexit
 import os
 from dataclasses import dataclass
 
 import torch
+
+
+def destroy_distributed() -> None:
+    """Release an initialized process group on normal and exceptional exits."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
 
 
 @dataclass(frozen=True)
@@ -28,6 +35,7 @@ def initialize_distributed() -> DistributedContext:
             raise RuntimeError("torchrun Part A training requires CUDA/NCCL")
         torch.cuda.set_device(local_rank)
         torch.distributed.init_process_group(backend="nccl", init_method="env://")
+        atexit.register(destroy_distributed)
         rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
     return DistributedContext(rank=rank, local_rank=local_rank, world_size=world_size)
@@ -43,4 +51,4 @@ def synchronize_failure(local_failed: bool, context: DistributedContext) -> bool
 
 def barrier(context: DistributedContext) -> None:
     if context.world_size > 1:
-        torch.distributed.barrier()
+        torch.distributed.barrier(device_ids=[context.local_rank])

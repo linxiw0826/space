@@ -29,7 +29,8 @@ from parta.canonical_data import ExactMediaLoader, PartASample, build_state_targ
 from parta.checkpoint import export_head_free_checkpoint  # noqa: E402
 from parta.checkpoint_selection import RULE as CHECKPOINT_SELECTION_RULE  # noqa: E402
 from parta.checkpoint_selection import select_validation_checkpoint  # noqa: E402
-from parta.distributed import barrier, initialize_distributed, synchronize_failure  # noqa: E402
+from parta.distributed import (barrier, destroy_distributed, initialize_distributed,
+                               synchronize_failure)  # noqa: E402
 from parta.provenance import atomic_json_dump, sha256_file, stable_sha256  # noqa: E402
 from parta.gate_orchestration import validate_formal_training_authorization  # noqa: E402
 from parta.runner import (  # noqa: E402
@@ -835,3 +836,7 @@ if __name__ == "__main__":
         except BaseException:
             pass
         raise
+    finally:
+        # torchrun may terminate healthy peers after another rank fails; do
+        # not rely solely on interpreter shutdown to release NCCL resources.
+        destroy_distributed()
