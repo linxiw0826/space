@@ -20,7 +20,8 @@ TRAIN_RUNNER = (PROJECT / "scripts/parta/train_parta.py").resolve()
 sys.path.insert(0, str(PROJECT / "src"))
 from parta.resource_profile_contract import (FRAME_COUNT, LAMBDA_STATE,
     STRATEGIES, WORLD_SIZE as REQUIRED_WORLD_SIZE, normalize_profile_worker_argv,
-    normalized_contract_sha256, validate_profile_pair)  # noqa: E402
+    normalize_profile_matched_execution, normalized_contract_sha256,
+    validate_profile_pair)  # noqa: E402
 from parta.resource_profile_contract import validate_preexecution_profile  # noqa: E402
 from parta.resource_profile_contract import validate_resolved_profile  # noqa: E402
 from parta.resource_profile_contract import validate_rank_failure_rows  # noqa: E402
@@ -267,9 +268,9 @@ def main() -> None:
                     "path": str(matched_path.resolve()), "sha256": _sha256(matched_path)
                 }
                 matched_payload = _json(matched_path)
-                execution = dict(matched_payload.get("execution_contract", {}))
-                if execution.pop("distributed_strategy", None) != strategy:
-                    raise ValueError("OOM matched contract strategy mismatch")
+                execution = normalize_profile_matched_execution(
+                    matched_payload.get("execution_contract", {}), strategy
+                )
                 reopened_runtime_matched[strategy] = {
                     **matched_payload, "execution_contract": execution
                 }
@@ -396,9 +397,9 @@ def main() -> None:
             }),
         })
         matched_payload = _json(run_dir / "matched_fairness_contract.json")
-        execution = dict(matched_payload.get("execution_contract", {}))
-        if execution.pop("distributed_strategy", None) != strategy:
-            raise ValueError("matched contract strategy mismatch")
+        execution = normalize_profile_matched_execution(
+            matched_payload.get("execution_contract", {}), strategy
+        )
         reopened_runtime_matched[strategy] = {**matched_payload, "execution_contract": execution}
         preflight_payload = _json(run_dir / "profile_preflight_matched_contract.json")
         validate_preexecution_profile(preflight_payload, argv, manifest=args.manifest,

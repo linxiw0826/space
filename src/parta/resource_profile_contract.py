@@ -13,6 +13,19 @@ WORLD_SIZE = 4
 FRAME_COUNT = 32
 STRATEGIES = ("ddp", "fsdp")
 
+
+def normalize_profile_matched_execution(
+    execution: dict[str, Any], strategy: str
+) -> dict[str, Any]:
+    """Validate and remove backend-specific fields before DDP/FSDP matching."""
+    normalized = dict(execution)
+    if normalized.pop("distributed_strategy", None) != strategy:
+        raise ValueError("matched contract strategy mismatch")
+    expected_unused = True if strategy == "ddp" else None
+    if normalized.pop("ddp_find_unused_parameters", None) != expected_unused:
+        raise ValueError("matched contract DDP unused-parameter setting mismatch")
+    return normalized
+
 VALUE_FLAGS = (
     "--arm", "--manifest", "--manifest-report", "--media-root", "--model-path",
     "--vggt-path", "--seed", "--learning-rate", "--weight-decay", "--lambda-state",
@@ -142,6 +155,7 @@ def validate_resolved_profile(resolved: dict[str, Any], contract: dict[str, Any]
         "effective_global_batch_size": int(contract["effective_global_batch_size"]),
         "gradient_accumulation_steps": int(contract["gradient_accumulation_steps"]),
         "gradient_checkpointing": True, "distributed_strategy": strategy,
+        "ddp_find_unused_parameters": True if strategy == "ddp" else None,
         "learning_rate": float(contract["learning_rate"]),
         "weight_decay": float(contract["weight_decay"]),
         "max_grad_norm": float(contract["max_grad_norm"]), "dtype": contract["dtype"],

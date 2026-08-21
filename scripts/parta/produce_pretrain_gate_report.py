@@ -24,7 +24,8 @@ from parta.provenance import atomic_json_dump, sha256_file, stable_sha256  # noq
 from parta.t0 import T0_A_REQUIRED_CHECKS  # noqa: E402
 from parta.unified_data import FROZEN_SOURCE_INVENTORY, FROZEN_TOTAL_INVENTORY  # noqa: E402
 from parta.resource_profile_contract import (LAMBDA_STATE,
-    normalize_profile_worker_argv, normalized_contract_sha256,
+    normalize_profile_matched_execution, normalize_profile_worker_argv,
+    normalized_contract_sha256,
     validate_rank_failure_rows)  # noqa: E402
 from parta.resource_profile_contract import validate_preexecution_profile  # noqa: E402
 from parta.resource_profile_contract import validate_resolved_profile  # noqa: E402
@@ -367,9 +368,9 @@ def _profile(args, contract):
         matched = (_json(Path(artifacts["matched_contract"]["path"]))
                    if "matched_contract" in artifacts else None)
         if matched is not None:
-            execution = dict(matched.get("execution_contract", {}))
-            if execution.pop("distributed_strategy", None) != item["distributed_strategy"]:
-                raise ValueError("resource profile matched-contract strategy mismatch")
+            execution = normalize_profile_matched_execution(
+                matched.get("execution_contract", {}), item["distributed_strategy"]
+            )
             runtime_matched_normalized[item["distributed_strategy"]] = {
                 **matched, "execution_contract": execution
             }

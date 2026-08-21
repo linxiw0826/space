@@ -69,6 +69,20 @@ logging.basicConfig(
 LOGGER = logging.getLogger("parta.train")
 
 
+def _ddp_wrapper_kwargs(local_rank: int) -> dict[str, object]:
+    """Frozen DDP semantics shared by matched A0/A1-O runs.
+
+    GUIDE contains conditionally active parameters, so a real multi-step run
+    must ask DDP to discover unused parameters.  Keeping this arm-independent
+    is part of the matched-training contract, not a profiling-only workaround.
+    """
+    return {
+        "device_ids": [local_rank],
+        "output_device": local_rank,
+        "find_unused_parameters": True,
+    }
+
+
 def _write_rank_failure(error: BaseException, stage: str, output_dir: Path) -> None:
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -374,6 +388,9 @@ def main() -> None:
         "model_path": str(args.model_path.resolve()),
         "vggt_path": str(args.vggt_path.resolve()),
         "distributed_strategy": args.distributed_strategy,
+        "ddp_find_unused_parameters": (
+            True if args.distributed_strategy == "ddp" else None
+        ),
         "world_size": context.world_size,
         "cuda_total_memory_bytes": (
             int(torch.cuda.get_device_properties(torch.device(effective_device)).total_memory)
@@ -444,7 +461,7 @@ def main() -> None:
     if context.world_size > 1:
         if args.distributed_strategy == "ddp":
             model = torch.nn.parallel.DistributedDataParallel(
-                model, device_ids=[context.local_rank], output_device=context.local_rank
+                model, **_ddp_wrapper_kwargs(context.local_rank)
             )
         else:
             from torch.distributed.fsdp import FullyShardedDataParallel
@@ -486,6 +503,9 @@ def main() -> None:
     }
     execution_contract = {
         "distributed_strategy": args.distributed_strategy,
+        "ddp_find_unused_parameters": (
+            True if args.distributed_strategy == "ddp" else None
+        ),
         "world_size": context.world_size,
         "per_rank_batch_size": 1,
         "effective_global_batch_size": context.world_size * config.gradient_accumulation_steps,

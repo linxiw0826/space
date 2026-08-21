@@ -13,7 +13,8 @@ sys.path.insert(0, str(PROJECT / "src"))
 from parta.worker_trust import validate_python_worker, validate_torchrun_worker
 from scripts.parta.audit_a1o_drop_load import producer_record
 from parta.resource_profile_contract import (LAMBDA_STATE, normalize_profile_worker_argv,
-    checkpoint_artifact_identity, normalized_contract_sha256,
+    checkpoint_artifact_identity, normalize_profile_matched_execution,
+    normalized_contract_sha256,
     validate_preexecution_profile, validate_resolved_profile)
 from scripts.parta.freeze_pretrain_config import validate_profile_selected_config
 from scripts.parta.run_resource_profile import (collect_rank_failure_evidence,
@@ -39,6 +40,33 @@ def test_head_free_audit_producer_record_has_real_canonical_schema():
     assert Path(record["path"]).resolve().name == "audit_a1o_drop_load.py"
     assert record["sha256"] == sha256_file(Path(record["path"]))
     assert record["git_revision"] == "c" * 40
+
+
+def test_ddp_wrapper_contract_enables_unused_detection_for_matched_arms():
+    # The same wrapper constructor serves A0 and A1-O; the option is therefore
+    # arm-independent and applies to profiling and formal DDP execution alike.
+    assert train_parta_script._ddp_wrapper_kwargs(3) == {
+        "device_ids": [3],
+        "output_device": 3,
+        "find_unused_parameters": True,
+    }
+
+    common = {"world_size": 4}
+    assert normalize_profile_matched_execution({
+        **common,
+        "distributed_strategy": "ddp",
+        "ddp_find_unused_parameters": True,
+    }, "ddp") == common
+    assert normalize_profile_matched_execution({
+        **common,
+        "distributed_strategy": "fsdp",
+        "ddp_find_unused_parameters": None,
+    }, "fsdp") == common
+    with pytest.raises(ValueError, match="unused-parameter"):
+        normalize_profile_matched_execution({
+            "distributed_strategy": "ddp",
+            "ddp_find_unused_parameters": False,
+        }, "ddp")
 
 
 def test_validator_recomputation_rejects_tampered_counts_and_other_manifest():
@@ -460,6 +488,7 @@ def test_profile_to_coverage_reopen_contract_is_consistent(tmp_path):
         "lambda_state": LAMBDA_STATE, "per_rank_batch_size": 1,
         "effective_global_batch_size": 4, "gradient_accumulation_steps": 1,
         "gradient_checkpointing": True, "distributed_strategy": "fsdp",
+        "ddp_find_unused_parameters": None,
         "learning_rate": 2e-5, "weight_decay": 0.0, "max_grad_norm": 1.0,
         "dtype": "bfloat16", "num_workers": 4, "seed": 42,
         "required_frame_count": 32, "engineering_mode": "resource_profile",

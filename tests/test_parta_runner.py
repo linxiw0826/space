@@ -186,7 +186,8 @@ def test_matched_identity_rejects_non_whitelisted_drift():
 
 
 def test_matched_execution_identity_rejects_world_size_and_strategy_drift():
-    base = dict(distributed_strategy="fsdp", world_size=2, per_rank_batch_size=1,
+    base = dict(distributed_strategy="ddp", ddp_find_unused_parameters=True,
+                world_size=2, per_rank_batch_size=1,
                 effective_global_batch_size=2, source_content_identity={"adt": "abc"})
     kwargs = dict(manifest_sha256="1" * 64, initialization_sha256="2" * 64,
                   exact_frame_binding_sha256="3" * 64,
@@ -196,6 +197,7 @@ def test_matched_execution_identity_rejects_world_size_and_strategy_drift():
     a1o = matched_fairness_payload(PartATrainConfig(arm="a1o"), **kwargs,
                                    execution_contract=base)
     assert assert_matched_fairness(a0, a1o)
+    assert a0["execution_contract"]["ddp_find_unused_parameters"] is True
     drift = copy.deepcopy(a1o)
     drift["execution_contract"]["world_size"] = 1
     drift["execution_contract"]["distributed_strategy"] = "none"

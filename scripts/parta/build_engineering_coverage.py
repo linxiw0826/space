@@ -14,7 +14,8 @@ sys.path.insert(0, str(PROJECT / "src"))
 
 from parta.provenance import sha256_file, stable_sha256  # noqa: E402
 from parta.resource_profile_contract import (LAMBDA_STATE,
-    normalize_profile_worker_argv, normalized_contract_sha256,
+    normalize_profile_matched_execution, normalize_profile_worker_argv,
+    normalized_contract_sha256,
     validate_rank_failure_rows)  # noqa: E402
 from parta.resource_profile_contract import validate_preexecution_profile  # noqa: E402
 from parta.resource_profile_contract import validate_resolved_profile  # noqa: E402
@@ -202,9 +203,9 @@ def main() -> None:
         }
         if "matched_contract" in reopened:
             matched = reopened["matched_contract"]
-            execution = dict(matched.get("execution_contract", {}))
-            if execution.pop("distributed_strategy", None) != measurement["distributed_strategy"]:
-                raise ValueError("resource profile matched-contract strategy mismatch")
+            execution = normalize_profile_matched_execution(
+                matched.get("execution_contract", {}), measurement["distributed_strategy"]
+            )
             runtime_matched_normalized[measurement["distributed_strategy"]] = {
                 **matched, "execution_contract": execution
             }
