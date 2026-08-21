@@ -49,6 +49,50 @@ def test_eval_dry_run_uses_server_roots_and_timestamped_log(script_name, experim
     assert f"Log=/contract/logs/eval/{experiment_name}_vsibench_" in result.stdout
 
 
+@pytest.mark.parametrize(
+    ("script_name", "experiment_name"),
+    [
+        ("eval_e00b_mope_new_vlm4d.sh", "e00b_mope_new_projector_only_4b"),
+        ("eval_e03a_mope_new_vlm4d.sh", "e03a_mope_new_crossattn_two_stage_4b"),
+    ],
+)
+def test_vlm4d_eval_dry_run_contract(script_name, experiment_name):
+    root = Path.cwd()
+    env = os.environ.copy()
+    env.update(
+        {
+            "SPACE_ROOT": str(root),
+            "SPACE_OUTPUT_ROOT": "/contract/output",
+            "SPACE_LOG_ROOT": "/contract/logs",
+            "MOPE_NEW_ALLOW_MISSING_ASSETS": "1",
+            "DRY_RUN": "1",
+            "CUDA_VISIBLE_DEVICES": "7",
+            "NUM_PROCESSES": "1",
+            "MAIN_PORT": "29604",
+        }
+    )
+    result = subprocess.run(
+        ["bash", str(root / "scripts/idea1_feature/eval" / script_name)],
+        cwd=root,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert f"checkpoint=/contract/output/train/{experiment_name}" in result.stdout
+    assert f"output=/contract/output/eval/vlm4d/{experiment_name}" in result.stdout
+    assert f"Log=/contract/logs/eval/{experiment_name}_vlm4d_" in result.stdout
+    assert "--model qwen3_vl_mope_new_crossattn" in result.stdout
+    assert "--tasks vlm4d_real_mc_mope_new" in result.stdout
+    assert "checkpoint-50.pth" in result.stdout
+    assert "mope_all_frames=16" in result.stdout
+    assert "mope_sampling_rate=4" in result.stdout
+    assert "mope_input_size=224" in result.stdout
+    assert "mope_pool_mode=none" in result.stdout
+    assert "--num_processes=1" in result.stdout
+    assert "--main_process_port=29604" in result.stdout
+
+
 def test_shared_preprocessing_contract_for_ordered_images(tmp_path):
     paths = []
     for index in range(3):
