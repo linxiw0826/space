@@ -44,9 +44,122 @@ def test_eval_dry_run_uses_server_roots_and_timestamped_log(script_name, experim
         capture_output=True,
         check=True,
     )
-    assert f"checkpoint=/contract/output/train/{experiment_name}" in result.stdout
+    assert f"requested_checkpoint=/contract/output/train/{experiment_name}" in result.stdout
+    assert f"Effective_checkpoint=/contract/output/train/{experiment_name}" in result.stdout
     assert f"output=/contract/output/eval/vsibench/{experiment_name}" in result.stdout
     assert f"Log=/contract/logs/eval/{experiment_name}_vsibench_" in result.stdout
+    assert "--num_processes=4" in result.stdout
+    assert "CUDA_VISIBLE_DEVICES" not in result.stderr
+
+
+def test_vsibench_eval_promotes_exactly_two_flat_artifacts(tmp_path):
+    root = Path.cwd()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    accelerate = fake_bin / "accelerate"
+    accelerate.write_text(
+        """#!/usr/bin/env bash
+set -euo pipefail
+output=''
+while (($#)); do
+  if [[ "$1" == '--output_path' ]]; then output="$2"; shift 2; else shift; fi
+done
+mkdir -p "$output/train__fake"
+printf '{"results": {"vsibench": 0.5}}\\n' > "$output/train__fake/20260822_results.json"
+printf '{"doc_id": 1}\\n' > "$output/train__fake/20260822_samples_vsibench_mope_new.jsonl"
+"""
+    )
+    accelerate.chmod(0o755)
+    output_root = tmp_path / "output"
+    log_root = tmp_path / "logs"
+    experiment = "e02c_mope_new_crossattn_joint_4b"
+    result_dir = output_root / "eval" / "vsibench" / experiment
+    # An earlier valid result must remain until the replacement run succeeds.
+    result_dir.mkdir(parents=True)
+    (result_dir / "old_results.json").write_text("{}")
+    checkpoint = output_root / "train" / experiment / "checkpoint-5000"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "config.json").write_text("{}")
+    (checkpoint / "model-00001-of-00001.safetensors").write_text("weights")
+    (checkpoint / "model.safetensors.index.json").write_text(
+        '{"weight_map":{"x":"model-00001-of-00001.safetensors"}}'
+    )
+    mope_checkpoint = tmp_path / "checkpoint-50.pth"
+    mope_checkpoint.write_text("mope")
+    annotation = tmp_path / "test.jsonl"
+    annotation.write_text("{}\n")
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "SPACE_ROOT": str(root),
+            "SPACE_OUTPUT_ROOT": str(output_root),
+            "SPACE_LOG_ROOT": str(log_root),
+            "MOPE_NEW_CKPT": str(mope_checkpoint),
+            "VSIBENCH_JSONL": str(annotation),
+        }
+    )
+    completed = subprocess.run(
+        ["bash", str(root / "scripts/idea1_feature/eval/eval_e02c_mope_new_vsibench.sh")],
+        cwd=root,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert f"Effective_checkpoint={checkpoint}" in completed.stdout
+    assert sorted(path.name for path in result_dir.iterdir()) == [
+        f"{experiment}_results.json",
+        f"{experiment}_samples.jsonl",
+    ]
+    assert not list((output_root / "eval" / "vsibench").glob(f"{experiment}.work.*"))
+
+
+def test_failed_vsibench_eval_preserves_prior_results_and_cleans_workdir(tmp_path):
+    root = Path.cwd()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    accelerate = fake_bin / "accelerate"
+    accelerate.write_text("#!/usr/bin/env bash\nexit 9\n")
+    accelerate.chmod(0o755)
+    output_root = tmp_path / "output"
+    experiment = "e03a_mope_new_crossattn_two_stage_4b"
+    result_dir = output_root / "eval" / "vsibench" / experiment
+    result_dir.mkdir(parents=True)
+    old_result = result_dir / "old_results.json"
+    old_result.write_text('{"overall": 0.4}')
+    checkpoint = output_root / "train" / experiment / "checkpoint-7000"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "config.json").write_text("{}")
+    (checkpoint / "model.safetensors").write_text("weights")
+    (checkpoint / "model.safetensors.index.json").write_text(
+        '{"weight_map":{"x":"model.safetensors"}}'
+    )
+    mope_checkpoint = tmp_path / "checkpoint-50.pth"
+    mope_checkpoint.write_text("mope")
+    annotation = tmp_path / "test.jsonl"
+    annotation.write_text("{}\n")
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "SPACE_ROOT": str(root),
+            "SPACE_OUTPUT_ROOT": str(output_root),
+            "SPACE_LOG_ROOT": str(tmp_path / "logs"),
+            "MOPE_NEW_CKPT": str(mope_checkpoint),
+            "VSIBENCH_JSONL": str(annotation),
+        }
+    )
+    completed = subprocess.run(
+        ["bash", str(root / "scripts/idea1_feature/eval/eval_e03a_mope_new_vsibench.sh")],
+        cwd=root,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    assert completed.returncode == 9
+    assert old_result.read_text() == '{"overall": 0.4}'
+    assert not list((output_root / "eval" / "vsibench").glob(f"{experiment}.work.*"))
 
 
 @pytest.mark.parametrize(
