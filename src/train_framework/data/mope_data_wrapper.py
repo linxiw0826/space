@@ -16,6 +16,7 @@ from torch.utils.data import Dataset
 _IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 _IMAGENET_STD  = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 _VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov", ".mkv")
+_STRICT_MOPE_LOADING = False
 
 
 def _load_mope_frames(ann: dict, all_frames: int) -> torch.Tensor:
@@ -92,6 +93,10 @@ class MoPEDatasetWrapper(Dataset):
         try:
             item["raw_frames"] = _load_mope_frames(ann, self.mope_all_frames)
         except Exception as exc:
+            if _STRICT_MOPE_LOADING:
+                raise RuntimeError(
+                    f"strict MoPE frame loading failed for dataset index {i}"
+                ) from exc
             print(f"[MoPE] WARNING: frame load failed for idx {i} ({exc}), using zeros.")
             item["raw_frames"] = torch.zeros(3, self.mope_all_frames, 224, 224)
         return item

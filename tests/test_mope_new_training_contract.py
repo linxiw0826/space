@@ -7,6 +7,7 @@ import pytest
 from model.mope_new_encoder import load_projector_warmstart
 from model.mope_projector import MoPEProjectorCrossAttn
 from train_framework.train_space_mope_new import configure_trainability, validate_resume_scope
+from train_framework.data import mope_data_wrapper
 
 
 class FakeModel(nn.Module):
@@ -26,20 +27,18 @@ def save_projector(root, projector, mutate=None):
     torch.save(state, root / "pytorch_model.bin")
 
 
-def test_crossattn_accepts_1568_tokens():
+def test_crossattn_accepts_final515k_8_tokens():
     projector = MoPEProjectorCrossAttn(768, 16)
-    result = projector(torch.randn(1, 1568, 768), torch.randn(1, 9, 16))
+    result = projector(torch.randn(1, 8, 768), torch.randn(1, 9, 16))
     assert result.shape == (1, 9, 16)
 
 
 def test_trainability_contracts():
-    e00b = FakeModel()
-    counts = configure_trainability(e00b, "e00b-new")
-    assert counts["encoder"] == counts["other"] == 0 and counts["projector"] > 0
-    for experiment in ("e02c-new", "e03a-new"):
-        model = FakeModel()
-        counts = configure_trainability(model, experiment)
-        assert counts["encoder"] == 0 and counts["projector"] > 0 and counts["other"] > 0
+    model = FakeModel()
+    counts = configure_trainability(model, "e02c-new")
+    assert counts["encoder"] == 0 and counts["projector"] > 0 and counts["other"] > 0
+    with pytest.raises(ValueError, match="unknown"):
+        configure_trainability(FakeModel(), "e00b-new")
 
 
 def test_projector_warmstart_is_strict_and_trainable(tmp_path):
@@ -73,3 +72,19 @@ def test_resume_must_stay_in_own_output(tmp_path):
     validate_resume_scope(str(output / "checkpoint-1000"), str(output))
     with pytest.raises(ValueError):
         validate_resume_scope(str(tmp_path / "e00b" / "checkpoint-1000"), str(output))
+
+
+def test_strict_final515k_loading_never_falls_back_to_zeros(monkeypatch):
+    class Base:
+        list_data_dict = [{"image": ["missing.jpg"]}]
+        def __len__(self): return 1
+        def __getitem__(self, index): return {}
+
+    monkeypatch.setattr(mope_data_wrapper, "_STRICT_MOPE_LOADING", True)
+    monkeypatch.setattr(
+        mope_data_wrapper, "_load_mope_frames",
+        lambda annotation, frames: (_ for _ in ()).throw(ValueError("missing mope_video")),
+    )
+    wrapped = mope_data_wrapper.MoPEDatasetWrapper(Base(), mope_all_frames=16)
+    with pytest.raises(RuntimeError, match="strict MoPE frame loading failed"):
+        wrapped[0]

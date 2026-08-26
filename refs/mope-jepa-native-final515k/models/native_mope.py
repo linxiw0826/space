@@ -1,0 +1,327 @@
+from functools import partial
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from timm.models.layers import DropPath, trunc_normal_
+from timm.models.registry import register_model
+
+from .native_moe import NativeMoEFFN
+
+
+def get_sinusoid_encoding_table(n_position, d_hid):
+    def get_position_angle_vec(position):
+        return [
+            position / np.power(10000, 2 * (hid_j // 2) / d_hid)
+            for hid_j in range(d_hid)
+        ]
+    table = np.array([get_position_angle_vec(pos_i) for pos_i in range(n_position)])
+    table[:, 0::2] = np.sin(table[:, 0::2])
+    table[:, 1::2] = np.cos(table[:, 1::2])
+    return torch.tensor(table, dtype=torch.float, requires_grad=False).unsqueeze(0)
+
+
+def get_1d_sincos_pos_embed(embed_dim, positions):
+    if embed_dim % 2 != 0:
+        raise ValueError(f"1D sin-cos dim must be even, got {embed_dim}")
+    omega = np.arange(embed_dim // 2, dtype=np.float64)
+    omega /= embed_dim / 2.0
+    omega = 1.0 / (10000 ** omega)
+    out = np.einsum("m,d->md", positions.reshape(-1).astype(np.float64), omega)
+    return np.concatenate([np.sin(out), np.cos(out)], axis=1)
+
+
+def get_3d_sincos_encoding_table(num_time, grid_size, d_hid):
+    if d_hid % 6 != 0:
+        raise ValueError(f"3D sin-cos dim must be divisible by 6, got {d_hid}")
+    axis_dim = d_hid // 3
+    t = np.arange(num_time, dtype=np.float64)
+    h = np.arange(grid_size, dtype=np.float64)
+    w = np.arange(grid_size, dtype=np.float64)
+    tt, hh, ww = np.meshgrid(t, h, w, indexing="ij")
+    table = np.concatenate([
+        get_1d_sincos_pos_embed(axis_dim, tt.reshape(-1)),
+        get_1d_sincos_pos_embed(axis_dim, hh.reshape(-1)),
+        get_1d_sincos_pos_embed(axis_dim, ww.reshape(-1)),
+    ], axis=1)
+    return torch.tensor(table, dtype=torch.float, requires_grad=False).unsqueeze(0)
+
+
+class PatchEmbed(nn.Module):
+    def __init__(self, img_size=224, patch_size=16, in_chans=3,
+                 embed_dim=768, num_frames=16, tubelet_size=2):
+        super().__init__()
+        self.img_size = (img_size, img_size)
+        self.patch_size = (patch_size, patch_size)
+        self.tubelet_size = tubelet_size
+        self.num_time = num_frames // tubelet_size
+        self.num_spatial = (img_size // patch_size) * (img_size // patch_size)
+        self.num_patches = self.num_time * self.num_spatial
+        self.proj = nn.Conv3d(
+            in_chans, embed_dim,
+            kernel_size=(tubelet_size, patch_size, patch_size),
+            stride=(tubelet_size, patch_size, patch_size))
+
+    def forward(self, x):
+        bsz, _, _, height, width = x.shape
+        if (height, width) != self.img_size:
+            raise ValueError(f"expected image size {self.img_size}, got {(height, width)}")
+        return self.proj(x).flatten(2).transpose(1, 2)
+
+
+class CausalAttention(nn.Module):
+    def __init__(self, dim, num_heads=12, qkv_bias=True, attn_drop=0.0, proj_drop=0.0):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x, causal_mask):
+        bsz, n_tokens, dim = x.shape
+        qkv = self.qkv(x).reshape(bsz, n_tokens, 3, self.num_heads, dim // self.num_heads)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.masked_fill(causal_mask.view(1, 1, n_tokens, n_tokens), -torch.finfo(attn.dtype).max)
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+        x = (attn @ v).transpose(1, 2).reshape(bsz, n_tokens, dim)
+        return self.proj_drop(self.proj(x))
+
+
+class DenseFFN(nn.Module):
+    def __init__(self, dim, mlp_ratio=4.0, drop=0.0):
+        super().__init__()
+        hidden = int(dim * mlp_ratio)
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden),
+            nn.GELU(),
+            nn.Dropout(drop),
+            nn.Linear(hidden, dim),
+            nn.Dropout(drop),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class NativeBlock(nn.Module):
+    def __init__(self, dim, num_heads, mlp_ratio=4.0, qkv_bias=True,
+                 drop=0.0, attn_drop=0.0, drop_path=0.0, norm_layer=nn.LayerNorm,
+                 use_moe=False, num_experts=4, top_k=2, num_shared_experts=1,
+                 router_score_func="sigmoid", router_bias_update_speed=0.001):
+        super().__init__()
+        self.use_moe = use_moe
+        self.norm1 = norm_layer(dim)
+        self.attn = CausalAttention(dim, num_heads=num_heads, qkv_bias=qkv_bias,
+                                    attn_drop=attn_drop, proj_drop=drop)
+        self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
+        self.norm2 = norm_layer(dim)
+        if use_moe:
+            self.mlp = NativeMoEFFN(
+                dim, mlp_ratio=mlp_ratio, num_experts=num_experts, top_k=top_k,
+                num_shared_experts=num_shared_experts, drop=drop,
+                router_score_func=router_score_func,
+                router_bias_update_speed=router_bias_update_speed)
+        else:
+            self.mlp = DenseFFN(dim, mlp_ratio=mlp_ratio, drop=drop)
+
+    def forward(self, x, causal_mask, record_stats=True):
+        x = x + self.drop_path(self.attn(self.norm1(x), causal_mask))
+        if self.use_moe:
+            x = x + self.drop_path(self.mlp(self.norm2(x), record_stats=record_stats))
+        else:
+            x = x + self.drop_path(self.mlp(self.norm2(x)))
+        return x
+
+
+class FutureJEPAPredictor(nn.Module):
+    def __init__(self, num_patches, encoder_dim=768, predictor_dim=384,
+                 depth=6, num_heads=6, norm_layer=partial(nn.LayerNorm, eps=1e-6),
+                 pos_embed_type="learnable_1d", num_time=None, grid_size=None):
+        super().__init__()
+        self.predictor_dim = predictor_dim
+        self.input_proj = nn.Linear(encoder_dim, predictor_dim)
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, predictor_dim))
+        self.pos_embed_type = pos_embed_type
+        if pos_embed_type == "learnable_1d":
+            self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, predictor_dim))
+        elif pos_embed_type == "fixed_1d":
+            self.register_buffer("pos_embed", get_sinusoid_encoding_table(num_patches, predictor_dim), persistent=False)
+        elif pos_embed_type == "3d_sincos":
+            if num_time is None or grid_size is None:
+                raise ValueError("num_time and grid_size are required for 3D predictor positional embedding")
+            self.register_buffer("pos_embed", get_3d_sincos_encoding_table(num_time, grid_size, predictor_dim), persistent=False)
+        else:
+            raise ValueError(f"unknown predictor pos_embed_type: {pos_embed_type}")
+        self.blocks = nn.ModuleList([
+            NativeBlock(predictor_dim, num_heads, mlp_ratio=4.0, qkv_bias=True,
+                        norm_layer=norm_layer, use_moe=False)
+            for _ in range(depth)
+        ])
+        self.norm = norm_layer(predictor_dim)
+        self.output_proj = nn.Linear(predictor_dim, encoder_dim)
+        trunc_normal_(self.mask_token, std=0.02)
+        if isinstance(self.pos_embed, nn.Parameter):
+            trunc_normal_(self.pos_embed, std=0.02)
+
+    def forward(self, x_context, target_mask, causal_mask):
+        bsz, n_context, _ = x_context.shape
+        n_all = target_mask.shape[0]
+        x_context = self.input_proj(x_context)
+        pos = self.pos_embed.expand(bsz, -1, -1)
+        context_mask = ~target_mask
+        x_context = x_context + pos[:, context_mask]
+        n_target = int(target_mask.sum().item())
+        x_target = self.mask_token.expand(bsz, n_target, -1) + pos[:, target_mask]
+        x = torch.cat([x_context, x_target], dim=1)
+        order = torch.cat([
+            torch.nonzero(context_mask, as_tuple=False).flatten(),
+            torch.nonzero(target_mask, as_tuple=False).flatten(),
+        ])
+        local_mask = causal_mask.index_select(0, order).index_select(1, order)
+        for block in self.blocks:
+            x = block(x, local_mask, record_stats=False)
+        x = self.norm(x)
+        return self.output_proj(x[:, n_context:])
+
+
+class NativeMoPEJEPA(nn.Module):
+    def __init__(self, img_size=224, patch_size=16, encoder_in_chans=3,
+                 encoder_embed_dim=768, encoder_depth=8, encoder_num_heads=12,
+                 predictor_dim=384, predictor_depth=6, predictor_num_heads=6,
+                 mlp_ratio=4.0, qkv_bias=True, drop_rate=0.0, attn_drop_rate=0.0,
+                 drop_path_rate=0.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
+                 all_frames=16, tubelet_size=2, dense_layers=4, num_experts=4,
+                 top_k=2, num_shared_experts=1, router_score_func="sigmoid",
+                 router_bias_update_speed=0.001, anchor_candidates=(0, 1, 2, 3, 4, 5, 6),
+                 num_anchors=3, anchor_weights=(1.35, 1.25, 1.15, 1.0, 0.9, 0.8, 0.7),
+                 pos_embed_type="fixed_1d", predictor_pos_embed_type="learnable_1d"):
+        super().__init__()
+        self.patch_embed = PatchEmbed(img_size, patch_size, encoder_in_chans,
+                                      encoder_embed_dim, all_frames, tubelet_size)
+        self.num_patches = self.patch_embed.num_patches
+        self.num_time = self.patch_embed.num_time
+        self.num_spatial = self.patch_embed.num_spatial
+        self.grid_size = int(round(self.num_spatial ** 0.5))
+        if self.grid_size * self.grid_size != self.num_spatial:
+            raise ValueError(f"num_spatial must be a square grid, got {self.num_spatial}")
+        self.pos_embed_type = pos_embed_type
+        self.predictor_pos_embed_type = predictor_pos_embed_type
+        self.num_anchors = int(num_anchors)
+        self.anchor_candidates = tuple(int(x) for x in anchor_candidates)
+        self.register_buffer("anchor_weight_table", torch.tensor(anchor_weights, dtype=torch.float32))
+        if pos_embed_type == "fixed_1d":
+            pos_embed = get_sinusoid_encoding_table(self.num_patches, encoder_embed_dim)
+        elif pos_embed_type == "3d_sincos":
+            pos_embed = get_3d_sincos_encoding_table(self.num_time, self.grid_size, encoder_embed_dim)
+        else:
+            raise ValueError(f"unknown encoder pos_embed_type: {pos_embed_type}")
+        self.register_buffer("pos_embed", pos_embed, persistent=False)
+        time_ids = torch.arange(self.num_time).repeat_interleave(self.num_spatial)
+        self.register_buffer("time_ids", time_ids, persistent=False)
+        self.register_buffer(
+            "causal_mask",
+            time_ids.view(1, -1) > time_ids.view(-1, 1),
+            persistent=False)
+
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, encoder_depth)]
+        self.blocks = nn.ModuleList([
+            NativeBlock(
+                encoder_embed_dim, encoder_num_heads, mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias, drop=drop_rate, attn_drop=attn_drop_rate,
+                drop_path=dpr[i], norm_layer=norm_layer, use_moe=(i >= dense_layers),
+                num_experts=num_experts, top_k=top_k,
+                num_shared_experts=num_shared_experts,
+                router_score_func=router_score_func,
+                router_bias_update_speed=router_bias_update_speed)
+            for i in range(encoder_depth)
+        ])
+        self.norm = norm_layer(encoder_embed_dim)
+        self.predictor = FutureJEPAPredictor(
+            self.num_patches, encoder_dim=encoder_embed_dim,
+            predictor_dim=predictor_dim, depth=predictor_depth,
+            num_heads=predictor_num_heads,
+            pos_embed_type=predictor_pos_embed_type,
+            num_time=self.num_time, grid_size=self.grid_size)
+        self._last_x = None
+        self._route_stats = None
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            trunc_normal_(module.weight, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.LayerNorm):
+            nn.init.ones_(module.weight)
+            nn.init.zeros_(module.bias)
+
+    def encode_tokens(self, tokens, token_mask=None, record_stats=True):
+        if token_mask is None:
+            token_mask = torch.zeros(tokens.shape[1], device=tokens.device, dtype=torch.bool)
+        keep_idx = (~token_mask).nonzero(as_tuple=False).flatten()
+        x = tokens.index_select(1, keep_idx)
+        local_mask = self.causal_mask.index_select(0, keep_idx).index_select(1, keep_idx)
+        route_stats = []
+        for idx, block in enumerate(self.blocks):
+            x = block(x, local_mask, record_stats=record_stats)
+            if record_stats and block.use_moe:
+                stats = block.mlp.last_route_stats
+                if stats is not None:
+                    route_stats.append((idx, stats))
+        x = self.norm(x)
+        if record_stats:
+            self._last_x = x
+            self._route_stats = route_stats
+        return x
+
+    def patchify(self, x):
+        tokens = self.patch_embed(x)
+        return tokens + self.pos_embed.type_as(tokens).to(tokens.device)
+
+    def encode(self, x, token_mask=None, record_stats=True):
+        return self.encode_tokens(self.patchify(x), token_mask=token_mask, record_stats=record_stats)
+
+    def sample_anchors(self, device):
+        candidates = torch.tensor(self.anchor_candidates, device=device, dtype=torch.long)
+        perm = torch.randperm(candidates.numel(), device=device)
+        return candidates.index_select(0, perm[:self.num_anchors]).sort().values
+
+    def forward(self, x):
+        tokens = self.patchify(x)
+        with torch.no_grad():
+            target_latents = self.encode_tokens(tokens, token_mask=None, record_stats=False).detach()
+        anchors = self.sample_anchors(x.device)
+        weighted_loss = tokens.new_zeros(())
+        weight_sum = tokens.new_zeros(())
+        losses = {}
+        last_context = None
+        last_stats = None
+        for anchor in anchors.tolist():
+            target_mask = self.time_ids > anchor
+            context_latents = self.encode_tokens(tokens, token_mask=target_mask, record_stats=True)
+            last_context = context_latents
+            last_stats = self._route_stats
+            pred = self.predictor(context_latents, target_mask, self.causal_mask)
+            target = target_latents[:, target_mask]
+            loss = F.mse_loss(pred, target)
+            weight = self.anchor_weight_table[anchor].to(device=x.device, dtype=loss.dtype)
+            weighted_loss = weighted_loss + weight * loss
+            weight_sum = weight_sum + weight
+            losses[f"anchor_{anchor}"] = loss.detach()
+        self._last_x = last_context
+        self._route_stats = last_stats
+        future_loss = weighted_loss / weight_sum.clamp_min(1e-6)
+        return future_loss, losses, anchors.detach()
+
+
+@register_model
+def native_mope_jepa_base_patch16_224(pretrained=False, **kwargs):
+    del pretrained
+    return NativeMoPEJEPA(img_size=224, patch_size=16, **kwargs)

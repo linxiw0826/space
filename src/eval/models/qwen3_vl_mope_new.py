@@ -29,26 +29,30 @@ class Qwen3VLMoPENewCrossAttn(Qwen3_VL_MoPE_CrossAttn):
         mope_checkpoint_path: str,
         mope_source_root: str = str(DEFAULT_SOURCE_ROOT),
         mope_all_frames: int = 16,
-        mope_sampling_rate: int = 4,
+        mope_groups: int = 4,
+        mope_frames_per_group: int = 4,
         mope_input_size: int = 224,
-        mope_pool_mode: str = "none",
+        mope_pool_mode: str = "temporal",
         **kwargs,
     ) -> None:
         mope_all_frames = int(mope_all_frames)
-        mope_sampling_rate = int(mope_sampling_rate)
+        mope_groups = int(mope_groups)
+        mope_frames_per_group = int(mope_frames_per_group)
         mope_input_size = int(mope_input_size)
-        if mope_pool_mode not in POOL_IDS:
-            raise ValueError(f"invalid MoPE-new pool mode: {mope_pool_mode}")
+        if (mope_all_frames, mope_groups, mope_frames_per_group, mope_pool_mode) != (16, 4, 4, "temporal"):
+            raise ValueError("final515k eval requires 16 frames sampled as 4x4 with temporal pooling")
         Qwen3_VL_MY.__init__(self, pretrained=pretrained, **kwargs)
         self.mope_all_frames = mope_all_frames
-        self.mope_sampling_rate = mope_sampling_rate
+        self.mope_groups = mope_groups
+        self.mope_frames_per_group = mope_frames_per_group
         self.mope_input_size = mope_input_size
         self.mope_pool_mode = mope_pool_mode
         inner = self._model.model
         llm_dim = self._model.config.text_config.hidden_size
         encoder = MoPENewEncoder(
             mope_checkpoint_path, source_root=mope_source_root,
-            num_frames=mope_all_frames, sampling_rate=mope_sampling_rate,
+            num_frames=mope_all_frames, groups=mope_groups,
+            frames_per_group=mope_frames_per_group,
             input_size=mope_input_size, pool_mode=mope_pool_mode,
         )
         projector = MoPEProjectorCrossAttn(mope_dim=768, llm_dim=llm_dim)
@@ -59,13 +63,12 @@ class Qwen3VLMoPENewCrossAttn(Qwen3_VL_MoPE_CrossAttn):
         inner._mope_encoder.to(device=reference.device, dtype=reference.dtype)
         inner._mope_projector.to(device=reference.device, dtype=reference.dtype)
         _patch_model_for_mope_crossattn(self._model)
-        expected_tokens = 1568 if mope_pool_mode == "none" else 8 if mope_pool_mode == "temporal" else 1
         print(
-            "[MoPE-new eval] "
+            "[MoPE-final515k eval] "
             f"checkpoint={pretrained}, model=qwen3_vl_mope_new_crossattn, "
             f"mope_checkpoint={mope_checkpoint_path}, frames={mope_all_frames}, "
-            f"sampling_rate={mope_sampling_rate}, pool={mope_pool_mode}, "
-            f"expected_features=[B,{expected_tokens},768]",
+            f"sampling=4x4, pos=3d_sincos, pool={mope_pool_mode}, "
+            "expected_features=[B,8,768]",
             flush=True,
         )
 
@@ -80,7 +83,8 @@ class Qwen3VLMoPENewCrossAttn(Qwen3_VL_MoPE_CrossAttn):
         if video is None:
             raise ValueError("MoPE-new eval requires a video path; refusing to skip MoPE")
         frames = load_video_for_mope_new(
-            video, num_frames=self.mope_all_frames,
-            sampling_rate=self.mope_sampling_rate, input_size=self.mope_input_size,
+            video, groups=self.mope_groups,
+            frames_per_group=self.mope_frames_per_group,
+            input_size=self.mope_input_size,
         )
         return frames.unsqueeze(0)

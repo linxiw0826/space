@@ -12,17 +12,16 @@ DRY_RUN="${DRY_RUN:-0}"
 ALLOW_MISSING="${MOPE_NEW_ALLOW_MISSING_ASSETS:-0}"
 OUTPUT_ROOT="${SPACE_OUTPUT_ROOT:-${SPACE_ROOT}/output}"
 LOG_DIR="${LOG_DIR:-${SPACE_LOG_ROOT:-${SPACE_ROOT}/logs}/eval}"
-MOPE_NEW_SOURCE_ROOT="${MOPE_NEW_SOURCE_ROOT:-${SPACE_ROOT}/refs/mope_new}"
-MOPE_NEW_CKPT="${MOPE_NEW_CKPT:-/data2/mope-jepa-assets/jepa_checkpoints/native_mope8_dense4_moe4_top2_wisa_dyn_3dpos/checkpoint-50.pth}"
+MOPE_NEW_SOURCE_ROOT="${MOPE_NEW_SOURCE_ROOT:-${SPACE_ROOT}/refs/mope-jepa-native-final515k}"
+MOPE_NEW_CKPT="${MOPE_NEW_CKPT:-/data2/mope-jepa-assets/jepa_checkpoints/native_mope_b_dense8_moe8_top1_shared1_anchor1_final515k_3dpos_ep100_warm3_cos_lr75e6_min25e6/checkpoint-50.pth}"
 GUIDE_LMMS_EVAL="${GUIDE_LMMS_EVAL:-${SPACE_ROOT}/src/vendor/lmms-eval}"
 VLM4D_VIDEO_ROOT="${VLM4D_VIDEO_ROOT:-/data2/wlx/data/VLM4D}"
 VLM4D_JSONL="${VLM4D_JSONL:-${VLM4D_VIDEO_ROOT}/QA/real_mc.json}"
 export VLM4D_VIDEO_ROOT
 
 case "${MOPE_NEW_EXPERIMENT}" in
-  e00b-new) NAME=e00b_mope_new_projector_only_4b ;;
-  e03a-new) NAME=e03a_mope_new_crossattn_two_stage_4b ;;
-  *) echo "Unknown MoPE-new VLM4D experiment: ${MOPE_NEW_EXPERIMENT}" >&2; exit 2 ;;
+  e02c-new) NAME=e02c_mope_new_crossattn_joint_4b ;;
+  *) echo "final515k VLM4D eval only supports e02c-new; old wrappers are historical" >&2; exit 2 ;;
 esac
 
 CKPT_PATH="${CKPT_PATH:-${OUTPUT_ROOT}/train/${NAME}}"
@@ -42,7 +41,7 @@ if [[ "${ALLOW_MISSING}" != "1" ]]; then
   [[ -f "${VLM4D_JSONL}" ]] || { echo "Missing VLM4D real_mc annotations: ${VLM4D_JSONL}" >&2; exit 2; }
 fi
 
-MODEL_ARGS="pretrained=${CKPT_PATH},mope_checkpoint_path=${MOPE_NEW_CKPT},mope_source_root=${MOPE_NEW_SOURCE_ROOT},mope_all_frames=16,mope_sampling_rate=4,mope_input_size=224,mope_pool_mode=none,max_pixels=268324,min_pixels=8192,attn_implementation=flash_attention_2"
+MODEL_ARGS="pretrained=${CKPT_PATH},mope_checkpoint_path=${MOPE_NEW_CKPT},mope_source_root=${MOPE_NEW_SOURCE_ROOT},mope_all_frames=16,mope_groups=4,mope_frames_per_group=4,mope_input_size=224,mope_pool_mode=temporal,max_pixels=268324,min_pixels=8192,attn_implementation=flash_attention_2"
 COMMAND=(accelerate launch "--num_processes=${NUM_PROCESSES}" "--main_process_port=${MAIN_PORT}"
   -m lmms_eval --model qwen3_vl_mope_new_crossattn --model_args "${MODEL_ARGS}"
   --include_path "${TASK_DIR}" --tasks "${TASK_NAME}"
@@ -51,7 +50,7 @@ COMMAND=(accelerate launch "--num_processes=${NUM_PROCESSES}" "--main_process_po
 
 echo "Experiment=${MOPE_NEW_EXPERIMENT} checkpoint=${CKPT_PATH}"
 echo "Model=qwen3_vl_mope_new_crossattn MoPE=${MOPE_NEW_CKPT}"
-echo "frames=16 sampling_rate=4 input=224 pool=none expected=[B,1568,768]"
+echo "frames=16 sampling=4x4 pos=3d_sincos input=224 pool=temporal expected=[B,8,768]"
 echo "VLM4D real_mc=${VLM4D_JSONL} video_root=${VLM4D_VIDEO_ROOT} output=${RESULTS_DIR}"
 echo "Log=${LOG_FILE}"
 printf 'COMMAND:'; printf ' %q' "${COMMAND[@]}"; printf '\n'

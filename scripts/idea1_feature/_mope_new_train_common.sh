@@ -12,8 +12,8 @@ DRY_RUN="${DRY_RUN:-0}"
 ALLOW_MISSING="${MOPE_NEW_ALLOW_MISSING_ASSETS:-0}"
 OUTPUT_ROOT="${SPACE_OUTPUT_ROOT:-${SPACE_ROOT}/output}"
 LOG_DIR="${LOG_DIR:-${SPACE_LOG_ROOT:-${SPACE_ROOT}/logs}/train}"
-MOPE_NEW_SOURCE_ROOT="${MOPE_NEW_SOURCE_ROOT:-${SPACE_ROOT}/refs/mope_new}"
-MOPE_NEW_CKPT="${MOPE_NEW_CKPT:-/data2/mope-jepa-assets/jepa_checkpoints/native_mope8_dense4_moe4_top2_wisa_dyn_3dpos/checkpoint-50.pth}"
+MOPE_NEW_SOURCE_ROOT="${MOPE_NEW_SOURCE_ROOT:-${SPACE_ROOT}/refs/mope-jepa-native-final515k}"
+MOPE_NEW_CKPT="${MOPE_NEW_CKPT:-/data2/mope-jepa-assets/jepa_checkpoints/native_mope_b_dense8_moe8_top1_shared1_anchor1_final515k_3dpos_ep100_warm3_cos_lr75e6_min25e6/checkpoint-50.pth}"
 GUIDE_CKPT_PATH="${GUIDE_CKPT_PATH:-${OUTPUT_ROOT}/train/guide_reproduced/4b}"
 VGGT_PATH="${VGGT_PATH:-/data2/wlx/models/VGGT-1B}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
@@ -26,23 +26,11 @@ export VSI590K_VIDEO_ANN="${VSI590K_VIDEO_ANN:-/data2/wlx/data/vsi590k_processed
 export VSI590K_DATA_ROOT="${VSI590K_DATA_ROOT:-/data2/wlx/data/vsi590k_processed}"
 
 case "${MOPE_NEW_EXPERIMENT}" in
-  e00b-new)
-    OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_ROOT}/train/e00b_mope_new_projector_only_4b}"
-    TUNE_LLM=False
-    GRAD_ACCUM=6
-    WARMSTART=""
-    ;;
   e02c-new)
     OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_ROOT}/train/e02c_mope_new_crossattn_joint_4b}"
     TUNE_LLM=True
     GRAD_ACCUM=6
     WARMSTART=""
-    ;;
-  e03a-new)
-    OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_ROOT}/train/e03a_mope_new_crossattn_two_stage_4b}"
-    TUNE_LLM=True
-    GRAD_ACCUM=6
-    WARMSTART="${MOPE_PROJECTOR_WARMSTART_PATH:-${OUTPUT_ROOT}/train/e00b_mope_new_projector_only_4b}"
     ;;
   *) echo "Unknown MoPE-new experiment: ${MOPE_NEW_EXPERIMENT}" >&2; exit 2 ;;
 esac
@@ -62,9 +50,6 @@ if [[ "${ALLOW_MISSING}" != "1" ]]; then
   [[ -d "${GUIDE_CKPT_PATH}" ]] || { echo "Missing GUIDE checkpoint: ${GUIDE_CKPT_PATH}" >&2; exit 2; }
   [[ -d "${VGGT_PATH}" ]] || { echo "Missing VGGT: ${VGGT_PATH}" >&2; exit 2; }
   [[ -f "${MOPE_NEW_SOURCE_ROOT}/models/native_mope.py" ]] || { echo "Incomplete MoPE-new source" >&2; exit 2; }
-  if [[ "${MOPE_NEW_EXPERIMENT}" == "e03a-new" ]]; then
-    [[ -d "${WARMSTART}" ]] || { echo "Missing E-00b-new warm-start: ${WARMSTART}" >&2; exit 2; }
-  fi
 fi
 
 COMMAND=(python -m torch.distributed.run "--nproc_per_node=${NPROC_PER_NODE}" "--master_port=${MASTER_PORT}"
@@ -91,13 +76,13 @@ COMMAND=(python -m torch.distributed.run "--nproc_per_node=${NPROC_PER_NODE}" "-
   --mope_checkpoint_path "${MOPE_NEW_CKPT}" --mope_all_frames 16
   --mope_new_experiment "${MOPE_NEW_EXPERIMENT}"
   --mope_new_source_root "${MOPE_NEW_SOURCE_ROOT}"
-  --mope_new_sampling_rate 4 --mope_new_input_size 224 --mope_new_pool_mode none
+  --mope_new_groups 4 --mope_new_frames_per_group 4
+  --mope_new_input_size 224 --mope_new_pool_mode temporal
   --group_by_modality_length True)
-[[ -n "${WARMSTART}" ]] && COMMAND+=(--mope_projector_warmstart_path "${WARMSTART}")
 [[ -n "${RESUME_FROM_CHECKPOINT}" ]] && COMMAND+=(--resume_from_checkpoint "${RESUME_FROM_CHECKPOINT}")
 
 echo "Experiment=${MOPE_NEW_EXPERIMENT} train_llm=${TUNE_LLM} train_projector=True train_mope=False grad_accum=${GRAD_ACCUM} effective_batch=$((2 * NPROC_PER_NODE * GRAD_ACCUM))"
-echo "MoPE=${MOPE_NEW_CKPT} frames=16 sampling_rate=4 input=224 pool=none expected=[B,1568,768]"
+echo "MoPE=${MOPE_NEW_CKPT} architecture=dense8+moe8/top1/shared1 pos=3d_sincos frames=16 sampling=4x4 input=224 pool=temporal expected=[B,8,768]"
 echo "Output=${OUTPUT_DIR} warmstart=${WARMSTART:-none} resume=${RESUME_FROM_CHECKPOINT:-none}"
 echo "Log=${LOG_FILE}"
 printf 'COMMAND:'; printf ' %q' "${COMMAND[@]}"; printf '\n'

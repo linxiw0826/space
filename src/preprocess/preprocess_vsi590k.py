@@ -141,6 +141,7 @@ def to_llava_video_format(
 def to_spar_format(
     doc: dict,
     frame_rel_paths: list[str],
+    video_rel_path: str,
     sample_id: str,
     question_text: str,
 ) -> dict:
@@ -153,6 +154,7 @@ def to_spar_format(
             {"from": "gpt", "value": "{answer}"}
         ],
         "images": ["frames/...", ...],
+        "mope_video": "videos/.../scene.mp4",
         "question_type": "...",
         "spar_info": "{...}"
     }
@@ -173,6 +175,9 @@ def to_spar_format(
             {"from": "gpt", "value": str(doc["ground_truth"])},
         ],
         "image": frame_rel_paths,
+        # MoPE-final515k sidecar must sample its official 4x4 frames from the
+        # complete video; GUIDE continues to consume the eight SPAR images.
+        "mope_video": video_rel_path,
         "question_type": doc["question_type"],
         "spar_info": spar_info,
     }
@@ -373,7 +378,10 @@ def main():
             continue
 
         spar_records.append(
-            to_spar_format(doc, frame_rel_paths, sample_id + "_spar", question_text)
+            to_spar_format(
+                doc, frame_rel_paths, str(video_abs.resolve()),
+                sample_id + "_spar", question_text
+            )
         )
 
     # ── 6. 保存 JSON ──────────────────────────────────────────────────────────

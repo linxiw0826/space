@@ -12,18 +12,16 @@ DRY_RUN="${DRY_RUN:-0}"
 ALLOW_MISSING="${MOPE_NEW_ALLOW_MISSING_ASSETS:-0}"
 OUTPUT_ROOT="${SPACE_OUTPUT_ROOT:-${SPACE_ROOT}/output}"
 LOG_DIR="${LOG_DIR:-${SPACE_LOG_ROOT:-${SPACE_ROOT}/logs}/eval}"
-MOPE_NEW_SOURCE_ROOT="${MOPE_NEW_SOURCE_ROOT:-${SPACE_ROOT}/refs/mope_new}"
-MOPE_NEW_CKPT="${MOPE_NEW_CKPT:-/data2/mope-jepa-assets/jepa_checkpoints/native_mope8_dense4_moe4_top2_wisa_dyn_3dpos/checkpoint-50.pth}"
+MOPE_NEW_SOURCE_ROOT="${MOPE_NEW_SOURCE_ROOT:-${SPACE_ROOT}/refs/mope-jepa-native-final515k}"
+MOPE_NEW_CKPT="${MOPE_NEW_CKPT:-/data2/mope-jepa-assets/jepa_checkpoints/native_mope_b_dense8_moe8_top1_shared1_anchor1_final515k_3dpos_ep100_warm3_cos_lr75e6_min25e6/checkpoint-50.pth}"
 GUIDE_LMMS_EVAL="${GUIDE_LMMS_EVAL:-${SPACE_ROOT}/src/vendor/lmms-eval}"
 VSIBENCH_VIDEO_ROOT="${VSIBENCH_VIDEO_ROOT:-/data2/wlx/data/VSIBench}"
 VSIBENCH_JSONL="${VSIBENCH_JSONL:-${VSIBENCH_VIDEO_ROOT}/test.jsonl}"
 export VSIBENCH_VIDEO_ROOT VSIBENCH_JSONL
 
 case "${MOPE_NEW_EXPERIMENT}" in
-  e00b-new) NAME=e00b_mope_new_projector_only_4b ;;
   e02c-new) NAME=e02c_mope_new_crossattn_joint_4b ;;
-  e03a-new) NAME=e03a_mope_new_crossattn_two_stage_4b ;;
-  *) echo "Unknown MoPE-new experiment: ${MOPE_NEW_EXPERIMENT}" >&2; exit 2 ;;
+  *) echo "final515k eval only supports e02c-new; old E-00b/E-03a wrappers are historical" >&2; exit 2 ;;
 esac
 REQUESTED_CKPT_PATH="${CKPT_PATH:-${OUTPUT_ROOT}/train/${NAME}}"
 CKPT_PATH="${REQUESTED_CKPT_PATH}"
@@ -81,7 +79,7 @@ PY
   [[ -f "${VSIBENCH_JSONL}" ]] || { echo "Missing VSI-Bench annotations: ${VSIBENCH_JSONL}" >&2; exit 2; }
 fi
 
-MODEL_ARGS="pretrained=${CKPT_PATH},mope_checkpoint_path=${MOPE_NEW_CKPT},mope_source_root=${MOPE_NEW_SOURCE_ROOT},mope_all_frames=16,mope_sampling_rate=4,mope_input_size=224,mope_pool_mode=none,max_pixels=268324,min_pixels=8192,attn_implementation=flash_attention_2"
+MODEL_ARGS="pretrained=${CKPT_PATH},mope_checkpoint_path=${MOPE_NEW_CKPT},mope_source_root=${MOPE_NEW_SOURCE_ROOT},mope_all_frames=16,mope_groups=4,mope_frames_per_group=4,mope_input_size=224,mope_pool_mode=temporal,max_pixels=268324,min_pixels=8192,attn_implementation=flash_attention_2"
 COMMAND=(accelerate launch "--num_processes=${NUM_PROCESSES}" "--main_process_port=${MAIN_PORT}"
   -m lmms_eval --model qwen3_vl_mope_new_crossattn --model_args "${MODEL_ARGS}"
   --include_path "${TASK_DIR}" --tasks vsibench_mope_new
@@ -91,7 +89,7 @@ COMMAND=(accelerate launch "--num_processes=${NUM_PROCESSES}" "--main_process_po
 echo "Experiment=${MOPE_NEW_EXPERIMENT} requested_checkpoint=${REQUESTED_CKPT_PATH}"
 echo "Effective_checkpoint=${CKPT_PATH}"
 echo "Model=qwen3_vl_mope_new_crossattn MoPE=${MOPE_NEW_CKPT}"
-echo "frames=16 sampling_rate=4 input=224 pool=none expected=[B,1568,768]"
+echo "frames=16 sampling=4x4 pos=3d_sincos input=224 pool=temporal expected=[B,8,768]"
 echo "VSI-Bench=${VSIBENCH_JSONL} video_root=${VSIBENCH_VIDEO_ROOT} output=${RESULTS_DIR}"
 echo "Log=${LOG_FILE}"
 printf 'COMMAND:'; printf ' %q' "${COMMAND[@]}"; printf '\n'

@@ -1,4 +1,4 @@
-"""Isolated training entry point for E-00b-new, E-02c-new and E-03a-new."""
+"""Training entry point for the final515k E-02c-new Paper 1 experiment."""
 
 from __future__ import annotations
 
@@ -11,21 +11,20 @@ from model.mope_new_encoder import (
     DEFAULT_SOURCE_ROOT,
     MoPENewEncoder,
     load_annotation_for_mope_new,
-    load_projector_warmstart,
 )
 
 
-EXPERIMENTS = {"e00b-new", "e02c-new", "e03a-new"}
+EXPERIMENTS = {"e02c-new"}
 
 
 def _take_new_args(argv: list[str]):
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--mope_new_experiment", required=True, choices=sorted(EXPERIMENTS))
     parser.add_argument("--mope_new_source_root", default=str(DEFAULT_SOURCE_ROOT))
-    parser.add_argument("--mope_new_sampling_rate", type=int, default=4)
+    parser.add_argument("--mope_new_groups", type=int, default=4)
+    parser.add_argument("--mope_new_frames_per_group", type=int, default=4)
     parser.add_argument("--mope_new_input_size", type=int, default=224)
-    parser.add_argument("--mope_new_pool_mode", choices=("none", "temporal", "mean"), default="none")
-    parser.add_argument("--mope_projector_warmstart_path", default="")
+    parser.add_argument("--mope_new_pool_mode", choices=("temporal",), default="temporal")
     args, remaining = parser.parse_known_args(argv)
     return args, remaining
 
@@ -43,17 +42,13 @@ def validate_resume_scope(resume: str, output_dir: str) -> None:
 
 
 def configure_trainability(model, experiment: str) -> dict[str, int]:
-    if experiment not in EXPERIMENTS:
+    if experiment != "e02c-new":
         raise ValueError(f"unknown MoPE-new experiment: {experiment}")
     inner = model.model
     for parameter in inner._mope_encoder.parameters():
         parameter.requires_grad_(False)
     for parameter in inner._mope_projector.parameters():
         parameter.requires_grad_(True)
-    if experiment == "e00b-new":
-        for name, parameter in model.named_parameters():
-            if "._mope_projector." not in name:
-                parameter.requires_grad_(False)
     counts = {
         "encoder": sum(p.numel() for p in inner._mope_encoder.parameters() if p.requires_grad),
         "projector": sum(p.numel() for p in inner._mope_projector.parameters() if p.requires_grad),
@@ -62,10 +57,8 @@ def configure_trainability(model, experiment: str) -> dict[str, int]:
             if p.requires_grad and "._mope_projector." not in name and "._mope_encoder." not in name
         ),
     }
-    if counts["encoder"] != 0 or counts["projector"] == 0:
+    if counts["encoder"] != 0 or counts["projector"] == 0 or counts["other"] == 0:
         raise RuntimeError(f"invalid MoPE-new trainability: {counts}")
-    if experiment == "e00b-new" and counts["other"] != 0:
-        raise RuntimeError(f"E-00b-new must train only its projector: {counts}")
     return counts
 
 
@@ -89,10 +82,8 @@ def main() -> None:
     output_dir = _arg_value(remaining, "--output_dir")
     resume = _arg_value(remaining, "--resume_from_checkpoint")
     validate_resume_scope(resume, output_dir)
-    if new_args.mope_new_experiment == "e03a-new" and not new_args.mope_projector_warmstart_path:
-        raise ValueError("E-03a-new requires --mope_projector_warmstart_path")
-    if new_args.mope_new_experiment != "e03a-new" and new_args.mope_projector_warmstart_path:
-        raise ValueError("only E-03a-new may warm-start a projector")
+    if (new_args.mope_new_groups, new_args.mope_new_frames_per_group) != (4, 4):
+        raise ValueError("final515k requires --mope_new_groups 4 --mope_new_frames_per_group 4")
 
     import train_framework.train_space as base
     import train_framework.data.mope_data_wrapper as data_wrapper
@@ -105,7 +96,8 @@ def main() -> None:
         inner = model.model
         encoder = MoPENewEncoder(
             checkpoint, source_root=new_args.mope_new_source_root,
-            num_frames=16, sampling_rate=new_args.mope_new_sampling_rate,
+            num_frames=16, groups=new_args.mope_new_groups,
+            frames_per_group=new_args.mope_new_frames_per_group,
             input_size=new_args.mope_new_input_size, pool_mode=new_args.mope_new_pool_mode,
         )
         config = model.config
@@ -113,24 +105,24 @@ def main() -> None:
         projector = MoPEProjectorCrossAttn(mope_dim=768, llm_dim=llm_dim)
         inner.add_module("_mope_encoder", encoder)
         inner.add_module("_mope_projector", projector)
-        if new_args.mope_projector_warmstart_path:
-            norms = load_projector_warmstart(projector, new_args.mope_projector_warmstart_path)
-            base.rank0_print(
-                f"[MoPE-new] projector warm-start={new_args.mope_projector_warmstart_path}; "
-                f"keys={sorted(norms)}; out_proj.weight.norm={norms['out_proj.weight']:.6f}"
-            )
         base.rank0_print(
-            f"[MoPE-new] attached experiment={new_args.mope_new_experiment}, frames=16, "
-            f"sampling_rate={new_args.mope_new_sampling_rate}, input=224, "
-            f"pool={new_args.mope_new_pool_mode}, expected_tokens="
-            f"{1568 if new_args.mope_new_pool_mode == 'none' else 8 if new_args.mope_new_pool_mode == 'temporal' else 1}"
+            f"[MoPE-final515k] attached experiment={new_args.mope_new_experiment}, "
+            f"frames=16, sampling=4x4_uniform_segments_rint, input=224, "
+            f"position=3d_sincos, pool=temporal, expected_tokens=8"
         )
 
     def load_frames(annotation, all_frames):
         if all_frames != 16:
             raise ValueError(f"MoPE-new data wrapper expected 16 frames, got {all_frames}")
+        if not annotation.get("mope_video"):
+            raise ValueError(
+                "final515k E-02c-new requires SPAR annotations with mope_video so "
+                "MoPE samples 4x4 from the complete video; regenerate/migrate the "
+                "VSI-590K SPAR manifest instead of resampling its eight GUIDE images"
+            )
         return load_annotation_for_mope_new(
-            annotation, num_frames=16, sampling_rate=new_args.mope_new_sampling_rate,
+            annotation, groups=new_args.mope_new_groups,
+            frames_per_group=new_args.mope_new_frames_per_group,
             input_size=new_args.mope_new_input_size,
         )
 
@@ -142,6 +134,7 @@ def main() -> None:
     base._attach_mope_to_model = attach
     base.set_model = set_model_and_verify
     data_wrapper._load_mope_frames = load_frames
+    data_wrapper._STRICT_MOPE_LOADING = True
     base.train(attn_implementation="flash_attention_2")
 
 

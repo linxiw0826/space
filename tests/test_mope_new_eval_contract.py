@@ -19,9 +19,7 @@ from model.mope_new_encoder import (
 @pytest.mark.parametrize(
     ("script_name", "experiment_name"),
     [
-        ("eval_e00b_mope_new_vsibench.sh", "e00b_mope_new_projector_only_4b"),
         ("eval_e02c_mope_new_vsibench.sh", "e02c_mope_new_crossattn_joint_4b"),
-        ("eval_e03a_mope_new_vsibench.sh", "e03a_mope_new_crossattn_two_stage_4b"),
     ],
 )
 def test_eval_dry_run_uses_server_roots_and_timestamped_log(script_name, experiment_name):
@@ -123,7 +121,7 @@ def test_failed_vsibench_eval_preserves_prior_results_and_cleans_workdir(tmp_pat
     accelerate.write_text("#!/usr/bin/env bash\nexit 9\n")
     accelerate.chmod(0o755)
     output_root = tmp_path / "output"
-    experiment = "e03a_mope_new_crossattn_two_stage_4b"
+    experiment = "e02c_mope_new_crossattn_joint_4b"
     result_dir = output_root / "eval" / "vsibench" / experiment
     result_dir.mkdir(parents=True)
     old_result = result_dir / "old_results.json"
@@ -151,7 +149,7 @@ def test_failed_vsibench_eval_preserves_prior_results_and_cleans_workdir(tmp_pat
         }
     )
     completed = subprocess.run(
-        ["bash", str(root / "scripts/idea1_feature/eval/eval_e03a_mope_new_vsibench.sh")],
+        ["bash", str(root / "scripts/idea1_feature/eval/eval_e02c_mope_new_vsibench.sh")],
         cwd=root,
         env=env,
         text=True,
@@ -165,8 +163,7 @@ def test_failed_vsibench_eval_preserves_prior_results_and_cleans_workdir(tmp_pat
 @pytest.mark.parametrize(
     ("script_name", "experiment_name"),
     [
-        ("eval_e00b_mope_new_vlm4d.sh", "e00b_mope_new_projector_only_4b"),
-        ("eval_e03a_mope_new_vlm4d.sh", "e03a_mope_new_crossattn_two_stage_4b"),
+        ("eval_e02c_mope_new_vlm4d.sh", "e02c_mope_new_crossattn_joint_4b"),
     ],
 )
 def test_vlm4d_eval_dry_run_contract(script_name, experiment_name):
@@ -199,9 +196,10 @@ def test_vlm4d_eval_dry_run_contract(script_name, experiment_name):
     assert "--tasks vlm4d_real_mc_mope_new" in result.stdout
     assert "checkpoint-50.pth" in result.stdout
     assert "mope_all_frames=16" in result.stdout
-    assert "mope_sampling_rate=4" in result.stdout
+    assert "mope_groups=4" in result.stdout
+    assert "mope_frames_per_group=4" in result.stdout
     assert "mope_input_size=224" in result.stdout
-    assert "mope_pool_mode=none" in result.stdout
+    assert "mope_pool_mode=temporal" in result.stdout
     assert "--num_processes=1" in result.stdout
     assert "--main_process_port=29604" in result.stdout
 
@@ -218,7 +216,27 @@ def test_shared_preprocessing_contract_for_ordered_images(tmp_path):
     expected = images_to_mope_new_tensor(images)
     assert actual.shape == (3, 16, 224, 224)
     assert torch.equal(actual, expected)
-    assert len(select_ordered_images(images, 16)) == 16
+    assert len(select_ordered_images(images)) == 16
+
+
+def test_mope_video_sidecar_takes_precedence_over_guide_images(monkeypatch):
+    seen = {}
+
+    def fake_loader(path, **kwargs):
+        seen["path"] = str(path)
+        seen.update(kwargs)
+        return torch.zeros(3, 16, 224, 224)
+
+    monkeypatch.setattr("model.mope_new_encoder.load_video_for_mope_new", fake_loader)
+    result = load_annotation_for_mope_new({
+        "data_path": "/dataset", "image": ["guide/frame0.jpg"],
+        "mope_video": "videos/scene.mp4",
+    })
+    assert result.shape == (3, 16, 224, 224)
+    assert seen == {
+        "path": "/dataset/videos/scene.mp4", "groups": 4,
+        "frames_per_group": 4, "input_size": 224,
+    }
 
 
 def test_empty_or_unreadable_images_fail_loudly(tmp_path):
@@ -233,6 +251,16 @@ def test_new_eval_module_is_syntactically_importable_contract():
     tree = ast.parse(path.read_text())
     classes = [node.name for node in tree.body if isinstance(node, ast.ClassDef)]
     assert "Qwen3VLMoPENewCrossAttn" in classes
+    loader_calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "load_video_for_mope_new"
+    ]
+    assert len(loader_calls) == 1
+    assert {keyword.arg for keyword in loader_calls[0].keywords} == {
+        "groups", "frames_per_group", "input_size"
+    }
 
 
 class TinyEncoder(nn.Module):

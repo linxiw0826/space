@@ -1,4 +1,4 @@
-"""Frozen adapter and shared preprocessing for the updated MoPE-JEPA encoder."""
+"""Frozen adapter and shared preprocessing for the final515k MoPE encoder."""
 
 from __future__ import annotations
 
@@ -16,15 +16,17 @@ from torch import nn
 from torchvision import transforms
 
 
-DEFAULT_SOURCE_ROOT = Path(__file__).resolve().parents[2] / "refs" / "mope_new"
+DEFAULT_SOURCE_ROOT = Path(__file__).resolve().parents[2] / "refs" / "mope-jepa-native-final515k"
 DEFAULT_NUM_FRAMES = 16
-DEFAULT_SAMPLING_RATE = 4
+DEFAULT_GROUPS = 4
+DEFAULT_FRAMES_PER_GROUP = 4
 DEFAULT_INPUT_SIZE = 224
 FEATURE_DIM = 768
 SPATIAL_TOKENS = 196
 TIME_BINS = 8
 FULL_TOKENS = TIME_BINS * SPATIAL_TOKENS
-POOL_IDS = {"none": 0, "temporal": 1, "mean": 2}
+POOL_IDS = {"temporal": 1}
+CONTRACT_VERSION = 2
 
 
 def build_mope_new_transform(input_size: int = DEFAULT_INPUT_SIZE):
@@ -38,61 +40,88 @@ def build_mope_new_transform(input_size: int = DEFAULT_INPUT_SIZE):
     )
 
 
-def select_video_indices(total: int, num_frames: int = DEFAULT_NUM_FRAMES,
-                         sampling_rate: int = DEFAULT_SAMPLING_RATE) -> np.ndarray:
+def select_video_indices(total: int, groups: int = DEFAULT_GROUPS,
+                         frames_per_group: int = DEFAULT_FRAMES_PER_GROUP) -> np.ndarray:
+    """Match final515k's downstream 4x4 uniform-segment sampler exactly."""
     if total <= 0:
-        raise ValueError("MoPE-new cannot sample an empty video")
-    span = num_frames * sampling_rate
-    if total <= span:
-        indices = np.linspace(0, total - 1, num_frames).astype(int)
-    else:
-        center = total // 2
-        start = max(0, center - span // 2)
-        start = min(start, total - span)
-        indices = np.arange(start, start + span, sampling_rate)[:num_frames]
-    return np.clip(indices, 0, total - 1)
+        raise ValueError("MoPE-final515k cannot sample an empty video")
+    if groups <= 0 or frames_per_group <= 0:
+        raise ValueError("MoPE-final515k groups and frames_per_group must be positive")
+    indices: list[int] = []
+    for group_id in range(groups):
+        start = int(np.floor(group_id * total / groups))
+        end = int(np.floor((group_id + 1) * total / groups))
+        end = max(end, start + 1)
+        local = np.linspace(start, end - 1, frames_per_group)
+        indices.extend(np.rint(local).astype(np.int64).tolist())
+    target = groups * frames_per_group
+    indices = [int(np.clip(index, 0, total - 1)) for index in indices]
+    while len(indices) < target:
+        indices.append(indices[-1])
+    return np.asarray(indices[:target], dtype=np.int64)
 
 
-def select_ordered_images(images: Sequence, num_frames: int = DEFAULT_NUM_FRAMES) -> list:
+def select_ordered_images(images: Sequence, *, groups: int = DEFAULT_GROUPS,
+                          frames_per_group: int = DEFAULT_FRAMES_PER_GROUP) -> list:
     if not images:
-        raise ValueError("MoPE-new received an empty ordered image list")
-    if len(images) >= num_frames:
-        indices = np.linspace(0, len(images) - 1, num_frames).astype(int)
-        return [images[int(i)] for i in indices]
-    return list(images) + [images[-1]] * (num_frames - len(images))
+        raise ValueError("MoPE-final515k received an empty ordered image list")
+    indices = select_video_indices(len(images), groups, frames_per_group)
+    return [images[int(index)] for index in indices]
 
 
 def images_to_mope_new_tensor(images: Sequence[Image.Image], *, input_size: int = 224,
-                              num_frames: int = 16) -> torch.Tensor:
-    selected = select_ordered_images(images, num_frames)
+                              groups: int = 4, frames_per_group: int = 4) -> torch.Tensor:
+    selected = select_ordered_images(
+        images, groups=groups, frames_per_group=frames_per_group
+    )
     transform = build_mope_new_transform(input_size)
     frames = [transform(image.convert("RGB")) for image in selected]
     return torch.stack(frames, dim=1)  # [3,T,H,W]
 
 
-def load_video_for_mope_new(video_path: str | Path, *, num_frames: int = 16,
-                            sampling_rate: int = 4, input_size: int = 224) -> torch.Tensor:
+def load_video_for_mope_new(video_path: str | Path, *, groups: int = 4,
+                            frames_per_group: int = 4, input_size: int = 224) -> torch.Tensor:
+    """Decode exactly like the owner-provided final515k downstream extractor."""
     try:
-        import decord
+        import cv2
     except ImportError as exc:
-        raise RuntimeError("decord is required to read MoPE-new video inputs") from exc
-    reader = decord.VideoReader(str(video_path))
-    indices = select_video_indices(len(reader), num_frames, sampling_rate)
-    batch = reader.get_batch(indices.tolist()).asnumpy()
-    images = [Image.fromarray(frame).convert("RGB") for frame in batch]
-    return images_to_mope_new_tensor(images, input_size=input_size, num_frames=num_frames)
+        raise RuntimeError("opencv-python is required to read MoPE-final515k videos") from exc
+    capture = cv2.VideoCapture(str(video_path))
+    images: list[Image.Image] = []
+    try:
+        while True:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            images.append(Image.fromarray(frame))
+    finally:
+        capture.release()
+    if not images:
+        raise RuntimeError(f"no frames decoded from {video_path}")
+    return images_to_mope_new_tensor(
+        images, input_size=input_size, groups=groups, frames_per_group=frames_per_group
+    )
 
 
-def load_annotation_for_mope_new(annotation: Mapping, *, num_frames: int = 16,
-                                 sampling_rate: int = 4, input_size: int = 224) -> torch.Tensor:
+def load_annotation_for_mope_new(annotation: Mapping, *, groups: int = 4,
+                                 frames_per_group: int = 4,
+                                 input_size: int = 224) -> torch.Tensor:
     data_root_raw = annotation.get("data_path") or ""
     data_root = Path(data_root_raw)
+    if "mope_video" in annotation:
+        item = annotation["mope_video"]
+        path = data_root / item if data_root_raw else Path(item)
+        return load_video_for_mope_new(
+            path, groups=groups, frames_per_group=frames_per_group,
+            input_size=input_size,
+        )
     if "image" in annotation:
         paths = annotation["image"]
         if isinstance(paths, str):
             paths = [paths]
         if not paths:
-            raise ValueError("MoPE-new annotation contains an empty image list")
+            raise ValueError("MoPE-final515k annotation contains an empty image list")
         images = []
         for item in paths:
             path = data_root / item if data_root_raw else Path(item)
@@ -101,14 +130,18 @@ def load_annotation_for_mope_new(annotation: Mapping, *, num_frames: int = 16,
                     images.append(image.convert("RGB"))
             except Exception as exc:
                 raise RuntimeError(f"cannot read MoPE-new image: {path}") from exc
-        return images_to_mope_new_tensor(images, input_size=input_size, num_frames=num_frames)
+        return images_to_mope_new_tensor(
+            images, input_size=input_size, groups=groups,
+            frames_per_group=frames_per_group,
+        )
     if "video" in annotation:
         item = annotation["video"]
         path = data_root / item if data_root_raw else Path(item)
         return load_video_for_mope_new(
-            path, num_frames=num_frames, sampling_rate=sampling_rate, input_size=input_size
+            path, groups=groups, frames_per_group=frames_per_group,
+            input_size=input_size,
         )
-    raise ValueError("MoPE-new annotation must contain 'image' or 'video'")
+    raise ValueError("MoPE-final515k annotation must contain 'image' or 'video'")
 
 
 def extract_state_dict(checkpoint) -> MutableMapping[str, torch.Tensor]:
@@ -174,7 +207,7 @@ def _import_native_builder(source_root: str | Path):
     model_file = root / "models" / "native_mope.py"
     if not model_file.is_file():
         raise FileNotFoundError(f"MoPE-new source is incomplete: {model_file}")
-    package = "_space_mope_new_upstream"
+    package = "_space_mope_final515k_upstream"
     models_package = f"{package}.models"
     if package not in sys.modules:
         module = types.ModuleType(package)
@@ -189,24 +222,27 @@ def _import_native_builder(source_root: str | Path):
 
 
 class MoPENewEncoder(nn.Module):
-    """Strict, frozen wrapper around checkpoint-50's 8-layer MoPE encoder."""
+    """Strict frozen wrapper around the final515k checkpoint-50 encoder."""
 
     def __init__(self, checkpoint_path: str | Path, *, source_root: str | Path = DEFAULT_SOURCE_ROOT,
-                 num_frames: int = 16, sampling_rate: int = 4, input_size: int = 224,
-                 pool_mode: str = "none", model_factory=None):
+                 num_frames: int = 16, groups: int = 4, frames_per_group: int = 4,
+                 input_size: int = 224, pool_mode: str = "temporal", model_factory=None):
         super().__init__()
         if pool_mode not in POOL_IDS:
             raise ValueError(f"invalid MoPE-new pool_mode={pool_mode!r}; choose {tuple(POOL_IDS)}")
         if (num_frames, input_size) != (16, 224):
-            raise ValueError("checkpoint-50 contract requires num_frames=16 and input_size=224")
+            raise ValueError("final515k checkpoint contract requires 16 frames at 224x224")
+        if groups * frames_per_group != num_frames or (groups, frames_per_group) != (4, 4):
+            raise ValueError("final515k checkpoint contract requires 4 groups x 4 frames")
         self.num_frames = num_frames
-        self.sampling_rate = sampling_rate
+        self.groups = groups
+        self.frames_per_group = frames_per_group
         self.input_size = input_size
         self.pool_mode = pool_mode
         factory = model_factory or _import_native_builder(source_root)
         model = factory(
-            pretrained=False, all_frames=16, tubelet_size=2, encoder_depth=8,
-            dense_layers=4, num_experts=4, top_k=2, num_shared_experts=1,
+            pretrained=False, all_frames=16, tubelet_size=2, encoder_depth=12,
+            dense_layers=8, num_experts=8, top_k=1, num_shared_experts=1,
             router_score_func="sigmoid", router_bias_update_speed=0.0, num_anchors=1,
             pos_embed_type="3d_sincos", predictor_pos_embed_type="3d_sincos",
         )
@@ -216,7 +252,11 @@ class MoPENewEncoder(nn.Module):
         self.encoder = model
         self.loaded_encoder_keys = tuple(loaded)
         self.register_buffer(
-            "contract", torch.tensor([1, num_frames, sampling_rate, input_size, POOL_IDS[pool_mode]]),
+            "contract",
+            torch.tensor([
+                CONTRACT_VERSION, 12, 8, 8, 1, 1, num_frames, groups,
+                frames_per_group, input_size, POOL_IDS[pool_mode],
+            ]),
             persistent=True,
         )
         self._freeze()
@@ -235,21 +275,24 @@ class MoPENewEncoder(nn.Module):
     def forward(self, frames: torch.Tensor) -> torch.Tensor:
         expected = (3, self.num_frames, self.input_size, self.input_size)
         if frames.ndim != 5 or tuple(frames.shape[1:]) != expected:
-            raise ValueError(f"MoPE-new expected [B,{','.join(map(str, expected))}], got {tuple(frames.shape)}")
+            raise ValueError(
+                f"MoPE-final515k expected [B,{','.join(map(str, expected))}], "
+                f"got {tuple(frames.shape)}"
+            )
         self._freeze()
         features = self.encoder.encode(frames, token_mask=None, record_stats=False)
         if features.ndim != 3 or features.shape[-1] != FEATURE_DIM:
-            raise RuntimeError(f"MoPE-new expected [B,N,{FEATURE_DIM}], got {tuple(features.shape)}")
+            raise RuntimeError(
+                f"MoPE-final515k expected [B,N,{FEATURE_DIM}], got {tuple(features.shape)}"
+            )
         if features.shape[1] != FULL_TOKENS or features.shape[1] % SPATIAL_TOKENS:
             raise RuntimeError(
-                f"MoPE-new expected {FULL_TOKENS}=8x{SPATIAL_TOKENS} time-major tokens, "
+                f"MoPE-final515k expected {FULL_TOKENS}=8x{SPATIAL_TOKENS} tokens, "
                 f"got {features.shape[1]}"
             )
-        if self.pool_mode == "temporal":
-            features = features.view(features.shape[0], TIME_BINS, SPATIAL_TOKENS, FEATURE_DIM).mean(2)
-        elif self.pool_mode == "mean":
-            features = features.mean(1, keepdim=True)
-        return features
+        return features.view(
+            features.shape[0], TIME_BINS, SPATIAL_TOKENS, FEATURE_DIM
+        ).mean(2)
 
 
 PROJECTOR_KEYS = (
