@@ -1,4 +1,7 @@
 from types import SimpleNamespace
+import os
+from pathlib import Path
+import subprocess
 
 import torch
 from torch import nn
@@ -88,3 +91,48 @@ def test_strict_final515k_loading_never_falls_back_to_zeros(monkeypatch):
     wrapped = mope_data_wrapper.MoPEDatasetWrapper(Base(), mope_all_frames=16)
     with pytest.raises(RuntimeError, match="strict MoPE frame loading failed"):
         wrapped[0]
+
+
+def test_e02c_launcher_refuses_implicit_resume_from_existing_checkpoint(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    output_root = tmp_path / "output"
+    output_dir = output_root / "train" / "e02c_mope_new_crossattn_joint_4b"
+    (output_dir / "checkpoint-7269").mkdir(parents=True)
+    env = {
+        **os.environ,
+        "SPACE_OUTPUT_ROOT": str(output_root),
+        "SPACE_LOG_ROOT": str(tmp_path / "logs"),
+        "MOPE_NEW_ALLOW_MISSING_ASSETS": "1",
+        "DRY_RUN": "1",
+    }
+    result = subprocess.run(
+        ["bash", str(root / "scripts/idea1_feature/train/train_e02c_mope_new_crossattn_joint.sh")],
+        cwd=root,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "refusing implicit resume" in result.stderr
+
+
+def test_e02c_fresh_launcher_disables_transformers_auto_resume(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    env = {
+        **os.environ,
+        "SPACE_OUTPUT_ROOT": str(tmp_path / "output"),
+        "SPACE_LOG_ROOT": str(tmp_path / "logs"),
+        "MOPE_NEW_ALLOW_MISSING_ASSETS": "1",
+        "DRY_RUN": "1",
+    }
+    result = subprocess.run(
+        ["bash", str(root / "scripts/idea1_feature/train/train_e02c_mope_new_crossattn_joint.sh")],
+        cwd=root,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--overwrite_output_dir" in result.stdout

@@ -43,6 +43,12 @@ if [[ -n "${RESUME_FROM_CHECKPOINT}" ]]; then
     "$(realpath -m "${OUTPUT_DIR}")"/*) ;;
     *) echo "Resume must be inside this experiment's output directory" >&2; exit 2 ;;
   esac
+elif [[ -d "${OUTPUT_DIR}" ]] && find "${OUTPUT_DIR}" -mindepth 1 -maxdepth 1 \
+    \( -type d -name 'checkpoint-*' -o -type f -name 'model*.safetensors' \
+       -o -type f -name 'pytorch_model*.bin' \) -print -quit | grep -q .; then
+  echo "Existing training artifacts found in ${OUTPUT_DIR}; refusing implicit resume." >&2
+  echo "Move/archive the old output directory for a fresh final515k run, or set RESUME_FROM_CHECKPOINT explicitly." >&2
+  exit 2
 fi
 
 if [[ "${ALLOW_MISSING}" != "1" ]]; then
@@ -79,7 +85,14 @@ COMMAND=(python -m torch.distributed.run "--nproc_per_node=${NPROC_PER_NODE}" "-
   --mope_new_groups 4 --mope_new_frames_per_group 4
   --mope_new_input_size 224 --mope_new_pool_mode temporal
   --group_by_modality_length True)
-[[ -n "${RESUME_FROM_CHECKPOINT}" ]] && COMMAND+=(--resume_from_checkpoint "${RESUME_FROM_CHECKPOINT}")
+if [[ -n "${RESUME_FROM_CHECKPOINT}" ]]; then
+  COMMAND+=(--resume_from_checkpoint "${RESUME_FROM_CHECKPOINT}")
+else
+  # Transformers otherwise auto-discovers checkpoint-* in output_dir.  That is
+  # unsafe when an experiment name is intentionally reused for a new MoPE
+  # architecture/contract.
+  COMMAND+=(--overwrite_output_dir)
+fi
 
 echo "Experiment=${MOPE_NEW_EXPERIMENT} train_llm=${TUNE_LLM} train_projector=True train_mope=False grad_accum=${GRAD_ACCUM} effective_batch=$((2 * NPROC_PER_NODE * GRAD_ACCUM))"
 echo "MoPE=${MOPE_NEW_CKPT} architecture=dense8+moe8/top1/shared1 pos=3d_sincos frames=16 sampling=4x4 input=224 pool=temporal expected=[B,8,768]"
