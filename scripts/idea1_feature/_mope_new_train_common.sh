@@ -21,7 +21,9 @@ MASTER_PORT="${MASTER_PORT:-29517}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 export CUDA_VISIBLE_DEVICES
 export PYTHONPATH="${SPACE_ROOT}/src:${SPACE_ROOT}:${PYTHONPATH:-}"
-export VSI590K_SPAR_ANN="${VSI590K_SPAR_ANN:-/data2/wlx/data/vsi590k_processed/vsi590k_spar_590k.json}"
+# Keep the legacy GUIDE manifest untouched.  The final515k-specific copy adds
+# full-video sidecars used only by the frozen MoPE encoder.
+export VSI590K_SPAR_ANN="${MOPE_NEW_SPAR_ANN:-/data2/wlx/data/vsi590k_processed/vsi590k_spar_590k_final515k.json}"
 export VSI590K_VIDEO_ANN="${VSI590K_VIDEO_ANN:-/data2/wlx/data/vsi590k_processed/vsi590k_video_590k.json}"
 export VSI590K_DATA_ROOT="${VSI590K_DATA_ROOT:-/data2/wlx/data/vsi590k_processed}"
 
@@ -56,6 +58,7 @@ if [[ "${ALLOW_MISSING}" != "1" ]]; then
   [[ -d "${GUIDE_CKPT_PATH}" ]] || { echo "Missing GUIDE checkpoint: ${GUIDE_CKPT_PATH}" >&2; exit 2; }
   [[ -d "${VGGT_PATH}" ]] || { echo "Missing VGGT: ${VGGT_PATH}" >&2; exit 2; }
   [[ -f "${MOPE_NEW_SOURCE_ROOT}/models/native_mope.py" ]] || { echo "Incomplete MoPE-new source" >&2; exit 2; }
+  [[ -f "${VSI590K_SPAR_ANN}" ]] || { echo "Missing final515k SPAR manifest: ${VSI590K_SPAR_ANN}" >&2; exit 2; }
 fi
 
 COMMAND=(python -m torch.distributed.run "--nproc_per_node=${NPROC_PER_NODE}" "--master_port=${MASTER_PORT}"
