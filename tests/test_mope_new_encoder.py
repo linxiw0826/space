@@ -1,8 +1,16 @@
+import sys
+from types import SimpleNamespace
+
+import numpy as np
 import torch
 from torch import nn
 import pytest
 
-from model.mope_new_encoder import MoPENewEncoder, select_video_indices
+from model.mope_new_encoder import (
+    MoPENewEncoder,
+    load_video_for_mope_new,
+    select_video_indices,
+)
 
 
 class FakeNative(nn.Module):
@@ -54,6 +62,41 @@ def test_final515k_segment_sampling_and_short_video():
     ]
     short = select_video_indices(10)
     assert len(short) == 16 and short[0] == 0 and short[-1] == 9
+
+
+def test_video_loader_uses_exact_two_pass_bounded_selection(monkeypatch):
+    total = 10
+    captures = []
+
+    class FakeCapture:
+        def __init__(self, _):
+            self.position = 0
+            self.read_count = 0
+            captures.append(self)
+
+        def read(self):
+            self.read_count += 1
+            if self.position >= total:
+                return False, None
+            value = self.position
+            self.position += 1
+            return True, np.full((2, 2, 3), value, dtype=np.uint8)
+
+        def release(self):
+            pass
+
+    fake_cv2 = SimpleNamespace(
+        VideoCapture=FakeCapture,
+        COLOR_BGR2RGB=1,
+        cvtColor=lambda frame, _: frame,
+    )
+    monkeypatch.setitem(sys.modules, "cv2", fake_cv2)
+    result = load_video_for_mope_new("fake.mp4", input_size=2)
+
+    assert result.shape == (3, 16, 2, 2)
+    assert len(captures) == 2
+    assert captures[0].read_count == total + 1
+    assert captures[1].read_count == total
 
 
 def test_factory_receives_exact_final515k_architecture(tmp_path):

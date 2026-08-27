@@ -136,3 +136,5 @@ def test_e02c_fresh_launcher_disables_transformers_auto_resume(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert "--overwrite_output_dir" in result.stdout
+    assert "--dataloader_num_workers 2" in result.stdout
+    assert "--save_steps 500" in result.stdout

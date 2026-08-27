@@ -81,27 +81,55 @@ def images_to_mope_new_tensor(images: Sequence[Image.Image], *, input_size: int 
 
 def load_video_for_mope_new(video_path: str | Path, *, groups: int = 4,
                             frames_per_group: int = 4, input_size: int = 224) -> torch.Tensor:
-    """Decode exactly like the owner-provided final515k downstream extractor."""
+    """Decode the owner's exact indices without retaining every video frame.
+
+    The owner extractor materializes the complete decoded video before it
+    computes the 4x4 indices.  That is fine for a single-video CLI, but causes
+    excessive host RAM when many DataLoader workers run concurrently.  Two
+    sequential passes preserve the exact decoded-frame count and index rule
+    while retaining only the selected 16 frames.
+    """
     try:
         import cv2
     except ImportError as exc:
         raise RuntimeError("opencv-python is required to read MoPE-final515k videos") from exc
     capture = cv2.VideoCapture(str(video_path))
-    images: list[Image.Image] = []
+    total = 0
     try:
         while True:
+            ok, _ = capture.read()
+            if not ok:
+                break
+            total += 1
+    finally:
+        capture.release()
+    if total <= 0:
+        raise RuntimeError(f"no frames decoded from {video_path}")
+
+    indices = select_video_indices(total, groups, frames_per_group)
+    wanted = set(int(index) for index in indices)
+    selected_by_index: dict[int, Image.Image] = {}
+    capture = cv2.VideoCapture(str(video_path))
+    try:
+        for frame_index in range(total):
             ok, frame = capture.read()
             if not ok:
                 break
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            images.append(Image.fromarray(frame))
+            if frame_index in wanted:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                selected_by_index[frame_index] = Image.fromarray(frame)
     finally:
         capture.release()
-    if not images:
-        raise RuntimeError(f"no frames decoded from {video_path}")
-    return images_to_mope_new_tensor(
-        images, input_size=input_size, groups=groups, frames_per_group=frames_per_group
-    )
+    missing = sorted(wanted.difference(selected_by_index))
+    if missing:
+        raise RuntimeError(
+            f"video decode changed between counting and selection passes: "
+            f"{video_path}; missing indices={missing}"
+        )
+    selected = [selected_by_index[int(index)] for index in indices]
+    transform = build_mope_new_transform(input_size)
+    frames = [transform(image.convert("RGB")) for image in selected]
+    return torch.stack(frames, dim=1)
 
 
 def load_annotation_for_mope_new(annotation: Mapping, *, groups: int = 4,
