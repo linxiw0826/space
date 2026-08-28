@@ -181,6 +181,7 @@ def main() -> None:
         videos = videos[: args.limit]
     script = Path(__file__).resolve()
     results = []
+    printed_failures = 0
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         pending = {
             executor.submit(_run_isolated, script, video, args.timeout_seconds): video
@@ -189,7 +190,11 @@ def main() -> None:
         for completed_count, future in enumerate(as_completed(pending), 1):
             result = future.result()
             results.append(result)
-            if completed_count % 100 == 0 or result["status"] != "pass":
+            should_print = completed_count % 100 == 0
+            if result["status"] != "pass" and printed_failures < 20:
+                printed_failures += 1
+                should_print = True
+            if should_print:
                 print(
                     f"[{completed_count}/{len(videos)}] status={result['status']} "
                     f"video={result['video']}",
