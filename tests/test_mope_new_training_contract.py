@@ -89,7 +89,10 @@ def test_strict_final515k_loading_never_falls_back_to_zeros(monkeypatch):
         lambda annotation, frames: (_ for _ in ()).throw(ValueError("missing mope_video")),
     )
     wrapped = mope_data_wrapper.MoPEDatasetWrapper(Base(), mope_all_frames=16)
-    with pytest.raises(RuntimeError, match="strict MoPE frame loading failed"):
+    with pytest.raises(
+        RuntimeError,
+        match=r"dataset index=0 sample_id=UNKNOWN video=UNKNOWN",
+    ):
         wrapped[0]
 
 
@@ -138,3 +141,29 @@ def test_e02c_fresh_launcher_disables_transformers_auto_resume(tmp_path):
     assert "--overwrite_output_dir" in result.stdout
     assert "--dataloader_num_workers 2" in result.stdout
     assert "--save_steps 500" in result.stdout
+
+
+def test_e02c_three_gpu_launcher_preserves_effective_batch(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    env = {
+        **os.environ,
+        "SPACE_OUTPUT_ROOT": str(tmp_path / "output"),
+        "SPACE_LOG_ROOT": str(tmp_path / "logs"),
+        "MOPE_NEW_ALLOW_MISSING_ASSETS": "1",
+        "NPROC_PER_NODE": "3",
+        "GRAD_ACCUM": "8",
+        "CUDA_VISIBLE_DEVICES": "4,6,7",
+        "DRY_RUN": "1",
+    }
+    result = subprocess.run(
+        ["bash", str(root / "scripts/idea1_feature/train/train_e02c_mope_new_crossattn_joint.sh")],
+        cwd=root,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--nproc_per_node=3" in result.stdout
+    assert "--gradient_accumulation_steps 8" in result.stdout
+    assert "effective_batch=48" in result.stdout

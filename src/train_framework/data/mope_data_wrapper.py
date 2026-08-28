@@ -94,8 +94,11 @@ class MoPEDatasetWrapper(Dataset):
             item["raw_frames"] = _load_mope_frames(ann, self.mope_all_frames)
         except Exception as exc:
             if _STRICT_MOPE_LOADING:
+                sample_id = ann.get("id", "UNKNOWN")
+                video = ann.get("mope_video") or ann.get("video") or "UNKNOWN"
                 raise RuntimeError(
-                    f"strict MoPE frame loading failed for dataset index {i}"
+                    f"strict MoPE frame loading failed for dataset index={i} "
+                    f"sample_id={sample_id} video={video}"
                 ) from exc
             print(f"[MoPE] WARNING: frame load failed for idx {i} ({exc}), using zeros.")
             item["raw_frames"] = torch.zeros(3, self.mope_all_frames, 224, 224)

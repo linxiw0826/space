@@ -33,11 +33,17 @@ case "${MOPE_NEW_EXPERIMENT}" in
   e02c-new)
     OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_ROOT}/train/e02c_mope_new_crossattn_joint_4b}"
     TUNE_LLM=True
-    GRAD_ACCUM=6
+    GRAD_ACCUM="${GRAD_ACCUM:-6}"
     WARMSTART=""
     ;;
   *) echo "Unknown MoPE-new experiment: ${MOPE_NEW_EXPERIMENT}" >&2; exit 2 ;;
 esac
+
+EFFECTIVE_BATCH=$((2 * NPROC_PER_NODE * GRAD_ACCUM))
+[[ "${EFFECTIVE_BATCH}" == "48" ]] || {
+  echo "E-02c-new requires effective global batch 48; got 2 x ${NPROC_PER_NODE} x ${GRAD_ACCUM} = ${EFFECTIVE_BATCH}" >&2
+  exit 2
+}
 
 LOG_FILE="${LOG_FILE:-${LOG_DIR}/$(basename "${OUTPUT_DIR}")_$(date +%Y%m%d_%H%M%S).log}"
 
@@ -99,7 +105,7 @@ else
   COMMAND+=(--overwrite_output_dir)
 fi
 
-echo "Experiment=${MOPE_NEW_EXPERIMENT} train_llm=${TUNE_LLM} train_projector=True train_mope=False grad_accum=${GRAD_ACCUM} effective_batch=$((2 * NPROC_PER_NODE * GRAD_ACCUM))"
+echo "Experiment=${MOPE_NEW_EXPERIMENT} train_llm=${TUNE_LLM} train_projector=True train_mope=False grad_accum=${GRAD_ACCUM} effective_batch=${EFFECTIVE_BATCH}"
 echo "MoPE=${MOPE_NEW_CKPT} architecture=dense8+moe8/top1/shared1 pos=3d_sincos frames=16 sampling=4x4 input=224 pool=temporal expected=[B,8,768]"
 echo "Output=${OUTPUT_DIR} warmstart=${WARMSTART:-none} resume=${RESUME_FROM_CHECKPOINT:-none}"
 echo "DataLoader workers/rank=${DATALOADER_NUM_WORKERS} total_workers=$((DATALOADER_NUM_WORKERS * NPROC_PER_NODE)) save_steps=${SAVE_STEPS}"

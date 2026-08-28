@@ -64,39 +64,41 @@ def test_final515k_segment_sampling_and_short_video():
     assert len(short) == 16 and short[0] == 0 and short[-1] == 9
 
 
-def test_video_loader_uses_exact_two_pass_bounded_selection(monkeypatch):
+def test_video_loader_uses_exact_bounded_indexed_selection(monkeypatch):
     total = 10
-    captures = []
+    readers = []
 
-    class FakeCapture:
-        def __init__(self, _):
-            self.position = 0
-            self.read_count = 0
-            captures.append(self)
+    class FakeBatch:
+        def __init__(self, frames):
+            self.frames = frames
 
-        def read(self):
-            self.read_count += 1
-            if self.position >= total:
-                return False, None
-            value = self.position
-            self.position += 1
-            return True, np.full((2, 2, 3), value, dtype=np.uint8)
+        def asnumpy(self):
+            return self.frames
 
-        def release(self):
-            pass
+    class FakeReader:
+        def __init__(self, _, ctx=None, num_threads=None):
+            self.indices = None
+            readers.append(self)
 
-    fake_cv2 = SimpleNamespace(
-        VideoCapture=FakeCapture,
-        COLOR_BGR2RGB=1,
-        cvtColor=lambda frame, _: frame,
+        def __len__(self):
+            return total
+
+        def get_batch(self, indices):
+            self.indices = indices
+            return FakeBatch(np.stack([
+                np.full((2, 2, 3), index, dtype=np.uint8) for index in indices
+            ]))
+
+    fake_decord = SimpleNamespace(
+        VideoReader=FakeReader,
+        cpu=lambda index: ("cpu", index),
     )
-    monkeypatch.setitem(sys.modules, "cv2", fake_cv2)
+    monkeypatch.setitem(sys.modules, "decord", fake_decord)
     result = load_video_for_mope_new("fake.mp4", input_size=2)
 
     assert result.shape == (3, 16, 2, 2)
-    assert len(captures) == 2
-    assert captures[0].read_count == total + 1
-    assert captures[1].read_count == total
+    assert len(readers) == 1
+    assert readers[0].indices == select_video_indices(total).tolist()
 
 
 def test_factory_receives_exact_final515k_architecture(tmp_path):
