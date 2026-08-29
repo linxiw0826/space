@@ -160,6 +160,21 @@ def load_unique_videos(manifest: Path) -> tuple[list[Path], int]:
     return videos, len(rows)
 
 
+def load_passed_state(path: Path) -> dict[str, dict]:
+    """Load completed PASS records; tolerate an interrupted final JSONL line."""
+    passed: dict[str, dict] = {}
+    if not path.is_file():
+        return passed
+    for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            item = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        if item.get("status") == "pass" and item.get("video"):
+            passed[str(item["video"])] = item
+    return passed
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", type=Path)
@@ -180,17 +195,38 @@ def main() -> None:
     if args.limit > 0:
         videos = videos[: args.limit]
     script = Path(__file__).resolve()
-    results = []
+    state_path = args.report.with_suffix(args.report.suffix + ".states.jsonl")
+    results_by_video = load_passed_state(state_path)
+    selected_video_strings = {str(video) for video in videos}
+    results_by_video = {
+        video: result for video, result in results_by_video.items()
+        if video in selected_video_strings
+    }
+    remaining = [video for video in videos if str(video) not in results_by_video]
+    print(
+        f"[start] rows={rows} unique_videos={len(videos)} "
+        f"resumed_passes={len(results_by_video)} remaining={len(remaining)} "
+        f"workers={args.workers} timeout={args.timeout_seconds}s "
+        f"state={state_path}",
+        flush=True,
+    )
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_handle = state_path.open("a", encoding="utf-8")
     printed_failures = 0
-    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+    executor = ThreadPoolExecutor(max_workers=args.workers)
+    interrupted = False
+    try:
         pending = {
             executor.submit(_run_isolated, script, video, args.timeout_seconds): video
-            for video in videos
+            for video in remaining
         }
-        for completed_count, future in enumerate(as_completed(pending), 1):
+        for future in as_completed(pending):
             result = future.result()
-            results.append(result)
-            should_print = completed_count % 100 == 0
+            results_by_video[result["video"]] = result
+            state_handle.write(json.dumps(result, ensure_ascii=False) + "\n")
+            state_handle.flush()
+            completed_count = len(results_by_video)
+            should_print = completed_count == 1 or completed_count % 10 == 0
             if result["status"] != "pass" and printed_failures < 20:
                 printed_failures += 1
                 should_print = True
@@ -200,7 +236,20 @@ def main() -> None:
                     f"video={result['video']}",
                     flush=True,
                 )
+    except KeyboardInterrupt:
+        interrupted = True
+        print(
+            f"INTERRUPTED completed={len(results_by_video)}/{len(videos)} "
+            f"state={state_path}; rerun the same command to resume",
+            flush=True,
+        )
+    finally:
+        state_handle.close()
+        executor.shutdown(wait=not interrupted, cancel_futures=interrupted)
+    if interrupted:
+        raise SystemExit(130)
 
+    results = list(results_by_video.values())
     results.sort(key=lambda item: item["video"])
     failures = [item for item in results if item["status"] != "pass"]
     slowest = sorted(
@@ -215,6 +264,7 @@ def main() -> None:
         "unique_videos_audited": len(videos),
         "workers": args.workers,
         "timeout_seconds": args.timeout_seconds,
+        "state_jsonl": str(state_path.resolve()),
         "sampling": "4x4_uniform_segments_rint",
         "decoder_contract": "owner_opencv_full_decode_vs_decord_indexed_rgb_exact",
         "failure_count": len(failures),

@@ -3,6 +3,7 @@ import json
 import pytest
 
 from scripts.preprocess.audit_mope_final515k_videos import (
+    load_passed_state,
     load_unique_videos,
     sample_indices_4x4,
 )
@@ -33,3 +34,15 @@ def test_manifest_video_inventory_rejects_missing_sidecar(tmp_path):
     manifest.write_text(json.dumps([{"id": "q1"}]))
     with pytest.raises(ValueError, match="q1"):
         load_unique_videos(manifest)
+
+
+def test_passed_state_is_resumable_and_tolerates_truncated_line(tmp_path):
+    state = tmp_path / "audit.states.jsonl"
+    state.write_text(
+        json.dumps({"status": "pass", "video": "/a.mp4"}) + "\n"
+        + json.dumps({"status": "timeout", "video": "/b.mp4"}) + "\n"
+        + '{"status":"pass"',
+    )
+    assert load_passed_state(state) == {
+        "/a.mp4": {"status": "pass", "video": "/a.mp4"}
+    }
