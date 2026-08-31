@@ -21,6 +21,7 @@ MASTER_PORT="${MASTER_PORT:-29517}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-2}"
 SAVE_STEPS="${SAVE_STEPS:-500}"
+SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-1}"
 export CUDA_VISIBLE_DEVICES
 export PYTHONPATH="${SPACE_ROOT}/src:${SPACE_ROOT}:${PYTHONPATH:-}"
 # Keep the legacy GUIDE manifest untouched.  The final515k-specific copy adds
@@ -79,7 +80,7 @@ COMMAND=(python -m torch.distributed.run "--nproc_per_node=${NPROC_PER_NODE}" "-
   --num_train_epochs 1 --per_device_train_batch_size 2
   --per_device_eval_batch_size 4 --gradient_accumulation_steps "${GRAD_ACCUM}"
   --max_pixels 268324 --min_pixels 8192 --eval_strategy no
-  --save_strategy steps --save_steps "${SAVE_STEPS}" --save_total_limit 1
+  --save_strategy steps --save_steps "${SAVE_STEPS}" --save_total_limit "${SAVE_TOTAL_LIMIT}"
   --learning_rate 1e-5 --weight_decay 0.01 --warmup_ratio 0.03
   --max_grad_norm 1 --lr_scheduler_type cosine --logging_steps 1
   --model_max_length 12800 --gradient_checkpointing False
@@ -108,7 +109,7 @@ fi
 echo "Experiment=${MOPE_NEW_EXPERIMENT} train_llm=${TUNE_LLM} train_projector=True train_mope=False grad_accum=${GRAD_ACCUM} effective_batch=${EFFECTIVE_BATCH}"
 echo "MoPE=${MOPE_NEW_CKPT} architecture=dense8+moe8/top1/shared1 pos=3d_sincos frames=16 sampling=4x4 input=224 pool=temporal expected=[B,8,768]"
 echo "Output=${OUTPUT_DIR} warmstart=${WARMSTART:-none} resume=${RESUME_FROM_CHECKPOINT:-none}"
-echo "DataLoader workers/rank=${DATALOADER_NUM_WORKERS} total_workers=$((DATALOADER_NUM_WORKERS * NPROC_PER_NODE)) save_steps=${SAVE_STEPS}"
+echo "DataLoader workers/rank=${DATALOADER_NUM_WORKERS} total_workers=$((DATALOADER_NUM_WORKERS * NPROC_PER_NODE)) save_steps=${SAVE_STEPS} save_total_limit=${SAVE_TOTAL_LIMIT}"
 echo "Log=${LOG_FILE}"
 printf 'COMMAND:'; printf ' %q' "${COMMAND[@]}"; printf '\n'
 [[ "${DRY_RUN}" == "1" ]] && exit 0

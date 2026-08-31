@@ -167,3 +167,26 @@ def test_e02c_three_gpu_launcher_preserves_effective_batch(tmp_path):
     assert "--nproc_per_node=3" in result.stdout
     assert "--gradient_accumulation_steps 8" in result.stdout
     assert "effective_batch=48" in result.stdout
+
+
+def test_e02c_launcher_allows_two_checkpoint_rotation(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    env = {
+        **os.environ,
+        "SPACE_OUTPUT_ROOT": str(tmp_path / "output"),
+        "SPACE_LOG_ROOT": str(tmp_path / "logs"),
+        "MOPE_NEW_ALLOW_MISSING_ASSETS": "1",
+        "SAVE_TOTAL_LIMIT": "2",
+        "DRY_RUN": "1",
+    }
+    result = subprocess.run(
+        ["bash", str(root / "scripts/idea1_feature/train/train_e02c_mope_new_crossattn_joint.sh")],
+        cwd=root,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--save_total_limit 2" in result.stdout
+    assert "save_total_limit=2" in result.stdout
