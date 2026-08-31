@@ -10,6 +10,7 @@ import pytest
 from model.mope_new_encoder import load_projector_warmstart
 from model.mope_projector import MoPEProjectorCrossAttn
 from train_framework.train_space_mope_new import configure_trainability, validate_resume_scope
+from train_framework.checkpoint_rotation import predelete_for_two_slot_rotation
 from train_framework.data import mope_data_wrapper
 
 
@@ -177,6 +178,7 @@ def test_e02c_launcher_allows_two_checkpoint_rotation(tmp_path):
         "SPACE_LOG_ROOT": str(tmp_path / "logs"),
         "MOPE_NEW_ALLOW_MISSING_ASSETS": "1",
         "SAVE_TOTAL_LIMIT": "2",
+        "PREDELETE_OLDEST_CHECKPOINT": "1",
         "DRY_RUN": "1",
     }
     result = subprocess.run(
@@ -189,4 +191,45 @@ def test_e02c_launcher_allows_two_checkpoint_rotation(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert "--save_total_limit 2" in result.stdout
+    assert "--predelete_oldest_checkpoint True" in result.stdout
     assert "save_total_limit=2" in result.stdout
+    assert "predelete_oldest=1" in result.stdout
+
+
+def test_two_slot_rotation_deletes_placeholder_and_keeps_complete_latest(tmp_path):
+    output = tmp_path / "train"
+    placeholder = output / "checkpoint-2000"
+    latest = output / "checkpoint-3000"
+    placeholder.mkdir(parents=True)
+    (placeholder / "partial-shard.pt").write_bytes(b"partial")
+    latest.mkdir()
+    (latest / "trainer_state.json").write_text("{}")
+
+    deleted = predelete_for_two_slot_rotation(output, 4000)
+
+    assert deleted == [str(placeholder)]
+    assert not placeholder.exists()
+    assert latest.is_dir()
+
+
+def test_two_slot_rotation_refuses_to_delete_when_latest_is_incomplete(tmp_path):
+    output = tmp_path / "train"
+    oldest = output / "checkpoint-2000"
+    latest = output / "checkpoint-3000"
+    oldest.mkdir(parents=True)
+    (oldest / "trainer_state.json").write_text("{}")
+    latest.mkdir()
+
+    with pytest.raises(RuntimeError, match="newest recovery point is incomplete"):
+        predelete_for_two_slot_rotation(output, 4000)
+
+    assert oldest.is_dir()
+    assert latest.is_dir()
+
+
+def test_two_slot_rotation_refuses_existing_save_destination(tmp_path):
+    output = tmp_path / "train"
+    (output / "checkpoint-4000").mkdir(parents=True)
+
+    with pytest.raises(RuntimeError, match="destination already exists"):
+        predelete_for_two_slot_rotation(output, 4000)

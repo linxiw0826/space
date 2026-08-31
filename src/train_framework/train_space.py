@@ -101,6 +101,10 @@ from src.train_framework.argument import (
     DataArguments,
     TrainingArguments,
 )
+from src.train_framework.checkpoint_rotation import (
+    is_complete_checkpoint,
+    predelete_for_two_slot_rotation,
+)
 
 local_rank = None
 
@@ -1111,6 +1115,12 @@ def train(attn_implementation="flash_attention_2"):
     class _DiagTrainer(Trainer):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
+            if self.args.predelete_oldest_checkpoint and (
+                self.args.save_total_limit is None or self.args.save_total_limit < 2
+            ):
+                raise ValueError(
+                    "predelete_oldest_checkpoint requires save_total_limit>=2"
+                )
             self._diag_calls = 0
             # E-10b gate anti-collapse config (closed over from mope_args).
             self._gate_proj = _gate_proj
@@ -1125,6 +1135,39 @@ def train(attn_implementation="flash_attention_2"):
             # E-10b v2.1: real gate-logit grad norm captured by the backward hook
             # registered in _gate_anticollapse_loss (change 2). -1 = not yet seen.
             self._last_gate_logit_gnorm = -1.0
+
+        def _save_checkpoint(self, model, trial):
+            if self.args.predelete_oldest_checkpoint:
+                error = None
+                deleted = []
+                if self.is_world_process_zero():
+                    try:
+                        deleted = predelete_for_two_slot_rotation(
+                            self.args.output_dir,
+                            self.state.global_step,
+                        )
+                    except Exception as exc:  # coordinated across all ranks below
+                        error = f"{type(exc).__name__}: {exc}"
+
+                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    payload = [error]
+                    torch.distributed.broadcast_object_list(payload, src=0)
+                    error = payload[0]
+                    if error is None:
+                        torch.distributed.barrier()
+
+                if error is not None:
+                    raise RuntimeError(
+                        f"two-slot checkpoint pre-delete failed: {error}"
+                    )
+                if self.is_world_process_zero():
+                    print(
+                        "[checkpoint-two-slot] "
+                        f"step={self.state.global_step} deleted={deleted or 'none'}",
+                        flush=True,
+                    )
+
+            return super()._save_checkpoint(model, trial)
 
         def _gate_anticollapse_loss(self, base_loss):
             """E-10b v2.1: build the gate anti-collapse loss bundle on the live graph.
@@ -1350,33 +1393,6 @@ def train(attn_implementation="flash_attention_2"):
                 f"gate_init_bias={mope_args.mope_gate_init_bias})."
             )
 
-    def _is_complete_checkpoint(ckpt_dir):
-        # An auto-detected checkpoint is only safe to resume from if it is fully
-        # written. trainer_state.json is the HF Trainer marker (missing if the
-        # previous save was interrupted). For DeepSpeed runs the optimizer/model
-        # shards live under <ckpt>/<tag>/ where <tag> is the content of the
-        # `latest` file; if `latest` points at a missing global_stepN/ dir the
-        # DeepSpeed resume would fail, so treat it as incomplete. Non-DeepSpeed
-        # checkpoints have no `latest` file and are judged by trainer_state.json
-        # alone.
-        if not os.path.isfile(os.path.join(ckpt_dir, "trainer_state.json")):
-            return False
-        latest_file = os.path.join(ckpt_dir, "latest")
-        if os.path.isfile(latest_file):
-            try:
-                with open(latest_file) as f:
-                    tag = f.read().strip()
-            except (OSError, ValueError) as e:
-                # A save race (file removed mid-read), permission or decode error
-                # means we can't trust the checkpoint; fall back to from-scratch.
-                logging.warning(f"failed to read {latest_file} ({e}); treating checkpoint as incomplete")
-                return False
-            # An empty tag would make os.path.join(ckpt_dir, tag) collapse to
-            # ckpt_dir/ (always a dir), masking a half-written `latest`.
-            if not tag or not os.path.isdir(os.path.join(ckpt_dir, tag)):
-                return False
-        return True
-
     # Respect the CLI-provided --resume_from_checkpoint (used as-is, no
     # completeness check). Only auto-detect a checkpoint when it was not
     # explicitly passed, and only accept a *complete* checkpoint; otherwise
@@ -1384,7 +1400,7 @@ def train(attn_implementation="flash_attention_2"):
     resume_ckpt = training_args.resume_from_checkpoint
     if not resume_ckpt and not training_args.overwrite_output_dir:
         last_ckpt = get_last_checkpoint(training_args.output_dir)
-        if last_ckpt is not None and _is_complete_checkpoint(last_ckpt):
+        if last_ckpt is not None and is_complete_checkpoint(last_ckpt):
             resume_ckpt = last_ckpt
             logging.info(f"checkpoint found, resume training from {resume_ckpt}")
     if resume_ckpt:

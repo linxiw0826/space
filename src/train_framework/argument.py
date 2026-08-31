@@ -506,6 +506,15 @@ class TrainingArguments(transformers.TrainingArguments):
     mm_projector_lr: Optional[float] = None
     vision_tower_lr: Optional[float] = None
     group_by_modality_length: bool = field(default=False)
+    predelete_oldest_checkpoint: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable two-slot checkpoint rotation: immediately before "
+                    "writing checkpoint-N, delete every older checkpoint except "
+                    "the newest complete recovery point. Requires "
+                    "save_total_limit>=2."
+        },
+    )
     ## Lora config
     lora_enable: bool = field(default=False)
     lora_r: int = field(default=64)
