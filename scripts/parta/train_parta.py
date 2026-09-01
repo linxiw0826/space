@@ -85,6 +85,11 @@ def _ddp_wrapper_kwargs(local_rank: int) -> dict[str, object]:
     }
 
 
+def _should_export_head_free(*, arm: str, engineering: bool, is_primary: bool) -> bool:
+    """Engineering checkpoints are evidence-only and cannot be exported."""
+    return is_primary and arm == "a1o" and not engineering
+
+
 def _write_rank_failure(error: BaseException, stage: str, output_dir: Path) -> None:
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -401,6 +406,7 @@ def main() -> None:
         "val_batches_per_source": args.val_batches_per_source,
         "checkpoint_selection_rule": CHECKPOINT_SELECTION_RULE,
         "effective_device": effective_device,
+        "requested_device": args.device,
         "gradient_checkpointing": args.gradient_checkpointing,
         "per_rank_batch_size": 1,
         "effective_global_batch_size": context.world_size * config.gradient_accumulation_steps,
@@ -760,7 +766,9 @@ def main() -> None:
         per_rank_cuda_peak = sorted(
             (item for item in gathered if item is not None), key=lambda item: item["rank"]
         )
-    if context.is_primary and args.arm == "a1o":
+    if _should_export_head_free(
+        arm=args.arm, engineering=engineering, is_primary=context.is_primary
+    ):
         drop_path = args.output_dir / "checkpoint-a1o-drop.pt"
         export_head_free_checkpoint(final_path, drop_path)
         atomic_json_dump(

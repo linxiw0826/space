@@ -29,6 +29,8 @@ from parta.resource_profile_contract import (LAMBDA_STATE,
     validate_rank_failure_rows)  # noqa: E402
 from parta.resource_profile_contract import validate_preexecution_profile  # noqa: E402
 from parta.resource_profile_contract import validate_resolved_profile  # noqa: E402
+from parta.resource_profile_contract import is_safe_profile_measurement  # noqa: E402
+from parta.resource_profile_contract import validate_physical_execution_provenance  # noqa: E402
 
 
 def _json(path: Path) -> dict:
@@ -302,6 +304,11 @@ def _profile(args, contract):
         raise ValueError("resource profile transaction must be non-formal and non-promotable")
     if receipt.get("required_world_size") != 4:
         raise ValueError("resource profile must use the frozen four-rank contract")
+    if receipt.get("throughput_evidence_final") is not True:
+        raise ValueError("shared-GPU profile is diagnostic and cannot pass the formal profile gate")
+    validate_physical_execution_provenance(
+        receipt.get("physical_execution", {}), require_snapshot=True
+    )
     if tuple(receipt.get("source_registry", ())) != FORMAL_SOURCE_REGISTRY:
         raise ValueError("resource profile does not bind the D-62 source registry")
     if receipt.get("manifest_sha256") != contract.get("manifest_sha256"):
@@ -421,9 +428,7 @@ def _profile(args, contract):
     if set(runtime_matched_normalized) == {"ddp", "fsdp"} and \
             runtime_matched_normalized["ddp"] != runtime_matched_normalized["fsdp"]:
         raise ValueError("profile runtime matched contracts differ beyond strategy")
-    safe = [item for item in measurements if not item["oom"] and item.get("finite") is True
-            and all(rank["peak_allocated_bytes"] < rank["total_memory_bytes"] * 0.90
-                    for rank in item["per_rank_peak_memory_bytes"])]
+    safe = [item for item in measurements if is_safe_profile_measurement(item)]
     selected = min(
         safe,
         key=lambda item: (-item["throughput_samples_per_second"],
@@ -446,6 +451,8 @@ def _profile(args, contract):
             ),
         },
         "independent_profile_receipt_sha256": sha256_file(args.profile_receipt),
+        "throughput_evidence_final": receipt.get("throughput_evidence_final"),
+        "physical_execution": receipt.get("physical_execution"),
     }
 
 

@@ -13,6 +13,8 @@ from transformers.utils import ModelOutput
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+import parta.runner as runner_module
+
 from parta.checkpoint import (
     ResumeContract,
     export_head_free_checkpoint,
@@ -34,6 +36,8 @@ from parta.runner import (
     attach_a1o_head_without_advancing_shared_rng,
     SourceBalancedCursor,
     validate_single_step_execution_contract,
+    _clip_grad_norm,
+    _gradient_norm,
 )
 from parta.state_head import StateHeadConfig
 from parta.state_loss import StateLossConfig, StateTargets
@@ -241,6 +245,42 @@ def test_a1o_output_contract_rejects_undeclared_distributed_mapping_key():
 
     with pytest.raises(TypeError, match="parta_state_loss"):
         validate_a1o_model_output_contract(IncompleteOutput)
+
+
+def test_gradient_clipping_dispatches_to_fsdp_collective(monkeypatch):
+    class FakeFSDP(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.called_with = None
+
+        def clip_grad_norm_(self, max_norm):
+            self.called_with = max_norm
+            return torch.tensor(3.0)
+
+    model = FakeFSDP()
+    monkeypatch.setattr(
+        runner_module, "_is_fsdp_model", lambda candidate: candidate is model
+    )
+    result = _clip_grad_norm(model, (), 1.0)
+    assert model.called_with == 1.0
+    assert result.item() == 3.0
+
+
+def test_sharded_gradient_norm_collective_runs_for_empty_local_shard(monkeypatch):
+    parameter = torch.nn.Parameter(torch.empty(0))
+    calls = []
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_reduce",
+        lambda tensor, op: calls.append((tensor.clone(), op)),
+    )
+    assert _gradient_norm([parameter], distributed_sharded=True) == 0.0
+    assert len(calls) == 1
+    calls.clear()
+    assert _gradient_norm([], distributed_sharded=True) == 0.0
+    assert calls == []
 
 
 def test_a1o_ddp_find_unused_supports_multiple_forward_backward_steps():

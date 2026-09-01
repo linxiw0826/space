@@ -14,12 +14,15 @@ from parta.worker_trust import validate_python_worker, validate_torchrun_worker
 from scripts.parta.audit_a1o_drop_load import producer_record
 from parta.resource_profile_contract import (LAMBDA_STATE, normalize_profile_worker_argv,
     checkpoint_artifact_identity, normalize_profile_matched_execution,
+    is_safe_profile_measurement,
+    validate_physical_execution_provenance,
     normalized_contract_sha256,
     validate_preexecution_profile, validate_resolved_profile)
 from scripts.parta.freeze_pretrain_config import validate_profile_selected_config
 from scripts.parta.run_resource_profile import (collect_rank_failure_evidence,
                                                  run_with_timeout,
-                                                 write_worker_failure_diagnostics)
+                                                 write_worker_failure_diagnostics,
+                                                 command_physical_execution_provenance)
 from scripts.parta import train_parta as train_parta_script
 from scripts.parta.audit_three_source_validator import validate_recomputed_summary
 from scripts.parta.audit_formal_startup import (validate_single_checkpoint_artifact,
@@ -268,6 +271,10 @@ def test_profile_normalized_contract_detects_drift_and_lambda():
     drift = list(base)
     drift[drift.index("--learning-rate") + 1] = "3e-5"
     assert normalize_profile_worker_argv(drift) != ddp
+    save_drift = [*base, "--save-steps", "1"]
+    assert normalize_profile_worker_argv(save_drift) != ddp
+    device_drift = [*base, "--device", "cuda:1"]
+    assert normalize_profile_worker_argv(device_drift) != ddp
     bad_lambda = list(base)
     bad_lambda[bad_lambda.index("--lambda-state") + 1] = "0.05"
     with pytest.raises(ValueError, match="lambda_state"):
@@ -281,7 +288,8 @@ def test_freeze_rejects_selected_profile_field_tampering():
         "num_workers": "4", "gradient_checkpointing": True,
         "effective_global_batch_size": 8,
     }
-    report = {"result": {"recommendation": {"selected_strategy": "fsdp"},
+    report = {"result": {"throughput_evidence_final": True,
+                         "recommendation": {"selected_strategy": "fsdp"},
                          "measurements": [{"distributed_strategy": "fsdp",
                                            "normalized_execution_contract": contract}]}}
     resolved = {
@@ -292,6 +300,11 @@ def test_freeze_rejects_selected_profile_field_tampering():
         "effective_global_batch_size": 8,
     }
     validate_profile_selected_config(report, resolved)
+    with pytest.raises(ValueError, match="shared/non-final"):
+        validate_profile_selected_config(
+            {"result": {**report["result"], "throughput_evidence_final": False}},
+            resolved,
+        )
     for key, bad in (("lambda_state", 0.05), ("gradient_checkpointing", False),
                      ("effective_global_batch_size", 4)):
         with pytest.raises(ValueError, match="differs"):
@@ -323,6 +336,64 @@ def test_profile_worker_timeout_is_terminated_and_structured(tmp_path):
         time.sleep(0.1)
     else:
         pytest.fail("timeout left a torchrun child process alive")
+
+
+def test_profile_physical_execution_provenance_and_reserved_memory_gate():
+    shared = {
+        "assigned_physical_gpus": [1, 2, 4, 6],
+        "execution_environment": "shared_gpu",
+        "throughput_evidence_final": False,
+    }
+    assert command_physical_execution_provenance(
+        {"ddp": shared, "fsdp": dict(shared)}
+    ) == shared
+    with pytest.raises(ValueError, match="physical execution provenance"):
+        command_physical_execution_provenance({
+            "ddp": shared,
+            "fsdp": {**shared, "throughput_evidence_final": True},
+        })
+    snapshot = {
+        "schema_version": "parta_profile_gpu_snapshot_v1",
+        "gpus": [
+            {"index": index, "memory_used_mib": 5, "memory_free_mib": 97000}
+            for index in shared["assigned_physical_gpus"]
+        ],
+        "compute_processes": [],
+    }
+    exclusive = {
+        **shared,
+        "execution_environment": "exclusive_gpu",
+        "throughput_evidence_final": True,
+        "preflight_gpu_snapshot": snapshot,
+    }
+    validate_physical_execution_provenance(
+        exclusive, visible_devices="1,2,4,6", require_snapshot=True
+    )
+    with pytest.raises(ValueError, match="CUDA_VISIBLE_DEVICES"):
+        validate_physical_execution_provenance(
+            exclusive, visible_devices="1,2,4,7", require_snapshot=True
+        )
+    occupied = {
+        **exclusive,
+        "preflight_gpu_snapshot": {**snapshot, "compute_processes": ["uuid, 123, python"]},
+    }
+    with pytest.raises(ValueError, match="occupied GPUs"):
+        validate_physical_execution_provenance(occupied, require_snapshot=True)
+
+    ranks = [{
+        "rank": rank,
+        "peak_allocated_bytes": 50,
+        "peak_reserved_bytes": 89,
+        "total_memory_bytes": 100,
+    } for rank in range(4)]
+    measurement = {
+        "oom": False,
+        "finite": True,
+        "per_rank_peak_memory_bytes": ranks,
+    }
+    assert is_safe_profile_measurement(measurement)
+    ranks[3]["peak_reserved_bytes"] = 90
+    assert not is_safe_profile_measurement(measurement)
 
 
 def test_profile_worker_failure_diagnostics_preserve_stdout_and_stderr(tmp_path):
@@ -517,7 +588,8 @@ def test_profile_to_coverage_reopen_contract_is_consistent(tmp_path):
         "learning_rate": 2e-5, "weight_decay": 0.0, "max_grad_norm": 1.0,
         "dtype": "bfloat16", "num_workers": 4, "seed": 42,
         "required_frame_count": 32, "engineering_mode": "resource_profile",
-        "dry_run": True, "world_size": 4,
+        "dry_run": True, "world_size": 4, "max_steps": 2, "save_steps": 500,
+        "requested_device": "cuda:0", "effective_device": "cuda:0",
         "manifest": str(files["manifest"].resolve()),
         "manifest_report": str(files["report"].resolve()),
         "media_root": str(media.resolve()), "model_path": str(model.resolve()),
@@ -528,3 +600,18 @@ def test_profile_to_coverage_reopen_contract_is_consistent(tmp_path):
     validate_resolved_profile(resolved, reopened, "fsdp")
     with pytest.raises(ValueError, match="resolved config"):
         validate_resolved_profile({**resolved, "required_frame_count": 24}, reopened, "fsdp")
+
+
+def test_engineering_a1o_never_exports_promotable_head_free_artifact():
+    assert not train_parta_script._should_export_head_free(
+        arm="a1o", engineering=True, is_primary=True
+    )
+    assert train_parta_script._should_export_head_free(
+        arm="a1o", engineering=False, is_primary=True
+    )
+    assert not train_parta_script._should_export_head_free(
+        arm="a0", engineering=False, is_primary=True
+    )
+    assert not train_parta_script._should_export_head_free(
+        arm="a1o", engineering=False, is_primary=False
+    )

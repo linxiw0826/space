@@ -17,6 +17,8 @@ from parta.checkpoint_selection import RULE as CHECKPOINT_SELECTION_RULE  # noqa
 
 
 def validate_profile_selected_config(profile_report: dict, resolved_training: dict) -> tuple[str, dict]:
+    if profile_report.get("result", {}).get("throughput_evidence_final") is not True:
+        raise ValueError("formal config freeze rejects shared/non-final throughput evidence")
     recommendation = profile_report.get("result", {}).get("recommendation", {})
     selected_strategy = recommendation.get("selected_strategy")
     if selected_strategy not in {"ddp", "fsdp"}:

@@ -392,9 +392,16 @@ class PartATrainer:
         parameters = [parameter for _, parameter in named_parameters]
         shared_parameters = [parameter for name, parameter in named_parameters if "parta_state_head." not in name]
         head_parameters = [parameter for name, parameter in named_parameters if "parta_state_head." in name]
-        shared_grad_norm = _gradient_norm(shared_parameters)
-        head_grad_norm = _gradient_norm(head_parameters)
-        grad_norm_tensor = torch.nn.utils.clip_grad_norm_(parameters, self.config.max_grad_norm)
+        fsdp_model = _is_fsdp_model(self.model)
+        shared_grad_norm = _gradient_norm(
+            shared_parameters, distributed_sharded=fsdp_model
+        )
+        head_grad_norm = _gradient_norm(
+            head_parameters, distributed_sharded=fsdp_model
+        )
+        grad_norm_tensor = _clip_grad_norm(
+            self.model, parameters, self.config.max_grad_norm
+        )
         grad_norm = float(grad_norm_tensor.detach().float())
         if not math.isfinite(grad_norm):
             raise FloatingPointError("non-finite gradient norm")
@@ -455,8 +462,46 @@ def config_sha256(config: PartATrainConfig) -> str:
     return stable_sha256(asdict(config))
 
 
-def _gradient_norm(parameters: Sequence[torch.Tensor]) -> float:
-    grads = [parameter.grad.detach().float().norm(2) for parameter in parameters if parameter.grad is not None]
-    if not grads:
+def _is_fsdp_model(model: nn.Module) -> bool:
+    try:
+        from torch.distributed.fsdp import FullyShardedDataParallel
+    except ImportError:
+        return False
+    return isinstance(model, FullyShardedDataParallel)
+
+
+def _clip_grad_norm(
+    model: nn.Module,
+    parameters: Sequence[torch.Tensor],
+    max_norm: float,
+) -> torch.Tensor:
+    """Use FSDP's collective norm/clipping for sharded parameters."""
+    if _is_fsdp_model(model):
+        return model.clip_grad_norm_(max_norm)
+    return torch.nn.utils.clip_grad_norm_(parameters, max_norm)
+
+
+def _gradient_norm(
+    parameters: Sequence[torch.Tensor], *, distributed_sharded: bool = False
+) -> float:
+    if not parameters:
+        # A0 has no state-head parameters on every rank. Avoid constructing a
+        # CPU scalar and handing it to an NCCL collective.
         return 0.0
-    return float(torch.stack(grads).norm(2))
+    grads = [
+        parameter.grad.detach().float().norm(2)
+        for parameter in parameters
+        if parameter.grad is not None
+    ]
+    if grads:
+        squared = torch.stack([grad.square() for grad in grads]).sum()
+    elif distributed_sharded:
+        device = next((parameter.device for parameter in parameters), torch.device("cpu"))
+        squared = torch.zeros((), dtype=torch.float32, device=device)
+    else:
+        return 0.0
+    if distributed_sharded:
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            raise RuntimeError("FSDP gradient norm requires an initialized process group")
+        torch.distributed.all_reduce(squared, op=torch.distributed.ReduceOp.SUM)
+    return float(squared.sqrt())

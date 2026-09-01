@@ -14,6 +14,68 @@ FRAME_COUNT = 32
 STRATEGIES = ("ddp", "fsdp")
 
 
+def validate_physical_execution_provenance(
+    provenance: dict[str, Any], *, visible_devices: str | None = None,
+    require_snapshot: bool = False,
+) -> dict[str, Any]:
+    assigned = provenance.get("assigned_physical_gpus")
+    environment = provenance.get("execution_environment")
+    final_throughput = provenance.get("throughput_evidence_final")
+    if (not isinstance(assigned, list) or len(assigned) != WORLD_SIZE
+            or len(set(assigned)) != WORLD_SIZE
+            or any(not isinstance(item, int) or item < 0 for item in assigned)
+            or environment not in {"exclusive_gpu", "shared_gpu"}
+            or not isinstance(final_throughput, bool)
+            or (environment == "shared_gpu" and final_throughput is not False)
+            or (environment == "exclusive_gpu" and final_throughput is not True)):
+        raise ValueError("invalid physical profile execution provenance")
+    if visible_devices is not None:
+        try:
+            visible = [int(item.strip()) for item in visible_devices.split(",")]
+        except ValueError as error:
+            raise ValueError("invalid CUDA_VISIBLE_DEVICES for profile") from error
+        if visible != assigned:
+            raise ValueError("CUDA_VISIBLE_DEVICES differs from assigned physical GPUs")
+    snapshot = provenance.get("preflight_gpu_snapshot")
+    if require_snapshot:
+        if not isinstance(snapshot, dict):
+            raise ValueError("physical profile provenance lacks GPU snapshot")
+        rows = snapshot.get("gpus")
+        processes = snapshot.get("compute_processes")
+        if (snapshot.get("schema_version") != "parta_profile_gpu_snapshot_v1"
+                or not isinstance(rows, list) or len(rows) != WORLD_SIZE
+                or [row.get("index") for row in rows] != assigned
+                or any(not isinstance(row.get("memory_used_mib"), int)
+                       or not isinstance(row.get("memory_free_mib"), int)
+                       for row in rows)
+                or not isinstance(processes, list)):
+            raise ValueError("invalid physical profile GPU snapshot")
+        if environment == "exclusive_gpu" and (
+            processes or any(row["memory_used_mib"] >= 1024 for row in rows)
+        ):
+            raise ValueError("exclusive profile evidence shows occupied GPUs")
+    return provenance
+
+
+def is_safe_profile_measurement(item: dict[str, Any]) -> bool:
+    """Require finite execution and <90% allocated *and reserved* on every rank."""
+    ranks = item.get("per_rank_peak_memory_bytes")
+    return bool(
+        item.get("oom") is False
+        and item.get("finite") is True
+        and isinstance(ranks, list)
+        and len(ranks) == WORLD_SIZE
+        and all(
+            isinstance(rank.get("peak_allocated_bytes"), int)
+            and isinstance(rank.get("peak_reserved_bytes"), int)
+            and isinstance(rank.get("total_memory_bytes"), int)
+            and rank["peak_allocated_bytes"] < rank["total_memory_bytes"] * 0.90
+            and rank["peak_reserved_bytes"] < rank["total_memory_bytes"] * 0.90
+            for rank in ranks
+        )
+    )
+
+
 def normalize_profile_matched_execution(
     execution: dict[str, Any], strategy: str
 ) -> dict[str, Any]:
@@ -31,6 +93,7 @@ VALUE_FLAGS = (
     "--vggt-path", "--seed", "--learning-rate", "--weight-decay", "--lambda-state",
     "--max-grad-norm", "--gradient-accumulation-steps", "--dtype", "--num-workers",
     "--engineering-subset", "--engineering-mode", "--required-frame-count",
+    "--max-steps", "--save-steps", "--device",
 )
 
 
@@ -40,6 +103,9 @@ def normalize_profile_worker_argv(argv: Sequence[str]) -> dict[str, Any]:
     values["source_roots"] = sorted(
         argv[index + 1] for index, value in enumerate(argv) if value == "--source-root"
     )
+    values.setdefault("max_steps", "1000")
+    values.setdefault("save_steps", "500")
+    values.setdefault("device", "cuda:0")
     values.update({
         "gradient_checkpointing": "--gradient-checkpointing" in argv,
         "dry_run": "--dry-run" in argv,
@@ -162,6 +228,8 @@ def validate_resolved_profile(resolved: dict[str, Any], contract: dict[str, Any]
         "num_workers": int(contract["num_workers"]), "seed": int(contract["seed"]),
         "required_frame_count": FRAME_COUNT, "engineering_mode": "resource_profile",
         "dry_run": True, "world_size": WORLD_SIZE,
+        "max_steps": 2, "save_steps": int(contract["save_steps"]),
+        "requested_device": contract["device"], "effective_device": "cuda:0",
         "manifest": str(Path(contract["manifest"]).resolve()),
         "manifest_report": str(Path(contract["manifest_report"]).resolve()),
         "media_root": str(Path(contract["media_root"]).resolve()),

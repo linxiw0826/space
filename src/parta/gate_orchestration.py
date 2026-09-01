@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .provenance import atomic_json_dump, sha256_file, stable_sha256
-from .resource_profile_contract import validate_rank_failure_rows
+from .resource_profile_contract import is_safe_profile_measurement, validate_rank_failure_rows
 
 
 FORMAL_SOURCE_REGISTRY = ("adt", "hypersim", "scannetppv2")
@@ -381,9 +381,7 @@ def validate_phase_report(
                     or any("NVIDIA H20" not in str(rank.get("device_name")) for rank in per_rank)
                 ):
                     failures.append("per_rank_h20_cuda_peak")
-                elif (not item.get("oom") and item.get("finite") is True
-                      and all(rank["peak_allocated_bytes"] < rank["total_memory_bytes"] * 0.90
-                              for rank in per_rank)):
+                elif is_safe_profile_measurement(item):
                     feasible.append(item["distributed_strategy"])
                 elif not item.get("oom") and item.get("finite") is not True:
                     failures.append("profile_nonfinite")
@@ -403,12 +401,7 @@ def validate_phase_report(
         if isinstance(measurements, list):
             safe = {
                 item.get("distributed_strategy") for item in measurements
-                if not item.get("oom")
-                and item.get("finite") is True
-                and isinstance(item.get("per_rank_peak_memory_bytes"), list)
-                and all(rank.get("peak_allocated_bytes", float("inf"))
-                        < rank.get("total_memory_bytes", 0) * 0.90
-                        for rank in item["per_rank_peak_memory_bytes"])
+                if is_safe_profile_measurement(item)
             }
             if recommendation.get("selected_strategy") not in safe:
                 failures.append("recommendation_not_safe")

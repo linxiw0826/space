@@ -25,6 +25,8 @@ from parta.resource_profile_contract import (FRAME_COUNT, LAMBDA_STATE,
 from parta.resource_profile_contract import validate_preexecution_profile  # noqa: E402
 from parta.resource_profile_contract import validate_resolved_profile  # noqa: E402
 from parta.resource_profile_contract import validate_rank_failure_rows  # noqa: E402
+from parta.resource_profile_contract import is_safe_profile_measurement  # noqa: E402
+from parta.resource_profile_contract import validate_physical_execution_provenance  # noqa: E402
 from parta.worker_trust import (TRAIN_WORKER_SWITCH_FLAGS, train_worker_flag_contract,
                                 validate_torchrun_worker)  # noqa: E402
 
@@ -135,6 +137,48 @@ def collect_rank_failure_evidence(run_dir: Path) -> list[dict]:
     return rows
 
 
+def command_physical_execution_provenance(command_records: dict[str, dict]) -> dict:
+    records = {
+        strategy: {
+            "assigned_physical_gpus": record.get("assigned_physical_gpus"),
+            "execution_environment": record.get("execution_environment"),
+            "throughput_evidence_final": record.get("throughput_evidence_final"),
+        }
+        for strategy, record in command_records.items()
+    }
+    if set(records) != set(STRATEGIES) or records["ddp"] != records["fsdp"]:
+        raise ValueError("DDP/FSDP physical execution provenance differs")
+    return validate_physical_execution_provenance(
+        records["ddp"], visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES")
+    )
+
+
+def capture_gpu_preflight_snapshot(assigned: list[int]) -> dict:
+    query = subprocess.check_output([
+        "nvidia-smi", f"--id={','.join(map(str, assigned))}",
+        "--query-gpu=index,memory.used,memory.free", "--format=csv,noheader,nounits",
+    ], text=True)
+    rows = []
+    for line in query.splitlines():
+        if not line.strip():
+            continue
+        index, used, free = (int(item.strip()) for item in line.split(","))
+        rows.append({"index": index, "memory_used_mib": used, "memory_free_mib": free})
+    process_query = subprocess.run([
+        "nvidia-smi", f"--id={','.join(map(str, assigned))}",
+        "--query-compute-apps=gpu_uuid,pid,process_name,used_memory",
+        "--format=csv,noheader,nounits",
+    ], text=True, capture_output=True, check=False)
+    if process_query.returncode != 0:
+        raise RuntimeError(f"nvidia-smi process query failed: {process_query.stderr.strip()}")
+    return {
+        "schema_version": "parta_profile_gpu_snapshot_v1",
+        "gpus": sorted(rows, key=lambda row: row["index"]),
+        "compute_processes": [line.strip() for line in process_query.stdout.splitlines()
+                              if line.strip()],
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", type=Path, required=True)
@@ -162,6 +206,16 @@ def main() -> None:
     train_runner_sha256 = _sha256(TRAIN_RUNNER)
     command_payloads = {strategy: _json(path).get("argv") for strategy, path in commands.items()}
     normalized_contract, normalized_contract_hash = validate_profile_pair(command_payloads)
+    command_records = {strategy: _json(path) for strategy, path in commands.items()}
+    execution_provenance = command_physical_execution_provenance(command_records)
+    execution_provenance = {
+        **execution_provenance,
+        "preflight_gpu_snapshot": capture_gpu_preflight_snapshot(
+            execution_provenance["assigned_physical_gpus"]
+        ),
+    }
+    validate_physical_execution_provenance(execution_provenance, require_snapshot=True)
+    final_throughput = execution_provenance["throughput_evidence_final"]
     for strategy in STRATEGIES:
         frame_count = FRAME_COUNT
         command_record = _json(commands[strategy])
@@ -359,9 +413,10 @@ def main() -> None:
             "peak_reserved_memory_bytes": peak_reserved,
             "total_memory_bytes": int(point["cuda_total_memory_bytes"]),
             "step_time_seconds": sum(float(row["step_seconds"]) for row in steps) / len(steps),
-            "throughput_samples_per_second": sum(
+            "throughput_samples_per_second": REQUIRED_WORLD_SIZE * sum(
                 float(row["samples_per_second"]) for row in steps
             ) / len(steps),
+            "throughput_scope": "global_four_rank",
             "oom": False,
             "batch_size": 1,
             "per_rank_batch_size": 1,
@@ -438,10 +493,10 @@ def main() -> None:
         "normalized_execution_contract": normalized_contract,
         "normalized_execution_contract_sha256": normalized_contract_hash,
         "lambda_state": LAMBDA_STATE,
+        "physical_execution": execution_provenance,
+        "throughput_evidence_final": final_throughput,
     }
-    safe = [item for item in measurements if not item["oom"] and item["finite"]
-            and all(rank["peak_allocated_bytes"] < rank["total_memory_bytes"] * 0.90
-                    for rank in item["per_rank_peak_memory_bytes"])]
+    safe = [item for item in measurements if is_safe_profile_measurement(item)]
     selected = min(
         safe,
         key=lambda item: (-item["throughput_samples_per_second"],
