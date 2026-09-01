@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import MutableMapping
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from typing import Any, Sequence
 
 import torch
@@ -24,6 +24,25 @@ class A1OSideBranchOutput:
     tap: StateTapOutput
     predictions: ObjectStatePredictions
     losses: dict[str, object]
+
+
+def validate_a1o_model_output_contract(output_type: type[Any]) -> None:
+    """Fail before model loading when distributed output reconstruction is unsafe."""
+    if not is_dataclass(output_type):
+        raise TypeError("A1-O model output must be a dataclass ModelOutput")
+    declared = {field.name for field in fields(output_type)}
+    required = {
+        "loss",
+        "visual_state_hidden",
+        "visual_state_valid_mask",
+        "parta_state_loss",
+    }
+    missing = sorted(required - declared)
+    if missing:
+        raise TypeError(
+            "A1-O model output lacks fields required for distributed reconstruction: "
+            f"{missing}"
+        )
 
 
 def install_a1o_forward_integration(model: nn.Module) -> None:

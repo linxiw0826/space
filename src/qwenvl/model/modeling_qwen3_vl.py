@@ -1956,6 +1956,11 @@ class Qwen3VLCausalLMOutputWithPast(ModelOutput):
     # are a read-only side output and never re-enter the QA forward path.
     visual_state_hidden: Optional[torch.FloatTensor] = None
     visual_state_valid_mask: Optional[torch.BoolTensor] = None
+    # A1-O's forward hook publishes this exact, non-detached scalar in the
+    # mapping returned to DDP/FSDP.  It must be a declared dataclass field:
+    # distributed pytree traversal may reconstruct ModelOutput via
+    # ``type(output)(**dict(output))`` and rejects undeclared mapping keys.
+    parta_state_loss: Optional[torch.FloatTensor] = None
 
 
 class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):

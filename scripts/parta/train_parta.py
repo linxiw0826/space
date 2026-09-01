@@ -51,6 +51,7 @@ from parta.training import (  # noqa: E402
     consume_a1o_forward_result,
     install_a1o_forward_integration,
     prepare_a1o_forward_request,
+    validate_a1o_model_output_contract,
 )
 from parta.training_log import JsonlTrainingLogger  # noqa: E402
 from parta.unified_data import (  # noqa: E402
@@ -417,6 +418,16 @@ def main() -> None:
     # into a shared runtime module. Importing here keeps CPU contract tests light.
     from run_t0_a import _checkpoint_artifact_provenance, _load_local  # noqa: PLC0415
     from parta.t0_runtime import PartAT0Collator
+
+    # Validate the real output class before loading the large model. Without
+    # this, an undeclared mapping key can fail only after all distributed ranks
+    # have completed an expensive forward pass.
+    if args.arm == "a1o":
+        from qwenvl.model.modeling_qwen3_vl import (  # noqa: PLC0415
+            Qwen3VLCausalLMOutputWithPast,
+        )
+
+        validate_a1o_model_output_contract(Qwen3VLCausalLMOutputWithPast)
 
     if args.engineering_mode == "resource_profile":
         normalized_profile = normalize_profile_worker_argv(sys.argv)

@@ -40,6 +40,7 @@ from parta.state_loss import StateLossConfig, StateTargets
 from parta.training import (
     attach_a1o_state_head, consume_a1o_forward_result,
     install_a1o_forward_integration, prepare_a1o_forward_request,
+    validate_a1o_model_output_contract,
 )
 from parta.training_log import JsonlTrainingLogger
 
@@ -67,6 +68,7 @@ class TinyHFOutput(ModelOutput):
     logits: torch.Tensor | None = None
     visual_state_hidden: torch.Tensor | None = None
     visual_state_valid_mask: torch.Tensor | None = None
+    parta_state_loss: torch.Tensor | None = None
 
 
 class TinyHFModel(TinyModel):
@@ -211,6 +213,34 @@ def test_a1o_model_output_exposes_exact_non_detached_state_loss_mapping():
     assert output["loss"] is output.loss
     assert output["parta_state_loss"] is branch.losses["loss_state"]
     assert output["parta_state_loss"].grad_fn is not None
+
+
+def test_real_qwen_output_reconstructs_with_a1o_state_loss_mapping():
+    """Regression for four-rank profiling's ModelOutput reconstruction."""
+    from qwenvl.model.modeling_qwen3_vl import Qwen3VLCausalLMOutputWithPast
+
+    state_loss = torch.tensor(1.25, requires_grad=True)
+    output = Qwen3VLCausalLMOutputWithPast(
+        loss=torch.tensor(2.0, requires_grad=True),
+        logits=torch.zeros(1, 1, 2),
+        parta_state_loss=state_loss,
+    )
+
+    reconstructed = type(output)(**dict(output))
+    assert reconstructed.parta_state_loss is state_loss
+    assert reconstructed["parta_state_loss"] is state_loss
+    validate_a1o_model_output_contract(Qwen3VLCausalLMOutputWithPast)
+
+
+def test_a1o_output_contract_rejects_undeclared_distributed_mapping_key():
+    @dataclass
+    class IncompleteOutput(ModelOutput):
+        loss: torch.Tensor | None = None
+        visual_state_hidden: torch.Tensor | None = None
+        visual_state_valid_mask: torch.Tensor | None = None
+
+    with pytest.raises(TypeError, match="parta_state_loss"):
+        validate_a1o_model_output_contract(IncompleteOutput)
 
 
 def test_a1o_ddp_find_unused_supports_multiple_forward_backward_steps():

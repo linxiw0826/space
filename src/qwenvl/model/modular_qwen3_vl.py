@@ -14,6 +14,7 @@
 # limitations under the License.
 """PyTorch Qwen3-VL model."""
 
+from dataclasses import dataclass
 from typing import Callable, Optional, Union
 
 import numpy as np
@@ -1138,8 +1139,13 @@ class Qwen3VLModel(Qwen2_5_VLModel):
         )
 
 
+@dataclass
 class Qwen3VLCausalLMOutputWithPast(Qwen2_5_VLCausalLMOutputWithPast):
-    pass
+    # Kept in the modular source as well as the generated modeling file so a
+    # future regeneration cannot silently remove the complete A1-O seam.
+    visual_state_hidden: Optional[torch.FloatTensor] = None
+    visual_state_valid_mask: Optional[torch.BoolTensor] = None
+    parta_state_loss: Optional[torch.FloatTensor] = None
 
 
 class Qwen3VLForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
