@@ -64,7 +64,10 @@ while (($#)); do
 done
 mkdir -p "$output/train__fake"
 printf '{"results": {"vsibench": 0.5}}\\n' > "$output/train__fake/20260822_results.json"
-printf '{"doc_id": 1}\\n' > "$output/train__fake/20260822_samples_vsibench_mope_new.jsonl"
+: > "$output/train__fake/20260822_samples_vsibench_mope_new.jsonl"
+for ((i=0; i<5130; i++)); do
+  printf '{"doc_id": %s}\\n' "$i" >> "$output/train__fake/20260822_samples_vsibench_mope_new.jsonl"
+done
 """
     )
     accelerate.chmod(0o755)
@@ -81,6 +84,12 @@ printf '{"doc_id": 1}\\n' > "$output/train__fake/20260822_samples_vsibench_mope_
     (checkpoint / "model-00001-of-00001.safetensors").write_text("weights")
     (checkpoint / "model.safetensors.index.json").write_text(
         '{"weight_map":{"x":"model-00001-of-00001.safetensors"}}'
+    )
+    incomplete_checkpoint = checkpoint.parent / "checkpoint-8000"
+    incomplete_checkpoint.mkdir()
+    (incomplete_checkpoint / "config.json").write_text("{}")
+    (incomplete_checkpoint / "model.safetensors.index.json").write_text(
+        '{"weight_map":{"x":"missing.safetensors"}}'
     )
     mope_checkpoint = tmp_path / "checkpoint-50.pth"
     mope_checkpoint.write_text("mope")
@@ -189,7 +198,8 @@ def test_vlm4d_eval_dry_run_contract(script_name, experiment_name):
         capture_output=True,
         check=True,
     )
-    assert f"checkpoint=/contract/output/train/{experiment_name}" in result.stdout
+    assert f"requested_checkpoint=/contract/output/train/{experiment_name}" in result.stdout
+    assert f"Effective_checkpoint=/contract/output/train/{experiment_name}" in result.stdout
     assert f"output=/contract/output/eval/vlm4d/{experiment_name}" in result.stdout
     assert f"Log=/contract/logs/eval/{experiment_name}_vlm4d_" in result.stdout
     assert "--model qwen3_vl_mope_new_crossattn" in result.stdout
@@ -202,6 +212,244 @@ def test_vlm4d_eval_dry_run_contract(script_name, experiment_name):
     assert "mope_pool_mode=temporal" in result.stdout
     assert "--num_processes=1" in result.stdout
     assert "--main_process_port=29604" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("script_name", "benchmark", "port", "extra_output"),
+    [
+        (
+            "smoke_e02c_mope_new_vsibench.sh",
+            "vsibench",
+            "29527",
+            "Smoke coverage=all 10 question types total=10",
+        ),
+        (
+            "smoke_e02c_mope_new_vlm4d.sh",
+            "vlm4d",
+            "29529",
+            "Smoke coverage=one row per video source total=3",
+        ),
+    ],
+)
+def test_final515k_smoke_dry_run_is_multigpu_and_isolated(
+    script_name, benchmark, port, extra_output
+):
+    root = Path.cwd()
+    env = os.environ.copy()
+    env.update(
+        {
+            "SPACE_ROOT": str(root),
+            "SPACE_OUTPUT_ROOT": "/contract/output",
+            "SPACE_LOG_ROOT": "/contract/logs",
+            "MOPE_NEW_ALLOW_MISSING_ASSETS": "1",
+            "DRY_RUN": "1",
+        }
+    )
+    result = subprocess.run(
+        ["bash", str(root / "scripts/idea1_feature/eval" / script_name)],
+        cwd=root,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    experiment = "e02c_mope_new_crossattn_joint_4b"
+    assert "Mode=smoke" in result.stdout
+    assert f"output=/contract/output/eval/smoke/{benchmark}/{experiment}" in result.stdout
+    assert f"Log=/contract/logs/eval/smoke/{experiment}_{benchmark}_smoke_" in result.stdout
+    assert "--num_processes=4" in result.stdout
+    assert f"--main_process_port={port}" in result.stdout
+    assert extra_output in result.stdout
+    assert (
+        f"Data_preflight_report=/contract/output/audit/mope_final515k_eval/"
+        f"{benchmark}_data_preflight.json"
+    ) in result.stdout
+    assert " --limit " not in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("script_name", "benchmark"),
+    [
+        ("smoke_e02c_mope_new_vsibench.sh", "vsibench"),
+        ("smoke_e02c_mope_new_vlm4d.sh", "vlm4d"),
+    ],
+)
+def test_final515k_smoke_refuses_formal_result_directory(script_name, benchmark):
+    root = Path.cwd()
+    experiment = "e02c_mope_new_crossattn_joint_4b"
+    output_root = "/contract/output"
+    formal = f"{output_root}/eval/{benchmark}/{experiment}"
+    for unsafe_result in (
+        formal,
+        f"{output_root}/eval/{benchmark}",
+        f"{formal}/child",
+        f"{output_root}/unrelated-smoke",
+    ):
+        env = os.environ.copy()
+        env.update(
+            {
+                "SPACE_ROOT": str(root),
+                "SPACE_OUTPUT_ROOT": output_root,
+                "SPACE_LOG_ROOT": "/contract/logs",
+                "RESULTS_DIR": unsafe_result,
+                "MOPE_NEW_ALLOW_MISSING_ASSETS": "1",
+                "DRY_RUN": "1",
+            }
+        )
+        result = subprocess.run(
+            ["bash", str(root / "scripts/idea1_feature/eval" / script_name)],
+            cwd=root,
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        assert result.returncode == 2
+        assert "Smoke output must be an isolated child" in result.stderr
+
+
+def test_final515k_wrappers_preflight_source_root():
+    for script in (
+        "scripts/idea1_feature/_mope_new_eval_common.sh",
+        "scripts/idea1_feature/_mope_new_vlm4d_eval_common.sh",
+    ):
+        source = Path(script).read_text()
+        assert '[[ -d "${MOPE_NEW_SOURCE_ROOT}" ]]' in source
+        assert "Missing MoPE-new source" in source
+
+
+def test_eval_artifact_validation_rejects_partial_samples(tmp_path):
+    samples = tmp_path / "samples.jsonl"
+    samples.write_text('{"doc_id": 0}\n')
+    helper = Path.cwd() / "scripts/idea1_feature/_mope_new_eval_lib.sh"
+    result = subprocess.run(
+        [
+            "bash", "-c",
+            'source "$1"; mope_validate_jsonl_count "$2" 3',
+            "bash", str(helper), str(samples),
+        ],
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode != 0
+    assert "samples JSONL count mismatch: expected=3, actual=1" in result.stderr
+
+
+def test_vlm4d_eval_resolves_checkpoint_and_promotes_two_flat_artifacts(tmp_path):
+    root = Path.cwd()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    accelerate = fake_bin / "accelerate"
+    accelerate.write_text(
+        """#!/usr/bin/env bash
+set -euo pipefail
+output=''
+while (($#)); do
+  if [[ "$1" == '--output_path' ]]; then output="$2"; shift 2; else shift; fi
+done
+mkdir -p "$output/train__fake"
+printf '{"results": {"vlm4d": 0.5}}\\n' > "$output/train__fake/20260901_results.json"
+: > "$output/train__fake/20260901_samples_vlm4d_real_mc_mope_new.jsonl"
+for ((i=0; i<1371; i++)); do
+  printf '{"doc_id": %s}\\n' "$i" >> "$output/train__fake/20260901_samples_vlm4d_real_mc_mope_new.jsonl"
+done
+"""
+    )
+    accelerate.chmod(0o755)
+    output_root = tmp_path / "output"
+    log_root = tmp_path / "logs"
+    experiment = "e02c_mope_new_crossattn_joint_4b"
+    result_dir = output_root / "eval" / "vlm4d" / experiment
+    result_dir.mkdir(parents=True)
+    (result_dir / "old_results.json").write_text("{}")
+    checkpoint = output_root / "train" / experiment / "checkpoint-7000"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "config.json").write_text("{}")
+    (checkpoint / "model-00001-of-00001.safetensors").write_text("weights")
+    (checkpoint / "model.safetensors.index.json").write_text(
+        '{"weight_map":{"x":"model-00001-of-00001.safetensors"}}'
+    )
+    mope_checkpoint = tmp_path / "checkpoint-50.pth"
+    mope_checkpoint.write_text("mope")
+    source_root = tmp_path / "mope-source"
+    source_root.mkdir()
+    annotation = tmp_path / "real_mc.json"
+    annotation.write_text("{}\n")
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "SPACE_ROOT": str(root),
+            "SPACE_OUTPUT_ROOT": str(output_root),
+            "SPACE_LOG_ROOT": str(log_root),
+            "MOPE_NEW_CKPT": str(mope_checkpoint),
+            "MOPE_NEW_SOURCE_ROOT": str(source_root),
+            "VLM4D_JSONL": str(annotation),
+        }
+    )
+    completed = subprocess.run(
+        ["bash", str(root / "scripts/idea1_feature/eval/eval_e02c_mope_new_vlm4d.sh")],
+        cwd=root,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert f"Effective_checkpoint={checkpoint}" in completed.stdout
+    assert sorted(path.name for path in result_dir.iterdir()) == [
+        f"{experiment}_results.json",
+        f"{experiment}_samples.jsonl",
+    ]
+    assert not list((output_root / "eval" / "vlm4d").glob(f"{experiment}.work.*"))
+
+
+def test_failed_vlm4d_eval_preserves_prior_results_and_cleans_workdir(tmp_path):
+    root = Path.cwd()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    accelerate = fake_bin / "accelerate"
+    accelerate.write_text("#!/usr/bin/env bash\nexit 9\n")
+    accelerate.chmod(0o755)
+    output_root = tmp_path / "output"
+    experiment = "e02c_mope_new_crossattn_joint_4b"
+    result_dir = output_root / "eval" / "vlm4d" / experiment
+    result_dir.mkdir(parents=True)
+    old_result = result_dir / "old_results.json"
+    old_result.write_text('{"overall": 0.4}')
+    checkpoint = output_root / "train" / experiment
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "config.json").write_text("{}")
+    (checkpoint / "model.safetensors").write_text("weights")
+    (checkpoint / "model.safetensors.index.json").write_text(
+        '{"weight_map":{"x":"model.safetensors"}}'
+    )
+    mope_checkpoint = tmp_path / "checkpoint-50.pth"
+    mope_checkpoint.write_text("mope")
+    source_root = tmp_path / "mope-source"
+    source_root.mkdir()
+    annotation = tmp_path / "real_mc.json"
+    annotation.write_text("{}\n")
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "SPACE_ROOT": str(root),
+            "SPACE_OUTPUT_ROOT": str(output_root),
+            "SPACE_LOG_ROOT": str(tmp_path / "logs"),
+            "MOPE_NEW_CKPT": str(mope_checkpoint),
+            "MOPE_NEW_SOURCE_ROOT": str(source_root),
+            "VLM4D_JSONL": str(annotation),
+        }
+    )
+    completed = subprocess.run(
+        ["bash", str(root / "scripts/idea1_feature/eval/eval_e02c_mope_new_vlm4d.sh")],
+        cwd=root,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    assert completed.returncode == 9
+    assert old_result.read_text() == '{"overall": 0.4}'
+    assert not list((output_root / "eval" / "vlm4d").glob(f"{experiment}.work.*"))
 
 
 def test_shared_preprocessing_contract_for_ordered_images(tmp_path):
@@ -261,6 +509,53 @@ def test_new_eval_module_is_syntactically_importable_contract():
     assert {keyword.arg for keyword in loader_calls[0].keywords} == {
         "groups", "frames_per_group", "input_size"
     }
+
+
+def test_new_eval_uses_accelerate_unwrap_property():
+    """The final515k plugin must not dereference attributes on a DDP wrapper."""
+    path = Path("src/eval/models/qwen3_vl_mope_new.py")
+    tree = ast.parse(path.read_text())
+    cls = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "Qwen3VLMoPENewCrossAttn"
+    )
+    init = next(
+        node for node in cls.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    )
+    source = ast.unparse(init)
+    assert "base_model = self.model" in source
+    assert "self._model.model" not in source
+    assert "self._model.config" not in source
+    assert "next(self._model.parameters())" not in source
+    assert "inner._mope_encoder.eval()" in source
+    assert "inner._mope_projector.eval()" in source
+
+
+def test_final515k_eval_enables_fail_closed_sidecar_contract():
+    new_tree = ast.parse(Path("src/eval/models/qwen3_vl_mope_new.py").read_text())
+    strict_assignments = [
+        node for node in ast.walk(new_tree)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Attribute)
+            and target.attr == "_mope_eval_fail_closed"
+            for target in node.targets
+        )
+    ]
+    assert len(strict_assignments) == 1
+    assert isinstance(strict_assignments[0].value, ast.Constant)
+    assert strict_assignments[0].value.value is True
+
+    base_tree = ast.parse(Path("src/eval/models/qwen3_vl_mope.py").read_text())
+    generate = next(
+        node for node in ast.walk(base_tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "generate_until"
+    )
+    source = ast.unparse(generate)
+    assert "strict MoPE eval could not extract the source video" in source
+    assert "strict MoPE eval produced no MoPE frames" in source
+    assert "inner = self.model.model" in source
 
 
 class TinyEncoder(nn.Module):

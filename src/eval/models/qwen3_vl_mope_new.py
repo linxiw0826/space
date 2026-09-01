@@ -42,13 +42,20 @@ class Qwen3VLMoPENewCrossAttn(Qwen3_VL_MoPE_CrossAttn):
         if (mope_all_frames, mope_groups, mope_frames_per_group, mope_pool_mode) != (16, 4, 4, "temporal"):
             raise ValueError("final515k eval requires 16 frames sampled as 4x4 with temporal pooling")
         Qwen3_VL_MY.__init__(self, pretrained=pretrained, **kwargs)
+        # final515k is a strict two-encoder evaluation.  A bad/missing video
+        # must never turn a sample into an unreported GUIDE-only evaluation.
+        self._mope_eval_fail_closed = True
         self.mope_all_frames = mope_all_frames
         self.mope_groups = mope_groups
         self.mope_frames_per_group = mope_frames_per_group
         self.mope_input_size = mope_input_size
         self.mope_pool_mode = mope_pool_mode
-        inner = self._model.model
-        llm_dim = self._model.config.text_config.hidden_size
+        # Qwen3_VL_MY.model is the canonical Accelerate/DDP unwrap property.
+        # self._model may already be DistributedDataParallel at this point and
+        # therefore does not expose the transformer's ``model``/``config``.
+        base_model = self.model
+        inner = base_model.model
+        llm_dim = base_model.config.text_config.hidden_size
         encoder = MoPENewEncoder(
             mope_checkpoint_path, source_root=mope_source_root,
             num_frames=mope_all_frames, groups=mope_groups,
@@ -59,10 +66,14 @@ class Qwen3VLMoPENewCrossAttn(Qwen3_VL_MoPE_CrossAttn):
         inner.add_module("_mope_encoder", encoder)
         inner.add_module("_mope_projector", projector)
         load_saved_eval_components(encoder, projector, pretrained, encoder.contract)
-        reference = next(self._model.parameters())
+        reference = next(base_model.parameters())
         inner._mope_encoder.to(device=reference.device, dtype=reference.dtype)
         inner._mope_projector.to(device=reference.device, dtype=reference.dtype)
-        _patch_model_for_mope_crossattn(self._model)
+        # These modules are attached after Accelerate prepared the base model,
+        # so inherit eval mode explicitly instead of relying on parent state.
+        inner._mope_encoder.eval()
+        inner._mope_projector.eval()
+        _patch_model_for_mope_crossattn(base_model)
         print(
             "[MoPE-final515k eval] "
             f"checkpoint={pretrained}, model=qwen3_vl_mope_new_crossattn, "

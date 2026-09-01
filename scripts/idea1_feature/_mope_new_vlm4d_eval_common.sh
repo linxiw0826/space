@@ -5,10 +5,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SPACE_ROOT="${SPACE_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 source "${SPACE_ROOT}/scripts/_common/env/activate.sh"
+source "${SPACE_ROOT}/scripts/idea1_feature/_mope_new_eval_lib.sh"
 
 MODEL_SIZE="${MODEL_SIZE:-4b}"
 [[ "${MODEL_SIZE}" == "4b" ]] || { echo "Only the verified 4b recipe is enabled" >&2; exit 2; }
 DRY_RUN="${DRY_RUN:-0}"
+SMOKE_MODE="${SMOKE_MODE:-0}"
+SMOKE_DECODE_LIMIT="${SMOKE_DECODE_LIMIT:-3}"
+LIMIT="${LIMIT:-}"
 ALLOW_MISSING="${MOPE_NEW_ALLOW_MISSING_ASSETS:-0}"
 OUTPUT_ROOT="${SPACE_OUTPUT_ROOT:-${SPACE_ROOT}/output}"
 LOG_DIR="${LOG_DIR:-${SPACE_LOG_ROOT:-${SPACE_ROOT}/logs}/eval}"
@@ -24,18 +28,53 @@ case "${MOPE_NEW_EXPERIMENT}" in
   *) echo "final515k VLM4D eval only supports e02c-new; old wrappers are historical" >&2; exit 2 ;;
 esac
 
-CKPT_PATH="${CKPT_PATH:-${OUTPUT_ROOT}/train/${NAME}}"
-RESULTS_DIR="${RESULTS_DIR:-${OUTPUT_ROOT}/eval/vlm4d/${NAME}}"
-TASK_DIR="${RESULTS_DIR}/task_config"
+REQUESTED_CKPT_PATH="${CKPT_PATH:-${OUTPUT_ROOT}/train/${NAME}}"
+CKPT_PATH="${REQUESTED_CKPT_PATH}"
+FORMAL_RESULTS_DIR="${OUTPUT_ROOT}/eval/vlm4d/${NAME}"
+if [[ "${SMOKE_MODE}" == "1" ]]; then
+  [[ "${SMOKE_DECODE_LIMIT}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "SMOKE_DECODE_LIMIT must be a positive integer" >&2
+    exit 2
+  }
+  [[ -z "${LIMIT}" ]] || { echo "LIMIT is not allowed in canonical VLM4D smoke mode" >&2; exit 2; }
+  RESULTS_DIR="${RESULTS_DIR:-${OUTPUT_ROOT}/eval/smoke/vlm4d/${NAME}}"
+  mope_assert_smoke_output_isolated \
+    "${RESULTS_DIR}" "${FORMAL_RESULTS_DIR}" "${OUTPUT_ROOT}/eval/smoke" || {
+    echo "Invalid VLM4D smoke output: ${RESULTS_DIR}" >&2
+    exit 2
+  }
+else
+  [[ "${SMOKE_MODE}" == "0" ]] || { echo "SMOKE_MODE must be 0 or 1" >&2; exit 2; }
+  RESULTS_DIR="${RESULTS_DIR:-${FORMAL_RESULTS_DIR}}"
+fi
+if [[ -n "${LIMIT}" ]]; then
+  echo "LIMIT is not allowed for canonical VLM4D eval; use the smoke wrapper" >&2
+  exit 2
+fi
+RUN_ROOT="${RESULTS_DIR}.work.$$"
+TASK_DIR="${RUN_ROOT}/task_config"
+RUN_OUTPUT_DIR="${RUN_ROOT}/lmms_output"
 TASK_NAME="vlm4d_real_mc_mope_new"
-LOG_FILE="${LOG_FILE:-${LOG_DIR}/${NAME}_vlm4d_$(date +%Y%m%d_%H%M%S).log}"
+if [[ "${SMOKE_MODE}" == "1" ]]; then
+  LOG_FILE="${LOG_FILE:-${LOG_DIR}/smoke/${NAME}_vlm4d_smoke_$(date +%Y%m%d_%H%M%S).log}"
+  EVAL_JSONL="${RUN_ROOT}/vlm4d_smoke.jsonl"
+  EXPECTED_SAMPLE_COUNT=3
+  DATA_PREFLIGHT_REPORT="${OUTPUT_ROOT}/audit/mope_final515k_eval/vlm4d_data_preflight.json"
+else
+  LOG_FILE="${LOG_FILE:-${LOG_DIR}/${NAME}_vlm4d_$(date +%Y%m%d_%H%M%S).log}"
+  EVAL_JSONL="${VLM4D_JSONL}"
+  EXPECTED_SAMPLE_COUNT=1371
+fi
 NUM_PROCESSES="${NUM_PROCESSES:-4}"
 MAIN_PORT="${MAIN_PORT:-29529}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 export CUDA_VISIBLE_DEVICES
 
 if [[ "${ALLOW_MISSING}" != "1" ]]; then
-  [[ -d "${CKPT_PATH}" ]] || { echo "Missing experiment checkpoint: ${CKPT_PATH}" >&2; exit 2; }
+  CKPT_PATH="$(mope_resolve_complete_hf_checkpoint "${REQUESTED_CKPT_PATH}")" || {
+    echo "Invalid experiment checkpoint: ${REQUESTED_CKPT_PATH}" >&2
+    exit 2
+  }
   [[ -f "${MOPE_NEW_CKPT}" ]] || { echo "Missing MoPE-new checkpoint: ${MOPE_NEW_CKPT}" >&2; exit 2; }
   [[ -d "${MOPE_NEW_SOURCE_ROOT}" ]] || { echo "Missing MoPE-new source: ${MOPE_NEW_SOURCE_ROOT}" >&2; exit 2; }
   [[ -f "${VLM4D_JSONL}" ]] || { echo "Missing VLM4D real_mc annotations: ${VLM4D_JSONL}" >&2; exit 2; }
@@ -46,12 +85,18 @@ COMMAND=(accelerate launch "--num_processes=${NUM_PROCESSES}" "--main_process_po
   -m lmms_eval --model qwen3_vl_mope_new_crossattn --model_args "${MODEL_ARGS}"
   --include_path "${TASK_DIR}" --tasks "${TASK_NAME}"
   --batch_size 1 --log_samples --log_samples_suffix "${NAME}_vlm4d"
-  --output_path "${RESULTS_DIR}" --force_simple)
+  --output_path "${RUN_OUTPUT_DIR}" --force_simple)
 
-echo "Experiment=${MOPE_NEW_EXPERIMENT} checkpoint=${CKPT_PATH}"
+echo "Mode=$([[ "${SMOKE_MODE}" == "1" ]] && echo smoke || echo full)"
+echo "Experiment=${MOPE_NEW_EXPERIMENT} requested_checkpoint=${REQUESTED_CKPT_PATH}"
+echo "Effective_checkpoint=${CKPT_PATH}"
 echo "Model=qwen3_vl_mope_new_crossattn MoPE=${MOPE_NEW_CKPT}"
 echo "frames=16 sampling=4x4 pos=3d_sincos input=224 pool=temporal expected=[B,8,768]"
 echo "VLM4D real_mc=${VLM4D_JSONL} video_root=${VLM4D_VIDEO_ROOT} output=${RESULTS_DIR}"
+if [[ "${SMOKE_MODE}" == "1" ]]; then
+  echo "Smoke coverage=one row per video source total=3 decode_limit=${SMOKE_DECODE_LIMIT}"
+  echo "Data_preflight_report=${DATA_PREFLIGHT_REPORT}"
+fi
 echo "Log=${LOG_FILE}"
 printf 'COMMAND:'; printf ' %q' "${COMMAND[@]}"; printf '\n'
 [[ "${DRY_RUN}" == "1" ]] && exit 0
@@ -59,12 +104,72 @@ printf 'COMMAND:'; printf ' %q' "${COMMAND[@]}"; printf '\n'
 export LMMS_EVAL_PLUGINS=src.mope_new_eval_plugin
 export PYTHONPATH="${GUIDE_LMMS_EVAL}:${SPACE_ROOT}/src:${SPACE_ROOT}:${PYTHONPATH:-}"
 export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
-mkdir -p "${RESULTS_DIR}" "${TASK_DIR}" "${LOG_DIR}"
+cleanup_run_root() {
+  if [[ -n "${BACKUP_RESULTS:-}" && -e "${BACKUP_RESULTS}" && ! -e "${RESULTS_DIR}" ]]; then
+    mv -- "${BACKUP_RESULTS}" "${RESULTS_DIR}"
+  fi
+  rm -rf -- "${RUN_ROOT}"
+  [[ -z "${STAGED_RESULTS:-}" ]] || rm -rf -- "${STAGED_RESULTS}"
+}
+trap cleanup_run_root EXIT
+mkdir -p "$(dirname "${RESULTS_DIR}")" "${TASK_DIR}" "${RUN_OUTPUT_DIR}" "$(dirname "${LOG_FILE}")"
+if [[ "${SMOKE_MODE}" == "1" ]]; then
+  mkdir -p "$(dirname "${DATA_PREFLIGHT_REPORT}")"
+  python "${SPACE_ROOT}/scripts/preprocess/preflight_mope_final515k_eval_data.py" \
+    --dataset vlm4d \
+    --annotation "${VLM4D_JSONL}" \
+    --video-root "${VLM4D_VIDEO_ROOT}" \
+    --expected-rows 1371 \
+    --expected-videos 600 \
+    --decode sample \
+    --decode-limit "${SMOKE_DECODE_LIMIT}" \
+    --smoke-output "${EVAL_JSONL}" \
+    --report "${DATA_PREFLIGHT_REPORT}"
+fi
 cp "${GUIDE_LMMS_EVAL}/lmms_eval/tasks/vlm4d/utils.py" "${TASK_DIR}/utils.py"
-sed -e "s#^    test: .*#    test: ${VLM4D_JSONL}#" \
+sed -e "s#^    test: .*#    test: ${EVAL_JSONL}#" \
     -e "s/^task: vlm4d$/task: ${TASK_NAME}/" \
     "${GUIDE_LMMS_EVAL}/lmms_eval/tasks/vlm4d/vlm4d.yaml" \
     > "${TASK_DIR}/vlm4d_real_mc.yaml"
 cd "${GUIDE_LMMS_EVAL}"
 exec > >(tee "${LOG_FILE}") 2>&1
-exec "${COMMAND[@]}"
+"${COMMAND[@]}"
+
+mapfile -t RESULT_FILES < <(find "${RUN_OUTPUT_DIR}" -type f -name '*_results.json' -print)
+mapfile -t SAMPLE_FILES < <(find "${RUN_OUTPUT_DIR}" -type f -name "*_samples_${TASK_NAME}.jsonl" -print)
+[[ "${#RESULT_FILES[@]}" -eq 1 ]] || {
+  echo "Expected exactly one aggregated result JSON, found ${#RESULT_FILES[@]}" >&2
+  exit 3
+}
+[[ "${#SAMPLE_FILES[@]}" -eq 1 ]] || {
+  echo "Expected exactly one samples JSONL, found ${#SAMPLE_FILES[@]}" >&2
+  exit 3
+}
+[[ -s "${RESULT_FILES[0]}" && -s "${SAMPLE_FILES[0]}" ]] || {
+  echo "Evaluation produced an empty result artifact" >&2
+  exit 3
+}
+python -m json.tool "${RESULT_FILES[0]}" >/dev/null
+mope_validate_jsonl_count "${SAMPLE_FILES[0]}" "${EXPECTED_SAMPLE_COUNT}"
+
+# Promote a complete two-file result directory in one rename.  A failed run
+# leaves the previous public result untouched and the EXIT trap removes work.
+STAGED_RESULTS="${RESULTS_DIR}.staged.$$"
+BACKUP_RESULTS="${RESULTS_DIR}.backup.$$"
+mkdir -p "${STAGED_RESULTS}"
+cp -- "${RESULT_FILES[0]}" "${STAGED_RESULTS}/${NAME}_results.json"
+cp -- "${SAMPLE_FILES[0]}" "${STAGED_RESULTS}/${NAME}_samples.jsonl"
+
+if [[ -e "${RESULTS_DIR}" ]]; then
+  mv -- "${RESULTS_DIR}" "${BACKUP_RESULTS}"
+fi
+if mv -- "${STAGED_RESULTS}" "${RESULTS_DIR}"; then
+  rm -rf -- "${BACKUP_RESULTS}"
+else
+  [[ ! -e "${RESULTS_DIR}" && -e "${BACKUP_RESULTS}" ]] && \
+    mv -- "${BACKUP_RESULTS}" "${RESULTS_DIR}"
+  exit 3
+fi
+
+echo "Results=${RESULTS_DIR}/${NAME}_results.json"
+echo "Samples=${RESULTS_DIR}/${NAME}_samples.jsonl"

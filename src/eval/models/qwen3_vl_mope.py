@@ -320,6 +320,11 @@ class Qwen3_VL_MoPE(Qwen3_VL_MY):
             try:
                 visuals = doc_to_visual(self.task_dict[task][split][doc_id])
             except Exception as exc:
+                if getattr(self, "_mope_eval_fail_closed", False):
+                    raise RuntimeError(
+                        "strict MoPE eval could not extract the source video "
+                        f"for task={task!r}, split={split!r}, doc_id={doc_id!r}"
+                    ) from exc
                 print(
                     f"[Qwen3_VL_MoPE] WARNING: could not extract visuals "
                     f"({type(exc).__name__}: {exc}). MoPE skipped."
@@ -327,8 +332,14 @@ class Qwen3_VL_MoPE(Qwen3_VL_MY):
                 visuals = None
 
             mope_frames = self._compute_mope_frames(visuals) if visuals is not None else None
+            if mope_frames is None and getattr(self, "_mope_eval_fail_closed", False):
+                raise RuntimeError(
+                    "strict MoPE eval produced no MoPE frames; refusing GUIDE-only "
+                    f"fallback for task={task!r}, split={split!r}, doc_id={doc_id!r}"
+                )
 
-            inner = self._model.model
+            # Use the base model's canonical Accelerate/DDP unwrap property.
+            inner = self.model.model
             try:
                 if mope_frames is not None:
                     # Move frames to the model's device and dtype
