@@ -343,9 +343,19 @@ def test_vlm4d_eval_resolves_checkpoint_and_promotes_two_flat_artifacts(tmp_path
         """#!/usr/bin/env bash
 set -euo pipefail
 output=''
+include_path=''
 while (($#)); do
-  if [[ "$1" == '--output_path' ]]; then output="$2"; shift 2; else shift; fi
+  if [[ "$1" == '--output_path' ]]; then
+    output="$2"; shift 2
+  elif [[ "$1" == '--include_path' ]]; then
+    include_path="$2"; shift 2
+  else
+    shift
+  fi
 done
+test -s "$include_path/utils.py"
+test -s "$include_path/vlm4d.yaml"
+test -s "$include_path/vlm4d_real_mc.yaml"
 mkdir -p "$output/train__fake"
 printf '{"results": {"vlm4d": 0.5}}\\n' > "$output/train__fake/20260901_results.json"
 : > "$output/train__fake/20260901_samples_vlm4d_real_mc_mope_new.jsonl"

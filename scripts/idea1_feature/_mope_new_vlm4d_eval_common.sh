@@ -127,6 +127,10 @@ if [[ "${SMOKE_MODE}" == "1" ]]; then
     --report "${DATA_PREFLIGHT_REPORT}"
 fi
 cp "${GUIDE_LMMS_EVAL}/lmms_eval/tasks/vlm4d/utils.py" "${TASK_DIR}/utils.py"
+# VLM4D utils reads its sibling vlm4d.yaml at import time to resolve metadata.
+# Keep that runtime dependency next to utils.py; vlm4d_real_mc.yaml below is the
+# separately renamed task definition that points at the selected annotation.
+cp "${GUIDE_LMMS_EVAL}/lmms_eval/tasks/vlm4d/vlm4d.yaml" "${TASK_DIR}/vlm4d.yaml"
 sed -e "s#^    test: .*#    test: ${EVAL_JSONL}#" \
     -e "s/^task: vlm4d$/task: ${TASK_NAME}/" \
     "${GUIDE_LMMS_EVAL}/lmms_eval/tasks/vlm4d/vlm4d.yaml" \
