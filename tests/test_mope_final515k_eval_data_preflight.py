@@ -158,6 +158,44 @@ def test_vlm4d_array_preflight_resolves_urls_and_selects_sources(tmp_path):
     }
 
 
+def test_vlm4d_smoke_count_four_covers_sources_and_adds_new_video(tmp_path):
+    root = tmp_path / "VLM4D"
+    records = []
+    for source, names in {
+        "davis": ("first", "extra"),
+        "ego4d": ("first",),
+        "youtube-vos": ("first",),
+    }.items():
+        for name in names:
+            video = root / "videos_real" / source / f"{name}.mp4"
+            video.parent.mkdir(parents=True, exist_ok=True)
+            video.write_bytes(b"fixture")
+            records.append({
+                "id": f"{source}-{name}",
+                "question": "Which option?",
+                "choices": {"A": "one", "B": "two", "C": "three", "D": "four"},
+                "answer": "two",
+                "question_type": "multiple-choice",
+                "video": f"https://host/resolve/main/videos_real/{source}/{name}.mp4",
+            })
+    annotation = tmp_path / "real_mc.json"
+    annotation.write_text(json.dumps(records))
+    smoke = tmp_path / "smoke.jsonl"
+
+    result = run_preflight(
+        "--dataset", "vlm4d", "--annotation", annotation,
+        "--video-root", root, "--smoke-count", "4", "--smoke-output", smoke,
+    )
+
+    assert result.returncode == 0, result.stderr
+    selected = [json.loads(line) for line in smoke.read_text().splitlines()]
+    assert len(selected) == 4
+    assert {Path(item["video"]).parent.name for item in selected} == {
+        "davis", "ego4d", "youtube-vos",
+    }
+    assert len({item["video"] for item in selected}) == 4
+
+
 def test_vlm4d_accepts_numeric_answer_and_choice_values(tmp_path):
     root = tmp_path / "VLM4D"
     records = []

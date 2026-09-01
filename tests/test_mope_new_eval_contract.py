@@ -227,7 +227,7 @@ def test_vlm4d_eval_dry_run_contract(script_name, experiment_name):
             "smoke_e02c_mope_new_vlm4d.sh",
             "vlm4d",
             "29529",
-            "Smoke coverage=one row per video source total=3",
+            "Smoke coverage=all 3 video sources total=4",
         ),
     ],
 )
@@ -305,6 +305,30 @@ def test_final515k_smoke_refuses_formal_result_directory(script_name, benchmark)
         )
         assert result.returncode == 2
         assert "Smoke output must be an isolated child" in result.stderr
+
+
+def test_vlm4d_smoke_refuses_more_ranks_than_samples():
+    root = Path.cwd()
+    env = os.environ.copy()
+    env.update(
+        {
+            "SPACE_ROOT": str(root),
+            "SPACE_OUTPUT_ROOT": "/contract/output",
+            "SPACE_LOG_ROOT": "/contract/logs",
+            "MOPE_NEW_ALLOW_MISSING_ASSETS": "1",
+            "DRY_RUN": "1",
+            "NUM_PROCESSES": "5",
+        }
+    )
+    result = subprocess.run(
+        ["bash", str(root / "scripts/idea1_feature/eval/smoke_e02c_mope_new_vlm4d.sh")],
+        cwd=root,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 2
+    assert "VLM4D smoke requires NUM_PROCESSES <= 4; got 5" in result.stderr
 
 
 def test_final515k_wrappers_preflight_source_root():

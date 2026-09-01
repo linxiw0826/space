@@ -11,7 +11,7 @@ MODEL_SIZE="${MODEL_SIZE:-4b}"
 [[ "${MODEL_SIZE}" == "4b" ]] || { echo "Only the verified 4b recipe is enabled" >&2; exit 2; }
 DRY_RUN="${DRY_RUN:-0}"
 SMOKE_MODE="${SMOKE_MODE:-0}"
-SMOKE_DECODE_LIMIT="${SMOKE_DECODE_LIMIT:-3}"
+SMOKE_DECODE_LIMIT="${SMOKE_DECODE_LIMIT:-4}"
 LIMIT="${LIMIT:-}"
 ALLOW_MISSING="${MOPE_NEW_ALLOW_MISSING_ASSETS:-0}"
 OUTPUT_ROOT="${SPACE_OUTPUT_ROOT:-${SPACE_ROOT}/output}"
@@ -58,7 +58,7 @@ TASK_NAME="vlm4d_real_mc_mope_new"
 if [[ "${SMOKE_MODE}" == "1" ]]; then
   LOG_FILE="${LOG_FILE:-${LOG_DIR}/smoke/${NAME}_vlm4d_smoke_$(date +%Y%m%d_%H%M%S).log}"
   EVAL_JSONL="${RUN_ROOT}/vlm4d_smoke.jsonl"
-  EXPECTED_SAMPLE_COUNT=3
+  EXPECTED_SAMPLE_COUNT=4
   DATA_PREFLIGHT_REPORT="${OUTPUT_ROOT}/audit/mope_final515k_eval/vlm4d_data_preflight.json"
 else
   LOG_FILE="${LOG_FILE:-${LOG_DIR}/${NAME}_vlm4d_$(date +%Y%m%d_%H%M%S).log}"
@@ -66,6 +66,14 @@ else
   EXPECTED_SAMPLE_COUNT=1371
 fi
 NUM_PROCESSES="${NUM_PROCESSES:-4}"
+[[ "${NUM_PROCESSES}" =~ ^[1-9][0-9]*$ ]] || {
+  echo "NUM_PROCESSES must be a positive integer" >&2
+  exit 2
+}
+if [[ "${SMOKE_MODE}" == "1" ]] && (( NUM_PROCESSES > EXPECTED_SAMPLE_COUNT )); then
+  echo "VLM4D smoke requires NUM_PROCESSES <= ${EXPECTED_SAMPLE_COUNT}; got ${NUM_PROCESSES}" >&2
+  exit 2
+fi
 MAIN_PORT="${MAIN_PORT:-29529}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 export CUDA_VISIBLE_DEVICES
@@ -94,7 +102,7 @@ echo "Model=qwen3_vl_mope_new_crossattn MoPE=${MOPE_NEW_CKPT}"
 echo "frames=16 sampling=4x4 pos=3d_sincos input=224 pool=temporal expected=[B,8,768]"
 echo "VLM4D real_mc=${VLM4D_JSONL} video_root=${VLM4D_VIDEO_ROOT} output=${RESULTS_DIR}"
 if [[ "${SMOKE_MODE}" == "1" ]]; then
-  echo "Smoke coverage=one row per video source total=3 decode_limit=${SMOKE_DECODE_LIMIT}"
+  echo "Smoke coverage=all 3 video sources total=4 decode_limit=${SMOKE_DECODE_LIMIT}"
   echo "Data_preflight_report=${DATA_PREFLIGHT_REPORT}"
 fi
 echo "Log=${LOG_FILE}"
@@ -123,6 +131,7 @@ if [[ "${SMOKE_MODE}" == "1" ]]; then
     --expected-videos 600 \
     --decode sample \
     --decode-limit "${SMOKE_DECODE_LIMIT}" \
+    --smoke-count "${EXPECTED_SAMPLE_COUNT}" \
     --smoke-output "${EVAL_JSONL}" \
     --report "${DATA_PREFLIGHT_REPORT}"
 fi

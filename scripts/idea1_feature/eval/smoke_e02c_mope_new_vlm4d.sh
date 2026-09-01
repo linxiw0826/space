@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Uses one real VLM4D sample per video source on four GPUs.
+# Uses four real samples covering all three VLM4D sources on four GPUs.
 # NUM_PROCESSES, CUDA_VISIBLE_DEVICES, and MAIN_PORT remain configurable.
 MOPE_NEW_EXPERIMENT=e02c-new
 SMOKE_MODE=1

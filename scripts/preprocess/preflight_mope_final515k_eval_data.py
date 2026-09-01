@@ -206,21 +206,57 @@ def decode_video(path: Path) -> tuple[int, list[int]]:
     return decord_count, indices
 
 
-def select_smoke(dataset: str, records: list[dict]) -> list[dict]:
+def select_smoke(
+    dataset: str, records: list[dict], requested_count: int | None = None
+) -> list[dict]:
     if dataset == "vsibench":
         first = {}
         for record in records:
             first.setdefault(record["question_type"], record)
-        return [first[name] for name in VSI_QUESTION_TYPES]
+        selected = [first[name] for name in VSI_QUESTION_TYPES]
+        if requested_count not in (None, len(selected)):
+            raise ValueError(
+                f"VSI smoke count must be {len(selected)} to cover every question type"
+            )
+        return selected
 
-    # One item per real-video source keeps the smoke bounded while covering all
-    # path families (normally davis, ego4d and youtube-vos).
+    # Start with one item per real-video source, then deterministically add rows
+    # from new videos so a four-rank smoke gives every rank at least one doc.
     first = {}
     for row, record in enumerate(records, 1):
         relative = vlm4d_relative_path(record["video"], row)
         source = relative.parent.name
         first.setdefault(source, record)
-    return [first[source] for source in VLM4D_SOURCES]
+    selected = [first[source] for source in VLM4D_SOURCES]
+    target = requested_count if requested_count is not None else len(selected)
+    if target < len(selected):
+        raise ValueError(
+            f"VLM4D smoke count must be at least {len(selected)} to cover every source"
+        )
+    selected_ids = {id(record) for record in selected}
+    selected_videos = {
+        vlm4d_relative_path(record["video"], row)
+        for row, record in enumerate(selected, 1)
+    }
+    for row, record in enumerate(records, 1):
+        if len(selected) >= target:
+            break
+        relative = vlm4d_relative_path(record["video"], row)
+        if id(record) not in selected_ids and relative not in selected_videos:
+            selected.append(record)
+            selected_ids.add(id(record))
+            selected_videos.add(relative)
+    for record in records:
+        if len(selected) >= target:
+            break
+        if id(record) not in selected_ids:
+            selected.append(record)
+            selected_ids.add(id(record))
+    if len(selected) != target:
+        raise ValueError(
+            f"not enough records for smoke output: requested={target}, actual={len(selected)}"
+        )
+    return selected
 
 
 def write_jsonl(path: Path, records: Iterable[dict]) -> None:
@@ -252,6 +288,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--expected-rows", type=int)
     parser.add_argument("--expected-videos", type=int)
     parser.add_argument("--smoke-output", type=Path)
+    parser.add_argument("--smoke-count", type=int)
     parser.add_argument("--report", type=Path)
     return parser.parse_args(argv)
 
@@ -263,6 +300,8 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError(f"video root does not exist: {args.video_root}")
         if args.decode_limit < 1:
             raise ValueError("--decode-limit must be positive")
+        if args.smoke_count is not None and args.smoke_count < 1:
+            raise ValueError("--smoke-count must be positive")
         records = load_records(args.annotation)
         if args.expected_rows is not None and len(records) != args.expected_rows:
             raise ValueError(
@@ -305,7 +344,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"unique video count mismatch: expected={args.expected_videos}, "
                 f"actual={len(unique_paths)}"
             )
-        smoke = select_smoke(args.dataset, records)
+        smoke = select_smoke(args.dataset, records, args.smoke_count)
         smoke_paths = list(
             dict.fromkeys(path_by_record_id[id(record)] for record in smoke)
         )
