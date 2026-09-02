@@ -16,10 +16,32 @@ from model.mope_new_encoder import (
 )
 
 
+def test_complete_hf_resolver_rejects_empty_weight_shard(tmp_path):
+    root = Path.cwd()
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text("{}")
+    (checkpoint / "model.safetensors.index.json").write_text(
+        '{"weight_map":{"x":"model-00001-of-00001.safetensors"}}'
+    )
+    (checkpoint / "model-00001-of-00001.safetensors").touch()
+    helper = root / "scripts/idea1_feature/_mope_new_eval_lib.sh"
+    result = subprocess.run(
+        ["bash", "-c", 'source "$1"; mope_resolve_complete_hf_checkpoint "$2"', "bash", str(helper), str(checkpoint)],
+        cwd=root,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "No complete HF checkpoint" in result.stderr
+
+
 @pytest.mark.parametrize(
     ("script_name", "experiment_name"),
     [
         ("eval_e02c_mope_new_vsibench.sh", "e02c_mope_new_crossattn_joint_4b"),
+        ("eval_e04a_mope_new_vsibench.sh", "e04a_mope_new_e01_projector_only_4b"),
     ],
 )
 def test_eval_dry_run_uses_server_roots_and_timestamped_log(script_name, experiment_name):
@@ -173,6 +195,7 @@ def test_failed_vsibench_eval_preserves_prior_results_and_cleans_workdir(tmp_pat
     ("script_name", "experiment_name"),
     [
         ("eval_e02c_mope_new_vlm4d.sh", "e02c_mope_new_crossattn_joint_4b"),
+        ("eval_e04a_mope_new_vlm4d.sh", "e04a_mope_new_e01_projector_only_4b"),
     ],
 )
 def test_vlm4d_eval_dry_run_contract(script_name, experiment_name):
@@ -229,6 +252,18 @@ def test_vlm4d_eval_dry_run_contract(script_name, experiment_name):
             "29529",
             "Smoke coverage=all 3 video sources total=4",
         ),
+        (
+            "smoke_e04a_mope_new_vsibench.sh",
+            "vsibench",
+            "29527",
+            "Smoke coverage=all 10 question types total=10",
+        ),
+        (
+            "smoke_e04a_mope_new_vlm4d.sh",
+            "vlm4d",
+            "29529",
+            "Smoke coverage=all 3 video sources total=4",
+        ),
     ],
 )
 def test_final515k_smoke_dry_run_is_multigpu_and_isolated(
@@ -253,7 +288,11 @@ def test_final515k_smoke_dry_run_is_multigpu_and_isolated(
         capture_output=True,
         check=True,
     )
-    experiment = "e02c_mope_new_crossattn_joint_4b"
+    experiment = (
+        "e04a_mope_new_e01_projector_only_4b"
+        if "e04a" in script_name
+        else "e02c_mope_new_crossattn_joint_4b"
+    )
     assert "Mode=smoke" in result.stdout
     assert f"output=/contract/output/eval/smoke/{benchmark}/{experiment}" in result.stdout
     assert f"Log=/contract/logs/eval/smoke/{experiment}_{benchmark}_smoke_" in result.stdout

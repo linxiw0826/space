@@ -25,7 +25,8 @@ export VLM4D_VIDEO_ROOT
 
 case "${MOPE_NEW_EXPERIMENT}" in
   e02c-new) NAME=e02c_mope_new_crossattn_joint_4b ;;
-  *) echo "final515k VLM4D eval only supports e02c-new; old wrappers are historical" >&2; exit 2 ;;
+  e04a-new) NAME=e04a_mope_new_e01_projector_only_4b ;;
+  *) echo "final515k VLM4D eval only supports e02c-new/e04a-new; old wrappers are historical" >&2; exit 2 ;;
 esac
 
 REQUESTED_CKPT_PATH="${CKPT_PATH:-${OUTPUT_ROOT}/train/${NAME}}"

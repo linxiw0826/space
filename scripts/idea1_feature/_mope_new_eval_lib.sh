@@ -23,7 +23,10 @@ def complete_hf_checkpoint(path):
     except (KeyError, OSError, json.JSONDecodeError):
         return False
     shards = set(weight_map.values())
-    return bool(shards) and all((path / shard).is_file() for shard in shards)
+    return bool(shards) and all(
+        (path / shard).is_file() and (path / shard).stat().st_size > 0
+        for shard in shards
+    )
 
 
 candidates = [requested]

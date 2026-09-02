@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SPACE_ROOT="${SPACE_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 # Load the per-server output/log roots before deriving experiment paths.
 source "${SPACE_ROOT}/scripts/_common/env/activate.sh"
+source "${SPACE_ROOT}/scripts/idea1_feature/_mope_new_eval_lib.sh"
 MODEL_SIZE="${MODEL_SIZE:-4b}"
 [[ "${MODEL_SIZE}" == "4b" ]] || { echo "Only the verified 4b recipe is enabled" >&2; exit 2; }
 DRY_RUN="${DRY_RUN:-0}"
@@ -14,7 +15,7 @@ OUTPUT_ROOT="${SPACE_OUTPUT_ROOT:-${SPACE_ROOT}/output}"
 LOG_DIR="${LOG_DIR:-${SPACE_LOG_ROOT:-${SPACE_ROOT}/logs}/train}"
 MOPE_NEW_SOURCE_ROOT="${MOPE_NEW_SOURCE_ROOT:-${SPACE_ROOT}/refs/mope-jepa-native-final515k}"
 MOPE_NEW_CKPT="${MOPE_NEW_CKPT:-/data2/mope-jepa-assets/jepa_checkpoints/native_mope_b_dense8_moe8_top1_shared1_anchor1_final515k_3dpos_ep100_warm3_cos_lr75e6_min25e6/checkpoint-50.pth}"
-GUIDE_CKPT_PATH="${GUIDE_CKPT_PATH:-${OUTPUT_ROOT}/train/guide_reproduced/4b}"
+GUIDE_CKPT_PATH="${GUIDE_CKPT_PATH:-}"
 VGGT_PATH="${VGGT_PATH:-/data2/wlx/models/VGGT-1B}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 MASTER_PORT="${MASTER_PORT:-29517}"
@@ -34,7 +35,15 @@ export VSI590K_DATA_ROOT="${VSI590K_DATA_ROOT:-/data2/wlx/data/vsi590k_processed
 case "${MOPE_NEW_EXPERIMENT}" in
   e02c-new)
     OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_ROOT}/train/e02c_mope_new_crossattn_joint_4b}"
+    GUIDE_CKPT_PATH="${GUIDE_CKPT_PATH:-${OUTPUT_ROOT}/train/guide_reproduced/4b}"
     TUNE_LLM=True
+    GRAD_ACCUM="${GRAD_ACCUM:-6}"
+    WARMSTART=""
+    ;;
+  e04a-new)
+    OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_ROOT}/train/e04a_mope_new_e01_projector_only_4b}"
+    GUIDE_CKPT_PATH="${GUIDE_CKPT_PATH:-${OUTPUT_ROOT}/train/e01_guide_4b}"
+    TUNE_LLM=False
     GRAD_ACCUM="${GRAD_ACCUM:-6}"
     WARMSTART=""
     ;;
@@ -43,9 +52,14 @@ esac
 
 EFFECTIVE_BATCH=$((2 * NPROC_PER_NODE * GRAD_ACCUM))
 [[ "${EFFECTIVE_BATCH}" == "48" ]] || {
-  echo "E-02c-new requires effective global batch 48; got 2 x ${NPROC_PER_NODE} x ${GRAD_ACCUM} = ${EFFECTIVE_BATCH}" >&2
+  echo "MoPE-new requires effective global batch 48; got 2 x ${NPROC_PER_NODE} x ${GRAD_ACCUM} = ${EFFECTIVE_BATCH}" >&2
   exit 2
 }
+
+if [[ "$(realpath -m "${GUIDE_CKPT_PATH}")" == "$(realpath -m "${OUTPUT_DIR}")" ]]; then
+  echo "Initialization checkpoint must differ from the experiment output directory" >&2
+  exit 2
+fi
 
 LOG_FILE="${LOG_FILE:-${LOG_DIR}/$(basename "${OUTPUT_DIR}")_$(date +%Y%m%d_%H%M%S).log}"
 
@@ -55,6 +69,13 @@ if [[ -n "${RESUME_FROM_CHECKPOINT}" ]]; then
     "$(realpath -m "${OUTPUT_DIR}")"/*) ;;
     *) echo "Resume must be inside this experiment's output directory" >&2; exit 2 ;;
   esac
+  PYTHONPATH="${SPACE_ROOT}/src:${SPACE_ROOT}:${PYTHONPATH:-}" python - \
+    "${RESUME_FROM_CHECKPOINT}" "${NPROC_PER_NODE}" <<'PY'
+import sys
+from train_framework.checkpoint_rotation import validate_deepspeed_resume_checkpoint
+
+print("Resume_preflight=" + repr(validate_deepspeed_resume_checkpoint(sys.argv[1], sys.argv[2])))
+PY
 elif [[ -d "${OUTPUT_DIR}" ]] && find "${OUTPUT_DIR}" -mindepth 1 -maxdepth 1 \
     \( -type d -name 'checkpoint-*' -o -type f -name 'model*.safetensors' \
        -o -type f -name 'pytorch_model*.bin' \) -print -quit | grep -q .; then
@@ -65,7 +86,19 @@ fi
 
 if [[ "${ALLOW_MISSING}" != "1" ]]; then
   [[ -f "${MOPE_NEW_CKPT}" ]] || { echo "Missing MoPE-new checkpoint: ${MOPE_NEW_CKPT}" >&2; exit 2; }
-  [[ -d "${GUIDE_CKPT_PATH}" ]] || { echo "Missing GUIDE checkpoint: ${GUIDE_CKPT_PATH}" >&2; exit 2; }
+  if [[ "${MOPE_NEW_EXPERIMENT}" == "e04a-new" ]]; then
+    RESOLVED_E01_CKPT="$(mope_resolve_complete_hf_checkpoint "${GUIDE_CKPT_PATH}")" || {
+      echo "E-04a requires a complete E-01 HF checkpoint: ${GUIDE_CKPT_PATH}" >&2
+      exit 2
+    }
+    [[ "$(realpath -m "${RESOLVED_E01_CKPT}")" == "$(realpath -m "${GUIDE_CKPT_PATH}")" ]] || {
+      echo "E-04a requires the completed E-01 top-level HF checkpoint, not a nested fallback: ${RESOLVED_E01_CKPT}" >&2
+      exit 2
+    }
+    GUIDE_CKPT_PATH="${RESOLVED_E01_CKPT}"
+  else
+    [[ -d "${GUIDE_CKPT_PATH}" ]] || { echo "Missing GUIDE checkpoint: ${GUIDE_CKPT_PATH}" >&2; exit 2; }
+  fi
   [[ -d "${VGGT_PATH}" ]] || { echo "Missing VGGT: ${VGGT_PATH}" >&2; exit 2; }
   [[ -f "${MOPE_NEW_SOURCE_ROOT}/models/native_mope.py" ]] || { echo "Incomplete MoPE-new source" >&2; exit 2; }
   [[ -f "${VSI590K_SPAR_ANN}" ]] || { echo "Missing final515k SPAR manifest: ${VSI590K_SPAR_ANN}" >&2; exit 2; }
@@ -92,6 +125,10 @@ COMMAND=(python -m torch.distributed.run "--nproc_per_node=${NPROC_PER_NODE}" "-
   --use_deepstack_importance_gate all --use_deepstack_global_gate all
   --geometry_encoder_type vggt --geometry_encoder_path "${VGGT_PATH}"
   --use_mope True --mope_fusion_mode crossattn
+  --mope_feed_features True
+  --mope_use_gate False --mope_feed_causal_mask False
+  --mope_feed_temporal_pe False --load_mope_projector_from_ckpt False
+  --freeze_mope_projector False
   --mope_checkpoint_path "${MOPE_NEW_CKPT}" --mope_all_frames 16
   --mope_new_experiment "${MOPE_NEW_EXPERIMENT}"
   --mope_new_source_root "${MOPE_NEW_SOURCE_ROOT}"
@@ -110,7 +147,7 @@ else
   COMMAND+=(--overwrite_output_dir)
 fi
 
-echo "Experiment=${MOPE_NEW_EXPERIMENT} train_llm=${TUNE_LLM} train_projector=True train_mope=False grad_accum=${GRAD_ACCUM} effective_batch=${EFFECTIVE_BATCH}"
+echo "Experiment=${MOPE_NEW_EXPERIMENT} init_checkpoint=${GUIDE_CKPT_PATH} train_llm=${TUNE_LLM} train_projector=True train_mope=False train_other=$([[ "${MOPE_NEW_EXPERIMENT}" == "e04a-new" ]] && echo False || echo True) gate=False grad_accum=${GRAD_ACCUM} effective_batch=${EFFECTIVE_BATCH}"
 echo "MoPE=${MOPE_NEW_CKPT} architecture=dense8+moe8/top1/shared1 pos=3d_sincos frames=16 sampling=4x4 input=224 pool=temporal expected=[B,8,768]"
 echo "Output=${OUTPUT_DIR} warmstart=${WARMSTART:-none} resume=${RESUME_FROM_CHECKPOINT:-none}"
 echo "DataLoader workers/rank=${DATALOADER_NUM_WORKERS} total_workers=$((DATALOADER_NUM_WORKERS * NPROC_PER_NODE)) save_steps=${SAVE_STEPS} save_total_limit=${SAVE_TOTAL_LIMIT} predelete_oldest=${PREDELETE_OLDEST_CHECKPOINT}"

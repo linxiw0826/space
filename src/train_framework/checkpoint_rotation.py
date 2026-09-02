@@ -3,6 +3,7 @@
 import os
 import re
 import shutil
+import json
 from pathlib import Path
 
 
@@ -24,6 +25,45 @@ def is_complete_checkpoint(ckpt_dir):
         if not tag or not os.path.isdir(os.path.join(ckpt_dir, tag)):
             return False
     return True
+
+
+def validate_deepspeed_resume_checkpoint(ckpt_dir, expected_world_size):
+    """Fail closed before handing a checkpoint to Trainer/DeepSpeed."""
+    ckpt_dir = Path(ckpt_dir)
+    expected_world_size = int(expected_world_size)
+    if expected_world_size <= 0:
+        raise ValueError("expected_world_size must be positive")
+    if not is_complete_checkpoint(ckpt_dir):
+        raise RuntimeError(f"incomplete Trainer/DeepSpeed checkpoint: {ckpt_dir}")
+    try:
+        state = json.loads((ckpt_dir / "trainer_state.json").read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"invalid trainer_state.json: {ckpt_dir}") from exc
+    match = _CHECKPOINT_DIR_RE.fullmatch(ckpt_dir.name)
+    if match and int(state.get("global_step", -1)) != int(match.group(1)):
+        raise RuntimeError(
+            f"resume global_step does not match directory: {ckpt_dir} "
+            f"state={state.get('global_step')}"
+        )
+    latest = ckpt_dir / "latest"
+    if not latest.is_file():
+        raise RuntimeError(f"DeepSpeed resume checkpoint has no latest tag: {ckpt_dir}")
+    tag = latest.read_text().strip()
+    tag_dir = ckpt_dir / tag
+    model_shards = [path for path in tag_dir.glob("*model_states.pt") if path.stat().st_size > 0]
+    optimizer_shards = [path for path in tag_dir.glob("*optim_states.pt") if path.stat().st_size > 0]
+    if not model_shards or len(optimizer_shards) != expected_world_size:
+        raise RuntimeError(
+            "incomplete DeepSpeed shards: "
+            f"path={ckpt_dir}, model={len(model_shards)}, "
+            f"optimizer={len(optimizer_shards)}, expected_optimizer={expected_world_size}"
+        )
+    return {
+        "global_step": int(state["global_step"]),
+        "tag": tag,
+        "model_shards": len(model_shards),
+        "optimizer_shards": len(optimizer_shards),
+    }
 
 
 def predelete_for_two_slot_rotation(output_dir, upcoming_step):

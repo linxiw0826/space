@@ -1,4 +1,4 @@
-"""Training entry point for the final515k E-02c-new Paper 1 experiment."""
+"""Training entry point for the final515k Paper 1 experiments."""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ import os
 import sys
 from pathlib import Path
 
+import torch
+
 from model.mope_new_encoder import (
     DEFAULT_SOURCE_ROOT,
     MoPENewEncoder,
@@ -14,7 +16,8 @@ from model.mope_new_encoder import (
 )
 
 
-EXPERIMENTS = {"e02c-new"}
+EXPERIMENTS = {"e02c-new", "e04a-new"}
+E04A_PROJECTOR_PARAMETERS = 10_494_976
 
 
 def _take_new_args(argv: list[str]):
@@ -42,13 +45,23 @@ def validate_resume_scope(resume: str, output_dir: str) -> None:
 
 
 def configure_trainability(model, experiment: str) -> dict[str, int]:
-    if experiment != "e02c-new":
+    if experiment not in EXPERIMENTS:
         raise ValueError(f"unknown MoPE-new experiment: {experiment}")
     inner = model.model
-    for parameter in inner._mope_encoder.parameters():
-        parameter.requires_grad_(False)
-    for parameter in inner._mope_projector.parameters():
-        parameter.requires_grad_(True)
+    if experiment == "e04a-new":
+        # E-04a is a residual adapter on top of the completed E-01 SFT model.
+        # Freeze *every* loaded E-01 parameter first (including parameters not
+        # covered by GUIDE's tune_mm_* switches), then open only the freshly
+        # attached CrossAttn projector.
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+        for parameter in inner._mope_projector.parameters():
+            parameter.requires_grad_(True)
+    else:
+        for parameter in inner._mope_encoder.parameters():
+            parameter.requires_grad_(False)
+        for parameter in inner._mope_projector.parameters():
+            parameter.requires_grad_(True)
     counts = {
         "encoder": sum(p.numel() for p in inner._mope_encoder.parameters() if p.requires_grad),
         "projector": sum(p.numel() for p in inner._mope_projector.parameters() if p.requires_grad),
@@ -57,7 +70,22 @@ def configure_trainability(model, experiment: str) -> dict[str, int]:
             if p.requires_grad and "._mope_projector." not in name and "._mope_encoder." not in name
         ),
     }
-    if counts["encoder"] != 0 or counts["projector"] == 0 or counts["other"] == 0:
+    trainable_names = [name for name, parameter in model.named_parameters() if parameter.requires_grad]
+    if experiment == "e04a-new":
+        invalid_names = [
+            name for name in trainable_names
+            if not name.startswith("model._mope_projector.")
+        ]
+        if counts != {
+            "encoder": 0,
+            "projector": E04A_PROJECTOR_PARAMETERS,
+            "other": 0,
+        } or invalid_names:
+            raise RuntimeError(
+                "invalid E-04a projector-only trainability: "
+                f"counts={counts}, unexpected_trainable={invalid_names[:8]}"
+            )
+    elif counts["encoder"] != 0 or counts["projector"] == 0 or counts["other"] == 0:
         raise RuntimeError(f"invalid MoPE-new trainability: {counts}")
     return counts
 
@@ -103,6 +131,12 @@ def main() -> None:
         config = model.config
         llm_dim = getattr(config, "hidden_size", None) or config.text_config.hidden_size
         projector = MoPEProjectorCrossAttn(mope_dim=768, llm_dim=llm_dim)
+        if projector.use_gate or hasattr(projector, "gate_mlp"):
+            raise RuntimeError("MoPE-new Paper 1 experiments forbid a projector gate")
+        if torch.count_nonzero(projector.out_proj.weight).item() or torch.count_nonzero(
+            projector.out_proj.bias
+        ).item():
+            raise RuntimeError("MoPE-new CrossAttn residual must start from exact zero")
         inner.add_module("_mope_encoder", encoder)
         inner.add_module("_mope_projector", projector)
         base.rank0_print(
@@ -110,6 +144,11 @@ def main() -> None:
             f"frames=16, sampling=4x4_uniform_segments_rint, input=224, "
             f"position=3d_sincos, pool=temporal, expected_tokens=8"
         )
+        if new_args.mope_new_experiment == "e04a-new":
+            base.rank0_print(
+                "[E-04a] SFT-first residual adapter: fresh zero-init CrossAttn, "
+                "gate=False, frozen E-01 backbone, projector-only training."
+            )
 
     def load_frames(annotation, all_frames):
         if all_frames != 16:
