@@ -280,6 +280,34 @@ def test_e04a_dry_run_is_e01_initialized_projector_only(tmp_path):
     assert "--overwrite_output_dir" in result.stdout
 
 
+def test_e04a_launcher_ignores_stale_three_gpu_tmux_environment(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    env = {
+        **os.environ,
+        "SPACE_OUTPUT_ROOT": str(tmp_path / "output"),
+        "SPACE_LOG_ROOT": str(tmp_path / "logs"),
+        "MOPE_NEW_ALLOW_MISSING_ASSETS": "1",
+        "DRY_RUN": "1",
+        "CUDA_VISIBLE_DEVICES": "1,2,4",
+        "NPROC_PER_NODE": "3",
+        "PER_DEVICE_TRAIN_BATCH_SIZE": "1",
+        "GRAD_ACCUM": "16",
+    }
+    result = subprocess.run(
+        ["bash", str(root / "scripts/idea1_feature/train/train_e04a_mope_new_e01_projector_only.sh")],
+        cwd=root,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--nproc_per_node=4" in result.stdout
+    assert "--per_device_train_batch_size 1" in result.stdout
+    assert "--gradient_accumulation_steps 12" in result.stdout
+    assert "effective_batch=48" in result.stdout
+
+
 def test_e04a_resume_must_be_inside_its_own_output(tmp_path):
     root = Path(__file__).resolve().parents[1]
     output_root = tmp_path / "output"
