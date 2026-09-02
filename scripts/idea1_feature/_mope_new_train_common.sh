@@ -21,6 +21,7 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 MASTER_PORT="${MASTER_PORT:-29517}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-2}"
+PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-2}"
 SAVE_STEPS="${SAVE_STEPS:-500}"
 SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-1}"
 PREDELETE_OLDEST_CHECKPOINT="${PREDELETE_OLDEST_CHECKPOINT:-0}"
@@ -50,9 +51,9 @@ case "${MOPE_NEW_EXPERIMENT}" in
   *) echo "Unknown MoPE-new experiment: ${MOPE_NEW_EXPERIMENT}" >&2; exit 2 ;;
 esac
 
-EFFECTIVE_BATCH=$((2 * NPROC_PER_NODE * GRAD_ACCUM))
+EFFECTIVE_BATCH=$((PER_DEVICE_TRAIN_BATCH_SIZE * NPROC_PER_NODE * GRAD_ACCUM))
 [[ "${EFFECTIVE_BATCH}" == "48" ]] || {
-  echo "MoPE-new requires effective global batch 48; got 2 x ${NPROC_PER_NODE} x ${GRAD_ACCUM} = ${EFFECTIVE_BATCH}" >&2
+  echo "MoPE-new requires effective global batch 48; got ${PER_DEVICE_TRAIN_BATCH_SIZE} x ${NPROC_PER_NODE} x ${GRAD_ACCUM} = ${EFFECTIVE_BATCH}" >&2
   exit 2
 }
 
@@ -111,7 +112,7 @@ COMMAND=(python -m torch.distributed.run "--nproc_per_node=${NPROC_PER_NODE}" "-
   --dataset_use vsi590k_spar --data_flatten False
   --tune_mm_vision False --tune_mm_mlp False --tune_mm_llm "${TUNE_LLM}"
   --optim adamw_torch --bf16 --output_dir "${OUTPUT_DIR}"
-  --num_train_epochs 1 --per_device_train_batch_size 2
+  --num_train_epochs 1 --per_device_train_batch_size "${PER_DEVICE_TRAIN_BATCH_SIZE}"
   --per_device_eval_batch_size 4 --gradient_accumulation_steps "${GRAD_ACCUM}"
   --max_pixels 268324 --min_pixels 8192 --eval_strategy no
   --save_strategy steps --save_steps "${SAVE_STEPS}" --save_total_limit "${SAVE_TOTAL_LIMIT}"
@@ -147,7 +148,7 @@ else
   COMMAND+=(--overwrite_output_dir)
 fi
 
-echo "Experiment=${MOPE_NEW_EXPERIMENT} init_checkpoint=${GUIDE_CKPT_PATH} train_llm=${TUNE_LLM} train_projector=True train_mope=False train_other=$([[ "${MOPE_NEW_EXPERIMENT}" == "e04a-new" ]] && echo False || echo True) gate=False grad_accum=${GRAD_ACCUM} effective_batch=${EFFECTIVE_BATCH}"
+echo "Experiment=${MOPE_NEW_EXPERIMENT} init_checkpoint=${GUIDE_CKPT_PATH} train_llm=${TUNE_LLM} train_projector=True train_mope=False train_other=$([[ "${MOPE_NEW_EXPERIMENT}" == "e04a-new" ]] && echo False || echo True) gate=False per_device_batch=${PER_DEVICE_TRAIN_BATCH_SIZE} grad_accum=${GRAD_ACCUM} effective_batch=${EFFECTIVE_BATCH}"
 echo "MoPE=${MOPE_NEW_CKPT} architecture=dense8+moe8/top1/shared1 pos=3d_sincos frames=16 sampling=4x4 input=224 pool=temporal expected=[B,8,768]"
 echo "Output=${OUTPUT_DIR} warmstart=${WARMSTART:-none} resume=${RESUME_FROM_CHECKPOINT:-none}"
 echo "DataLoader workers/rank=${DATALOADER_NUM_WORKERS} total_workers=$((DATALOADER_NUM_WORKERS * NPROC_PER_NODE)) save_steps=${SAVE_STEPS} save_total_limit=${SAVE_TOTAL_LIMIT} predelete_oldest=${PREDELETE_OLDEST_CHECKPOINT}"

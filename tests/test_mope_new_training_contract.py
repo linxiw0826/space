@@ -271,8 +271,10 @@ def test_e04a_dry_run_is_e01_initialized_projector_only(tmp_path):
     assert "--freeze_mope_projector False" in result.stdout
     assert "train_other=False gate=False" in result.stdout
     assert "--nproc_per_node=4" in result.stdout
-    assert "--gradient_accumulation_steps 6" in result.stdout
-    assert "grad_accum=6" in result.stdout
+    assert "--per_device_train_batch_size 1" in result.stdout
+    assert "--gradient_accumulation_steps 12" in result.stdout
+    assert "per_device_batch=1" in result.stdout
+    assert "grad_accum=12" in result.stdout
     assert "effective_batch=48" in result.stdout
     assert "warmstart=none" in result.stdout
     assert "--overwrite_output_dir" in result.stdout
