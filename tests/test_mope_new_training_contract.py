@@ -223,6 +223,44 @@ def test_e04a_lr1e3_bs2_launcher_preserves_effective_batch_and_isolated_output(t
     ) in result.stdout
 
 
+def test_e04a_lr1e4_bs2_launcher_preserves_effective_batch_and_isolated_output(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    output_root = tmp_path / "output"
+    env = {
+        **os.environ,
+        "SPACE_OUTPUT_ROOT": str(output_root),
+        "SPACE_LOG_ROOT": str(tmp_path / "logs"),
+        "MOPE_NEW_ALLOW_MISSING_ASSETS": "1",
+        "DRY_RUN": "1",
+    }
+    result = subprocess.run(
+        [
+            "bash",
+            str(
+                root
+                / "scripts/idea1_feature/train/"
+                "train_e04a_mope_new_e01_projector_only_lr1e4_bs2.sh"
+            ),
+        ],
+        cwd=root,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "CUDA_VISIBLE_DEVICES=1,3,5,6" in result.stdout
+    assert "--nproc_per_node=4" in result.stdout
+    assert "--per_device_train_batch_size 2" in result.stdout
+    assert "--gradient_accumulation_steps 6" in result.stdout
+    assert "--learning_rate 1e-4" in result.stdout
+    assert "effective_batch=48" in result.stdout
+    assert "learning_rate=1e-4" in result.stdout
+    assert str(
+        output_root / "train/e04a_mope_new_e01_projector_only_lr1e4_bs2_4b"
+    ) in result.stdout
+
+
 def test_e02c_three_gpu_launcher_preserves_effective_batch(tmp_path):
     root = Path(__file__).resolve().parents[1]
     env = {
