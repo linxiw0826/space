@@ -131,6 +131,16 @@ def main() -> None:
         config = model.config
         llm_dim = getattr(config, "hidden_size", None) or config.text_config.hidden_size
         projector = MoPEProjectorCrossAttn(mope_dim=768, llm_dim=llm_dim)
+        if os.environ.get("MOPE_PROJECTOR_DIAG", "0") == "1":
+            diag_every = int(os.environ.get("MOPE_PROJECTOR_DIAG_EVERY_FORWARDS", "1920"))
+            if diag_every < 1:
+                raise ValueError("MOPE_PROJECTOR_DIAG_EVERY_FORWARDS must be positive")
+            projector._projector_diag_enabled = True
+            projector._projector_diag_every_forwards = diag_every
+            base.rank0_print(
+                "[E04a-projector-diag] enabled "
+                f"every_forwards={diag_every} rank0_only=True"
+            )
         if projector.use_gate or hasattr(projector, "gate_mlp"):
             raise RuntimeError("MoPE-new Paper 1 experiments forbid a projector gate")
         if torch.count_nonzero(projector.out_proj.weight).item() or torch.count_nonzero(

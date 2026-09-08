@@ -314,6 +314,13 @@ class MoPEProjectorCrossAttn(nn.Module):
         # Eval (change C): the router wrapper sets this True only when E10_GATE_LOG
         # is enabled, so the default learned-eval path stays byte-for-byte E-10.
         self._eval_resid_active = False
+        # Optional low-frequency diagnostics for ungated E-04a projector runs.
+        # The final515k entry point enables these attributes explicitly; all
+        # other experiments retain a zero-overhead disabled path.  The counter
+        # is plain Python state and never enters checkpoints/state_dict.
+        self._projector_diag_enabled = False
+        self._projector_diag_every_forwards = 1920
+        self._projector_diag_forward_count = 0
         if self.use_gate:
             self.gate_mlp = nn.Sequential(
                 nn.Linear(llm_dim, gate_hidden),
@@ -538,6 +545,59 @@ class MoPEProjectorCrossAttn(nn.Module):
         out = attn @ V                                                 # [B, N_img, llm_dim]
         out = self.out_proj(out)                                       # [B, N_img, llm_dim]
         out = out.to(image_embeds.dtype)
+
+        if self.training and self._projector_diag_enabled:
+            self._projector_diag_forward_count += 1
+            _diag_call = self._projector_diag_forward_count
+            _diag_due = _diag_call <= 2 or (
+                _diag_call % self._projector_diag_every_forwards == 0
+            )
+            if _diag_due:
+                try:
+                    import torch.distributed as _dist
+
+                    _rank0 = (not _dist.is_initialized()) or _dist.get_rank() == 0
+                except Exception:
+                    _rank0 = True
+                if _rank0:
+                    with torch.no_grad():
+                        _attn_fp32 = attn.detach().float()
+                        _entropy = -(
+                            _attn_fp32.clamp_min(1e-12)
+                            * _attn_fp32.clamp_min(1e-12).log()
+                        ).sum(dim=-1).mean()
+                        _entropy_max = torch.log(
+                            torch.tensor(
+                                float(_attn_fp32.shape[-1]),
+                                device=_attn_fp32.device,
+                            )
+                        ).clamp_min(1e-12)
+                        _entropy_norm = _entropy / _entropy_max
+                        _out_fp32 = out.detach().float()
+                        _img_fp32 = image_embeds.detach().float()
+                        _bias = self.out_proj.bias.detach().float()
+                        _content = _out_fp32 - _bias.view(1, 1, -1)
+                        _out_norm = _out_fp32.norm(dim=-1).mean()
+                        _img_norm = _img_fp32.norm(dim=-1).mean()
+                        _content_norm = _content.norm(dim=-1).mean()
+                        _bias_norm = _bias.norm()
+                        _resid_ratio = _out_norm / _img_norm.clamp_min(1e-12)
+                        _bias_share = _bias_norm / (
+                            _bias_norm + _content_norm
+                        ).clamp_min(1e-12)
+                    print(
+                        "[E04a-projector-diag] "
+                        f"forward={_diag_call} "
+                        f"attn_entropy={float(_entropy.item()):.6f} "
+                        f"attn_entropy_norm={float(_entropy_norm.item()):.6f} "
+                        f"image_norm={float(_img_norm.item()):.6f} "
+                        f"residual_norm={float(_out_norm.item()):.6f} "
+                        f"residual_image_ratio={float(_resid_ratio.item()):.6f} "
+                        f"content_norm={float(_content_norm.item()):.6f} "
+                        f"bias_norm={float(_bias_norm.item()):.6f} "
+                        f"bias_share_proxy={float(_bias_share.item()):.6f}",
+                        flush=True,
+                    )
 
         if self.use_gate:
             # E-10: modulate the MoPE residual by a content-driven scalar gate.

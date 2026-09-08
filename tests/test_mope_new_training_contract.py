@@ -86,6 +86,25 @@ def test_e04a_projector_is_ungated_and_exact_zero_residual_at_init():
     assert torch.equal(result, image)
 
 
+def test_e04a_projector_diagnostics_report_content_and_bias_without_changing_output(capsys):
+    projector = MoPEProjectorCrossAttn(768, 16)
+    projector.train()
+    projector._projector_diag_enabled = True
+    projector._projector_diag_every_forwards = 100
+    image = torch.randn(1, 5, 16)
+    features = torch.randn(1, 8, 768)
+
+    result = projector(features, image)
+
+    assert torch.equal(result, image)
+    line = capsys.readouterr().out
+    assert "[E04a-projector-diag]" in line
+    assert "attn_entropy_norm=" in line
+    assert "residual_image_ratio=" in line
+    assert "content_norm=" in line
+    assert "bias_share_proxy=" in line
+
+
 def test_projector_warmstart_is_strict_and_trainable(tmp_path):
     source = MoPEProjectorCrossAttn(768, 16)
     with torch.no_grad():
@@ -256,6 +275,13 @@ def test_e04a_lr1e4_bs2_launcher_preserves_effective_batch_and_isolated_output(t
     assert "--learning_rate 1e-4" in result.stdout
     assert "effective_batch=48" in result.stdout
     assert "learning_rate=1e-4" in result.stdout
+    launcher = (
+        root
+        / "scripts/idea1_feature/train/"
+        "train_e04a_mope_new_e01_projector_only_lr1e4_bs2.sh"
+    ).read_text()
+    assert 'MOPE_PROJECTOR_DIAG="1"' in launcher
+    assert 'MOPE_PROJECTOR_DIAG_EVERY_FORWARDS="1920"' in launcher
     assert str(
         output_root / "train/e04a_mope_new_e01_projector_only_lr1e4_bs2_4b"
     ) in result.stdout
