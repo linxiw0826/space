@@ -287,6 +287,121 @@ def test_e04a_lr1e4_bs2_launcher_preserves_effective_batch_and_isolated_output(t
     ) in result.stdout
 
 
+def test_e04a_lr1e4_constant_launcher_is_scheduler_only_fresh_control(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    output_root = tmp_path / "output"
+    env = {
+        **os.environ,
+        "SPACE_OUTPUT_ROOT": str(output_root),
+        "SPACE_LOG_ROOT": str(tmp_path / "logs"),
+        "MOPE_NEW_ALLOW_MISSING_ASSETS": "1",
+        "DRY_RUN": "1",
+    }
+    launcher_path = (
+        root
+        / "scripts/idea1_feature/train/"
+        "train_e04a_mope_new_e01_projector_only_lr1e4_constant_bs2_diag.sh"
+    )
+    result = subprocess.run(
+        ["bash", str(launcher_path)],
+        cwd=root,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    expected_base = output_root / "train/e01_guide_4b"
+    expected_output = (
+        output_root
+        / "train/e04a_mope_new_e01_projector_only_lr1e4_constant_bs2_diag_4b"
+    )
+    assert "CUDA_VISIBLE_DEVICES=1,3,5,6" in result.stdout
+    assert "--nproc_per_node=4" in result.stdout
+    assert "--model_name_or_path " + str(expected_base) in result.stdout
+    assert "--output_dir " + str(expected_output) in result.stdout
+    assert "--per_device_train_batch_size 2" in result.stdout
+    assert "--gradient_accumulation_steps 6" in result.stdout
+    assert "--learning_rate 1e-4" in result.stdout
+    assert "--warmup_ratio 0.03" in result.stdout
+    assert "--num_train_epochs 1" in result.stdout
+    assert "--lr_scheduler_type constant_with_warmup" in result.stdout
+    assert "--tune_mm_vision False" in result.stdout
+    assert "--tune_mm_mlp False" in result.stdout
+    assert "--tune_mm_llm False" in result.stdout
+    assert "--freeze_mope_projector False" in result.stdout
+    assert "effective_batch=48" in result.stdout
+    assert "lr_scheduler_type=constant_with_warmup" in result.stdout
+    assert "resume=none" in result.stdout
+    assert "--overwrite_output_dir" in result.stdout
+    launcher = launcher_path.read_text()
+    assert 'MOPE_PROJECTOR_DIAG="1"' in launcher
+    assert 'MOPE_PROJECTOR_DIAG_EVERY_FORWARDS="1920"' in launcher
+
+
+def test_e04a_lr1e4_constant_launcher_rejects_cosine_output_resume_escape(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    output_root = tmp_path / "output"
+    cosine_output = (
+        output_root
+        / "train/e04a_mope_new_e01_projector_only_lr1e4_bs2_diag_4b"
+    )
+    env = {
+        **os.environ,
+        "SPACE_OUTPUT_ROOT": str(output_root),
+        "SPACE_LOG_ROOT": str(tmp_path / "logs"),
+        "MOPE_NEW_ALLOW_MISSING_ASSETS": "1",
+        "DRY_RUN": "1",
+        "OUTPUT_DIR": str(cosine_output),
+        "RESUME_FROM_CHECKPOINT": str(cosine_output / "checkpoint-1000"),
+    }
+    launcher_path = (
+        root
+        / "scripts/idea1_feature/train/"
+        "train_e04a_mope_new_e01_projector_only_lr1e4_constant_bs2_diag.sh"
+    )
+    result = subprocess.run(
+        ["bash", str(launcher_path)],
+        cwd=root,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "constant control OUTPUT_DIR is locked" in result.stderr
+    assert "refusing override" in result.stderr
+
+
+def test_mope_new_common_scheduler_default_remains_cosine(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    env = {
+        **os.environ,
+        "SPACE_OUTPUT_ROOT": str(tmp_path / "output"),
+        "SPACE_LOG_ROOT": str(tmp_path / "logs"),
+        "MOPE_NEW_ALLOW_MISSING_ASSETS": "1",
+        "DRY_RUN": "1",
+    }
+    result = subprocess.run(
+        [
+            "bash",
+            str(
+                root
+                / "scripts/idea1_feature/train/"
+                "train_e04a_mope_new_e01_projector_only_lr1e4_bs2.sh"
+            ),
+        ],
+        cwd=root,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--lr_scheduler_type cosine" in result.stdout
+    assert "lr_scheduler_type=cosine" in result.stdout
+
+
 def test_e02c_three_gpu_launcher_preserves_effective_batch(tmp_path):
     root = Path(__file__).resolve().parents[1]
     env = {
