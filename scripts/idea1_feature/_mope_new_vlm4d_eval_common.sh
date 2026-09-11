@@ -24,10 +24,18 @@ VLM4D_JSONL="${VLM4D_JSONL:-${VLM4D_VIDEO_ROOT}/QA/real_mc.json}"
 export VLM4D_VIDEO_ROOT
 
 case "${MOPE_NEW_EXPERIMENT}" in
-  e02c-new) NAME=e02c_mope_new_crossattn_joint_4b ;;
-  e04a-new) NAME=e04a_mope_new_e01_projector_only_4b ;;
+  e02c-new) DEFAULT_NAME=e02c_mope_new_crossattn_joint_4b ;;
+  e04a-new) DEFAULT_NAME=e04a_mope_new_e01_projector_only_4b ;;
   *) echo "final515k VLM4D eval only supports e02c-new/e04a-new; old wrappers are historical" >&2; exit 2 ;;
 esac
+NAME="${MOPE_NEW_EVAL_NAME:-${DEFAULT_NAME}}"
+if [[ "${NAME}" != "${DEFAULT_NAME}" ]]; then
+  [[ "${MOPE_NEW_EXPERIMENT}" == "e04a-new" && \
+     "${NAME}" == "e04a_mope_new_e01_projector_only_lr1e4_constant_bs2_diag_4b" ]] || {
+    echo "Unsupported MOPE_NEW_EVAL_NAME override: ${NAME}" >&2
+    exit 2
+  }
+fi
 
 REQUESTED_CKPT_PATH="${CKPT_PATH:-${OUTPUT_ROOT}/train/${NAME}}"
 CKPT_PATH="${REQUESTED_CKPT_PATH}"
@@ -60,12 +68,29 @@ if [[ "${SMOKE_MODE}" == "1" ]]; then
   LOG_FILE="${LOG_FILE:-${LOG_DIR}/smoke/${NAME}_vlm4d_smoke_$(date +%Y%m%d_%H%M%S).log}"
   EVAL_JSONL="${RUN_ROOT}/vlm4d_smoke.jsonl"
   EXPECTED_SAMPLE_COUNT=4
-  DATA_PREFLIGHT_REPORT="${OUTPUT_ROOT}/audit/mope_final515k_eval/vlm4d_data_preflight.json"
+  if [[ "${NAME}" == "${DEFAULT_NAME}" ]]; then
+    DEFAULT_DATA_PREFLIGHT_REPORT="${OUTPUT_ROOT}/audit/mope_final515k_eval/vlm4d_data_preflight.json"
+  else
+    DEFAULT_DATA_PREFLIGHT_REPORT="${OUTPUT_ROOT}/audit/mope_final515k_eval/${NAME}_vlm4d_smoke_data_preflight.json"
+  fi
 else
   LOG_FILE="${LOG_FILE:-${LOG_DIR}/${NAME}_vlm4d_$(date +%Y%m%d_%H%M%S).log}"
   EVAL_JSONL="${VLM4D_JSONL}"
   EXPECTED_SAMPLE_COUNT=1371
+  if [[ "${NAME}" == "${DEFAULT_NAME}" ]]; then
+    DEFAULT_DATA_PREFLIGHT_REPORT="${OUTPUT_ROOT}/audit/mope_final515k_eval/vlm4d_formal_data_preflight.json"
+  else
+    DEFAULT_DATA_PREFLIGHT_REPORT="${OUTPUT_ROOT}/audit/mope_final515k_eval/${NAME}_vlm4d_formal_data_preflight.json"
+  fi
 fi
+DATA_PREFLIGHT_REPORT="${DATA_PREFLIGHT_REPORT:-${DEFAULT_DATA_PREFLIGHT_REPORT}}"
+E04A_BASE_CKPT="${E04A_BASE_CKPT:-${OUTPUT_ROOT}/train/e01_guide_4b}"
+if [[ "${NAME}" == "${DEFAULT_NAME}" ]]; then
+  DEFAULT_E04A_VERIFY_REPORT="${OUTPUT_ROOT}/audit/mope_final515k_eval/e04a_checkpoint_verification.json"
+else
+  DEFAULT_E04A_VERIFY_REPORT="${OUTPUT_ROOT}/audit/mope_final515k_eval/${NAME}_vlm4d_checkpoint_verification.json"
+fi
+E04A_VERIFY_REPORT="${E04A_VERIFY_REPORT:-${DEFAULT_E04A_VERIFY_REPORT}}"
 NUM_PROCESSES="${NUM_PROCESSES:-4}"
 [[ "${NUM_PROCESSES}" =~ ^[1-9][0-9]*$ ]] || {
   echo "NUM_PROCESSES must be a positive integer" >&2
@@ -104,9 +129,14 @@ echo "frames=16 sampling=4x4 pos=3d_sincos input=224 pool=temporal expected=[B,8
 echo "VLM4D real_mc=${VLM4D_JSONL} video_root=${VLM4D_VIDEO_ROOT} output=${RESULTS_DIR}"
 if [[ "${SMOKE_MODE}" == "1" ]]; then
   echo "Smoke coverage=all 3 video sources total=4 decode_limit=${SMOKE_DECODE_LIMIT}"
-  echo "Data_preflight_report=${DATA_PREFLIGHT_REPORT}"
+fi
+echo "Data_preflight_report=${DATA_PREFLIGHT_REPORT}"
+if [[ "${MOPE_NEW_EXPERIMENT}" == "e04a-new" ]]; then
+  echo "E04a_base_checkpoint=${E04A_BASE_CKPT}"
+  echo "E04a_checkpoint_verification=${E04A_VERIFY_REPORT}"
 fi
 echo "Log=${LOG_FILE}"
+echo "GPUs=${CUDA_VISIBLE_DEVICES} processes=${NUM_PROCESSES}"
 printf 'COMMAND:'; printf ' %q' "${COMMAND[@]}"; printf '\n'
 [[ "${DRY_RUN}" == "1" ]] && exit 0
 
@@ -122,6 +152,13 @@ cleanup_run_root() {
 }
 trap cleanup_run_root EXIT
 mkdir -p "$(dirname "${RESULTS_DIR}")" "${TASK_DIR}" "${RUN_OUTPUT_DIR}" "$(dirname "${LOG_FILE}")"
+if [[ "${MOPE_NEW_EXPERIMENT}" == "e04a-new" ]]; then
+  mkdir -p "$(dirname "${E04A_VERIFY_REPORT}")"
+  python "${SPACE_ROOT}/scripts/idea1_feature/verify_e04a_checkpoint.py" \
+    --base "${E04A_BASE_CKPT}" \
+    --candidate "${CKPT_PATH}" \
+    --report "${E04A_VERIFY_REPORT}"
+fi
 if [[ "${SMOKE_MODE}" == "1" ]]; then
   mkdir -p "$(dirname "${DATA_PREFLIGHT_REPORT}")"
   python "${SPACE_ROOT}/scripts/preprocess/preflight_mope_final515k_eval_data.py" \
@@ -134,6 +171,16 @@ if [[ "${SMOKE_MODE}" == "1" ]]; then
     --decode-limit "${SMOKE_DECODE_LIMIT}" \
     --smoke-count "${EXPECTED_SAMPLE_COUNT}" \
     --smoke-output "${EVAL_JSONL}" \
+    --report "${DATA_PREFLIGHT_REPORT}"
+elif [[ "${MOPE_NEW_EXPERIMENT}" == "e04a-new" ]]; then
+  mkdir -p "$(dirname "${DATA_PREFLIGHT_REPORT}")"
+  python "${SPACE_ROOT}/scripts/preprocess/preflight_mope_final515k_eval_data.py" \
+    --dataset vlm4d \
+    --annotation "${VLM4D_JSONL}" \
+    --video-root "${VLM4D_VIDEO_ROOT}" \
+    --expected-rows 1371 \
+    --expected-videos 600 \
+    --decode none \
     --report "${DATA_PREFLIGHT_REPORT}"
 fi
 cp "${GUIDE_LMMS_EVAL}/lmms_eval/tasks/vlm4d/utils.py" "${TASK_DIR}/utils.py"

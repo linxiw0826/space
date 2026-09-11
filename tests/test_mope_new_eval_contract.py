@@ -42,6 +42,10 @@ def test_complete_hf_resolver_rejects_empty_weight_shard(tmp_path):
     [
         ("eval_e02c_mope_new_vsibench.sh", "e02c_mope_new_crossattn_joint_4b"),
         ("eval_e04a_mope_new_vsibench.sh", "e04a_mope_new_e01_projector_only_4b"),
+        (
+            "eval_e04a_mope_new_lr1e4_constant_vsibench.sh",
+            "e04a_mope_new_e01_projector_only_lr1e4_constant_bs2_diag_4b",
+        ),
     ],
 )
 def test_eval_dry_run_uses_server_roots_and_timestamped_log(script_name, experiment_name):
@@ -196,6 +200,10 @@ def test_failed_vsibench_eval_preserves_prior_results_and_cleans_workdir(tmp_pat
     [
         ("eval_e02c_mope_new_vlm4d.sh", "e02c_mope_new_crossattn_joint_4b"),
         ("eval_e04a_mope_new_vlm4d.sh", "e04a_mope_new_e01_projector_only_4b"),
+        (
+            "eval_e04a_mope_new_lr1e4_constant_vlm4d.sh",
+            "e04a_mope_new_e01_projector_only_lr1e4_constant_bs2_diag_4b",
+        ),
     ],
 )
 def test_vlm4d_eval_dry_run_contract(script_name, experiment_name):
@@ -235,6 +243,69 @@ def test_vlm4d_eval_dry_run_contract(script_name, experiment_name):
     assert "mope_pool_mode=temporal" in result.stdout
     assert "--num_processes=1" in result.stdout
     assert "--main_process_port=29604" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("script_name", "benchmark", "port"),
+    [
+        ("eval_e04a_mope_new_lr1e4_constant_vsibench.sh", "vsibench", "29527"),
+        ("eval_e04a_mope_new_lr1e4_constant_vlm4d.sh", "vlm4d", "29529"),
+    ],
+)
+def test_e04a_constant_eval_isolated_contract(script_name, benchmark, port):
+    root = Path.cwd()
+    name = "e04a_mope_new_e01_projector_only_lr1e4_constant_bs2_diag_4b"
+    env = os.environ.copy()
+    env.update(
+        {
+            "SPACE_ROOT": str(root),
+            "SPACE_OUTPUT_ROOT": "/contract/output",
+            "SPACE_LOG_ROOT": "/contract/logs",
+            "MOPE_NEW_ALLOW_MISSING_ASSETS": "1",
+            "DRY_RUN": "1",
+        }
+    )
+    result = subprocess.run(
+        ["bash", str(root / "scripts/idea1_feature/eval" / script_name)],
+        cwd=root,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert f"requested_checkpoint=/contract/output/train/{name}" in result.stdout
+    assert f"output=/contract/output/eval/{benchmark}/{name}" in result.stdout
+    assert f"Log=/contract/logs/eval/{name}_{benchmark}_" in result.stdout
+    assert f"--main_process_port={port}" in result.stdout
+    assert "--num_processes=4" in result.stdout
+    assert "checkpoint-50.pth" in result.stdout
+    assert "frames=16 sampling=4x4 pos=3d_sincos input=224 pool=temporal" in result.stdout
+    assert f"{name}_{benchmark}_checkpoint_verification.json" in result.stdout
+    assert f"{name}_{benchmark}_formal_data_preflight.json" in result.stdout
+    assert "GPUs=1,3,5,6 processes=4" in result.stdout
+
+
+def test_eval_name_override_is_fail_closed():
+    root = Path.cwd()
+    env = os.environ.copy()
+    env.update(
+        {
+            "SPACE_ROOT": str(root),
+            "MOPE_NEW_EXPERIMENT": "e04a-new",
+            "MOPE_NEW_EVAL_NAME": "../../unsafe",
+            "MOPE_NEW_ALLOW_MISSING_ASSETS": "1",
+            "DRY_RUN": "1",
+        }
+    )
+    result = subprocess.run(
+        ["bash", str(root / "scripts/idea1_feature/_mope_new_eval_common.sh")],
+        cwd=root,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 2
+    assert "Unsupported MOPE_NEW_EVAL_NAME override" in result.stderr
 
 
 @pytest.mark.parametrize(
@@ -378,6 +449,23 @@ def test_final515k_wrappers_preflight_source_root():
         source = Path(script).read_text()
         assert '[[ -d "${MOPE_NEW_SOURCE_ROOT}" ]]' in source
         assert "Missing MoPE-new source" in source
+
+
+def test_e04a_formal_eval_requires_checkpoint_and_complete_data_preflight():
+    for script, dataset, rows, videos in (
+        ("scripts/idea1_feature/_mope_new_eval_common.sh", "vsibench", 5130, 288),
+        ("scripts/idea1_feature/_mope_new_vlm4d_eval_common.sh", "vlm4d", 1371, 600),
+    ):
+        source = Path(script).read_text()
+        assert '[[ "${MOPE_NEW_EXPERIMENT}" == "e04a-new" ]]' in source
+        assert "verify_e04a_checkpoint.py" in source
+        assert '--base "${E04A_BASE_CKPT}"' in source
+        assert '--candidate "${CKPT_PATH}"' in source
+        assert "preflight_mope_final515k_eval_data.py" in source
+        assert f"--dataset {dataset}" in source
+        assert f"--expected-rows {rows}" in source
+        assert f"--expected-videos {videos}" in source
+        assert "--decode none" in source
 
 
 def test_eval_artifact_validation_rejects_partial_samples(tmp_path):

@@ -23,10 +23,18 @@ VSIBENCH_JSONL="${VSIBENCH_JSONL:-${VSIBENCH_VIDEO_ROOT}/test.jsonl}"
 export VSIBENCH_VIDEO_ROOT VSIBENCH_JSONL
 
 case "${MOPE_NEW_EXPERIMENT}" in
-  e02c-new) NAME=e02c_mope_new_crossattn_joint_4b ;;
-  e04a-new) NAME=e04a_mope_new_e01_projector_only_4b ;;
+  e02c-new) DEFAULT_NAME=e02c_mope_new_crossattn_joint_4b ;;
+  e04a-new) DEFAULT_NAME=e04a_mope_new_e01_projector_only_4b ;;
   *) echo "final515k eval only supports e02c-new/e04a-new; old E-00b/E-03a wrappers are historical" >&2; exit 2 ;;
 esac
+NAME="${MOPE_NEW_EVAL_NAME:-${DEFAULT_NAME}}"
+if [[ "${NAME}" != "${DEFAULT_NAME}" ]]; then
+  [[ "${MOPE_NEW_EXPERIMENT}" == "e04a-new" && \
+     "${NAME}" == "e04a_mope_new_e01_projector_only_lr1e4_constant_bs2_diag_4b" ]] || {
+    echo "Unsupported MOPE_NEW_EVAL_NAME override: ${NAME}" >&2
+    exit 2
+  }
+fi
 REQUESTED_CKPT_PATH="${CKPT_PATH:-${OUTPUT_ROOT}/train/${NAME}}"
 CKPT_PATH="${REQUESTED_CKPT_PATH}"
 FORMAL_RESULTS_DIR="${OUTPUT_ROOT}/eval/vsibench/${NAME}"
@@ -52,12 +60,29 @@ if [[ "${SMOKE_MODE}" == "1" ]]; then
   LOG_FILE="${LOG_FILE:-${LOG_DIR}/smoke/${NAME}_vsibench_smoke_$(date +%Y%m%d_%H%M%S).log}"
   EVAL_JSONL="${RUN_ROOT}/vsibench_smoke.jsonl"
   EXPECTED_SAMPLE_COUNT=10
-  DATA_PREFLIGHT_REPORT="${OUTPUT_ROOT}/audit/mope_final515k_eval/vsibench_data_preflight.json"
+  if [[ "${NAME}" == "${DEFAULT_NAME}" ]]; then
+    DEFAULT_DATA_PREFLIGHT_REPORT="${OUTPUT_ROOT}/audit/mope_final515k_eval/vsibench_data_preflight.json"
+  else
+    DEFAULT_DATA_PREFLIGHT_REPORT="${OUTPUT_ROOT}/audit/mope_final515k_eval/${NAME}_vsibench_smoke_data_preflight.json"
+  fi
 else
   LOG_FILE="${LOG_FILE:-${LOG_DIR}/${NAME}_vsibench_$(date +%Y%m%d_%H%M%S).log}"
   EVAL_JSONL="${VSIBENCH_JSONL}"
   EXPECTED_SAMPLE_COUNT=5130
+  if [[ "${NAME}" == "${DEFAULT_NAME}" ]]; then
+    DEFAULT_DATA_PREFLIGHT_REPORT="${OUTPUT_ROOT}/audit/mope_final515k_eval/vsibench_formal_data_preflight.json"
+  else
+    DEFAULT_DATA_PREFLIGHT_REPORT="${OUTPUT_ROOT}/audit/mope_final515k_eval/${NAME}_vsibench_formal_data_preflight.json"
+  fi
 fi
+DATA_PREFLIGHT_REPORT="${DATA_PREFLIGHT_REPORT:-${DEFAULT_DATA_PREFLIGHT_REPORT}}"
+E04A_BASE_CKPT="${E04A_BASE_CKPT:-${OUTPUT_ROOT}/train/e01_guide_4b}"
+if [[ "${NAME}" == "${DEFAULT_NAME}" ]]; then
+  DEFAULT_E04A_VERIFY_REPORT="${OUTPUT_ROOT}/audit/mope_final515k_eval/e04a_checkpoint_verification.json"
+else
+  DEFAULT_E04A_VERIFY_REPORT="${OUTPUT_ROOT}/audit/mope_final515k_eval/${NAME}_vsibench_checkpoint_verification.json"
+fi
+E04A_VERIFY_REPORT="${E04A_VERIFY_REPORT:-${DEFAULT_E04A_VERIFY_REPORT}}"
 NUM_PROCESSES="${NUM_PROCESSES:-4}"
 MAIN_PORT="${MAIN_PORT:-29527}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
@@ -88,9 +113,14 @@ echo "frames=16 sampling=4x4 pos=3d_sincos input=224 pool=temporal expected=[B,8
 echo "VSI-Bench=${VSIBENCH_JSONL} video_root=${VSIBENCH_VIDEO_ROOT} output=${RESULTS_DIR}"
 if [[ "${SMOKE_MODE}" == "1" ]]; then
   echo "Smoke coverage=all 10 question types total=10 decode_limit=${SMOKE_DECODE_LIMIT}"
-  echo "Data_preflight_report=${DATA_PREFLIGHT_REPORT}"
+fi
+echo "Data_preflight_report=${DATA_PREFLIGHT_REPORT}"
+if [[ "${MOPE_NEW_EXPERIMENT}" == "e04a-new" ]]; then
+  echo "E04a_base_checkpoint=${E04A_BASE_CKPT}"
+  echo "E04a_checkpoint_verification=${E04A_VERIFY_REPORT}"
 fi
 echo "Log=${LOG_FILE}"
+echo "GPUs=${CUDA_VISIBLE_DEVICES} processes=${NUM_PROCESSES}"
 printf 'COMMAND:'; printf ' %q' "${COMMAND[@]}"; printf '\n'
 [[ "${DRY_RUN}" == "1" ]] && exit 0
 export LMMS_EVAL_PLUGINS=src.mope_new_eval_plugin
@@ -104,6 +134,13 @@ cleanup_run_root() {
   [[ -z "${STAGED_RESULTS:-}" ]] || rm -rf -- "${STAGED_RESULTS}"
 }
 trap cleanup_run_root EXIT
+if [[ "${MOPE_NEW_EXPERIMENT}" == "e04a-new" ]]; then
+  mkdir -p "$(dirname "${E04A_VERIFY_REPORT}")"
+  python "${SPACE_ROOT}/scripts/idea1_feature/verify_e04a_checkpoint.py" \
+    --base "${E04A_BASE_CKPT}" \
+    --candidate "${CKPT_PATH}" \
+    --report "${E04A_VERIFY_REPORT}"
+fi
 if [[ "${SMOKE_MODE}" == "1" ]]; then
   mkdir -p "$(dirname "${DATA_PREFLIGHT_REPORT}")"
   python "${SPACE_ROOT}/scripts/preprocess/preflight_mope_final515k_eval_data.py" \
@@ -115,6 +152,16 @@ if [[ "${SMOKE_MODE}" == "1" ]]; then
     --decode sample \
     --decode-limit "${SMOKE_DECODE_LIMIT}" \
     --smoke-output "${EVAL_JSONL}" \
+    --report "${DATA_PREFLIGHT_REPORT}"
+elif [[ "${MOPE_NEW_EXPERIMENT}" == "e04a-new" ]]; then
+  mkdir -p "$(dirname "${DATA_PREFLIGHT_REPORT}")"
+  python "${SPACE_ROOT}/scripts/preprocess/preflight_mope_final515k_eval_data.py" \
+    --dataset vsibench \
+    --annotation "${VSIBENCH_JSONL}" \
+    --video-root "${VSIBENCH_VIDEO_ROOT}" \
+    --expected-rows 5130 \
+    --expected-videos 288 \
+    --decode none \
     --report "${DATA_PREFLIGHT_REPORT}"
 fi
 cp "${GUIDE_LMMS_EVAL}/lmms_eval/tasks/vsibench/utils.py" "${TASK_DIR}/utils.py"
