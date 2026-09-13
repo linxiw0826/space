@@ -155,6 +155,17 @@ COMMAND=(python -m torch.distributed.run "--nproc_per_node=${NPROC_PER_NODE}" "-
 if [[ "${MOPE_NEW_EXPERIMENT}" == "e04b-quarter" ]]; then
   COMMAND+=(--lora_enable True --lora_r 8 --lora_alpha 16 --lora_dropout 0.05)
 fi
+
+if [[ "${MOPE_NEW_EXPERIMENT}" == *-quarter ]]; then
+  [[ "${VSI590K_SPAR_ANN}" == *"quarter_stratified.json" ]] || {
+    echo "Quarter experiments require the source-stratified quarter manifest: ${VSI590K_SPAR_ANN}" >&2
+    exit 2
+  }
+  [[ "${MOPE_NEW_CKPT}" == *"checkpoint-73.pth" ]] || {
+    echo "Quarter MoPE experiments require checkpoint-73.pth: ${MOPE_NEW_CKPT}" >&2
+    exit 2
+  }
+fi
 if [[ "${PREDELETE_OLDEST_CHECKPOINT}" == "1" ]]; then
   COMMAND+=(--predelete_oldest_checkpoint True)
 fi

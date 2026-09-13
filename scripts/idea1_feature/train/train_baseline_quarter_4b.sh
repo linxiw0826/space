@@ -16,6 +16,12 @@ export VSI590K_SPAR_ANN="${MOPE_NEW_SPAR_ANN:-/data2/wlx/data/vsi590k_processed/
 export VSI590K_VIDEO_ANN="${VSI590K_VIDEO_ANN:-/data2/wlx/data/vsi590k_processed/vsi590k_video_590k.json}"
 export VSI590K_DATA_ROOT="${VSI590K_DATA_ROOT:-/data2/wlx/data/vsi590k_processed}"
 
+[[ -f "${VSI590K_SPAR_ANN}" ]] || { echo "Missing quarter manifest: ${VSI590K_SPAR_ANN}" >&2; exit 2; }
+[[ -d "${GUIDE_CKPT_PATH:-${SPACE_OUTPUT_ROOT:-/data2/wlx/output}/train/guide_reproduced/4b}" ]] || {
+  echo "Missing baseline initialization checkpoint" >&2
+  exit 2
+}
+
 OUTPUT_DIR="${OUTPUT_DIR:-${SPACE_OUTPUT_ROOT:-/data2/wlx/output}/train/baseline_quarter_4b}"
 GUIDE_CKPT_PATH="${GUIDE_CKPT_PATH:-${SPACE_OUTPUT_ROOT:-/data2/wlx/output}/train/guide_reproduced/4b}"
 LOG_FILE="${LOG_FILE:-${SPACE_LOG_ROOT:-/data2/wlx/logs}/train/baseline_quarter_4b_$(date +%Y%m%d_%H%M%S).log}"
