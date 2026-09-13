@@ -17,8 +17,13 @@ warmup ratio 0.03 on GPUs `1,3,5,6`.
   projector at `1e-5` plus LoRA at `5e-6` on the final eight language layers,
   q/k/v/o, rank 8, alpha 16, dropout 0.05.
 
-The MoPE encoder is checkpoint-73 at the final515k 3D-sincos recipe:
+The MoPE encoder is the PhysBench-posttrained artifact
+`checkpoint-73-posttrain-physbench-fullmope-epoch44.pth`, derived from
+checkpoint-73. Its internal metadata still reports `epoch=73`; the filename
+is the authoritative identifier for this post-training artifact. It uses the
+final515k 3D-sincos recipe:
 16 frames, 4 groups x 4 frames, input 224, temporal pooling, output
 `[B, 8, 768]`. Quarter eval wrappers are named
 `eval_{baseline,mope73_projector,mope73_projector_lora}_quarter_{vsibench,vlm4d}.sh`.
-They enforce isolated result paths and checkpoint-73 for MoPE runs.
+They enforce isolated result paths and the PhysBench-posttrained checkpoint for
+MoPE runs. No feature scaling is applied in these experiments.

@@ -18,7 +18,7 @@ OUTPUT_ROOT="${SPACE_OUTPUT_ROOT:-${SPACE_ROOT}/output}"
 LOG_DIR="${LOG_DIR:-${SPACE_LOG_ROOT:-${SPACE_ROOT}/logs}/eval}"
 MOPE_NEW_SOURCE_ROOT="${MOPE_NEW_SOURCE_ROOT:-${SPACE_ROOT}/refs/mope-jepa-native-final515k}"
 if [[ "${MOPE_NEW_EXPERIMENT}" == *-quarter ]]; then
-  DEFAULT_MOPE_NEW_CKPT=/data2/mope-jepa-assets/jepa_checkpoints/native_mope_b_dense8_moe8_top1_shared1_anchor1_final515k_3dpos_ep100_warm3_cos_lr75e6_min25e6/checkpoint-73.pth
+  DEFAULT_MOPE_NEW_CKPT=/data2/mope-jepa-assets/jepa_checkpoints/native_mope_b_dense8_moe8_top1_shared1_anchor1_final515k_3dpos_ep100_warm3_cos_lr75e6_min25e6/checkpoint-73-posttrain-physbench-fullmoe-epoch44.pth
 else
   DEFAULT_MOPE_NEW_CKPT=/data2/mope-jepa-assets/jepa_checkpoints/native_mope_b_dense8_moe8_top1_shared1_anchor1_final515k_3dpos_ep100_warm3_cos_lr75e6_min25e6/checkpoint-50.pth
 fi
@@ -30,6 +30,7 @@ QUARTER_MANIFEST="${VSI590K_SPAR_ANN:-/data2/wlx/data/vsi590k_processed/vsi590k_
 export VLM4D_VIDEO_ROOT
 if [[ "${MOPE_NEW_EXPERIMENT}" == *-quarter ]]; then
   [[ -f "${QUARTER_MANIFEST}" && "${QUARTER_MANIFEST}" == *quarter_stratified.json ]] || { echo "Quarter eval requires ${QUARTER_MANIFEST}" >&2; exit 2; }
+  [[ "$(basename "${MOPE_NEW_CKPT}")" == "checkpoint-73-posttrain-physbench-fullmope-epoch44.pth" ]] || { echo "Quarter eval requires the PhysBench posttrain checkpoint: ${MOPE_NEW_CKPT}" >&2; exit 2; }
 fi
 
 case "${MOPE_NEW_EXPERIMENT}" in

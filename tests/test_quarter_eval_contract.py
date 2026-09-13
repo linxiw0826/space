@@ -29,5 +29,5 @@ def test_quarter_mope_eval_dry_run_contract(tmp_path):
     result = subprocess.run(["bash", str(ROOT / "scripts/idea1_feature/eval/eval_mope73_projector_quarter_vsibench.sh")],
                             cwd=ROOT, env=env, text=True, capture_output=True, check=False)
     assert result.returncode == 0
-    assert "checkpoint-73.pth" in result.stdout
+    assert "checkpoint-73-posttrain-physbench-fullmope-epoch44.pth" in result.stdout
     assert "mope73_projector_quarter_lr1e5_4b" in result.stdout
