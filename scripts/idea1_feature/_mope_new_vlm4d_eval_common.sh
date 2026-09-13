@@ -17,21 +17,33 @@ ALLOW_MISSING="${MOPE_NEW_ALLOW_MISSING_ASSETS:-0}"
 OUTPUT_ROOT="${SPACE_OUTPUT_ROOT:-${SPACE_ROOT}/output}"
 LOG_DIR="${LOG_DIR:-${SPACE_LOG_ROOT:-${SPACE_ROOT}/logs}/eval}"
 MOPE_NEW_SOURCE_ROOT="${MOPE_NEW_SOURCE_ROOT:-${SPACE_ROOT}/refs/mope-jepa-native-final515k}"
-MOPE_NEW_CKPT="${MOPE_NEW_CKPT:-/data2/mope-jepa-assets/jepa_checkpoints/native_mope_b_dense8_moe8_top1_shared1_anchor1_final515k_3dpos_ep100_warm3_cos_lr75e6_min25e6/checkpoint-50.pth}"
+if [[ "${MOPE_NEW_EXPERIMENT}" == *-quarter ]]; then
+  DEFAULT_MOPE_NEW_CKPT=/data2/mope-jepa-assets/jepa_checkpoints/native_mope_b_dense8_moe8_top1_shared1_anchor1_final515k_3dpos_ep100_warm3_cos_lr75e6_min25e6/checkpoint-73.pth
+else
+  DEFAULT_MOPE_NEW_CKPT=/data2/mope-jepa-assets/jepa_checkpoints/native_mope_b_dense8_moe8_top1_shared1_anchor1_final515k_3dpos_ep100_warm3_cos_lr75e6_min25e6/checkpoint-50.pth
+fi
+MOPE_NEW_CKPT="${MOPE_NEW_CKPT:-${DEFAULT_MOPE_NEW_CKPT}}"
 GUIDE_LMMS_EVAL="${GUIDE_LMMS_EVAL:-${SPACE_ROOT}/src/vendor/lmms-eval}"
 VLM4D_VIDEO_ROOT="${VLM4D_VIDEO_ROOT:-/data2/wlx/data/VLM4D}"
 VLM4D_JSONL="${VLM4D_JSONL:-${VLM4D_VIDEO_ROOT}/QA/real_mc.json}"
+QUARTER_MANIFEST="${VSI590K_SPAR_ANN:-/data2/wlx/data/vsi590k_processed/vsi590k_spar_590k_quarter_stratified.json}"
 export VLM4D_VIDEO_ROOT
+if [[ "${MOPE_NEW_EXPERIMENT}" == *-quarter ]]; then
+  [[ -f "${QUARTER_MANIFEST}" && "${QUARTER_MANIFEST}" == *quarter_stratified.json ]] || { echo "Quarter eval requires ${QUARTER_MANIFEST}" >&2; exit 2; }
+fi
 
 case "${MOPE_NEW_EXPERIMENT}" in
   e02c-new) DEFAULT_NAME=e02c_mope_new_crossattn_joint_4b ;;
   e04a-new) DEFAULT_NAME=e04a_mope_new_e01_projector_only_4b ;;
+  e04a-quarter) DEFAULT_NAME=mope73_projector_quarter_lr1e5_4b ;;
+  e04b-quarter) DEFAULT_NAME=mope73_projector_lora_quarter_lr1e5_4b ;;
   *) echo "final515k VLM4D eval only supports e02c-new/e04a-new; old wrappers are historical" >&2; exit 2 ;;
 esac
 NAME="${MOPE_NEW_EVAL_NAME:-${DEFAULT_NAME}}"
 if [[ "${NAME}" != "${DEFAULT_NAME}" ]]; then
-  [[ "${MOPE_NEW_EXPERIMENT}" == "e04a-new" && \
-     "${NAME}" == "e04a_mope_new_e01_projector_only_lr1e4_constant_bs2_diag_4b" ]] || {
+  [[ "${MOPE_NEW_EXPERIMENT}" == "e04a-new" && "${NAME}" == "e04a_mope_new_e01_projector_only_lr1e4_constant_bs2_diag_4b" ||
+     "${MOPE_NEW_EXPERIMENT}" == "e04a-quarter" && "${NAME}" == "mope73_projector_quarter_lr1e5_4b" ||
+     "${MOPE_NEW_EXPERIMENT}" == "e04b-quarter" && "${NAME}" == "mope73_projector_lora_quarter_lr1e5_4b" ]] || {
     echo "Unsupported MOPE_NEW_EVAL_NAME override: ${NAME}" >&2
     exit 2
   }

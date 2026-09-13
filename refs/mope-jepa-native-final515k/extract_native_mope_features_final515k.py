@@ -84,7 +84,11 @@ def build_model():
 
 
 def load_checkpoint(model, ckpt_path):
-    ckpt = torch.load(ckpt_path, map_location="cpu")
+    # These trusted local training checkpoints contain optimizer/scaler
+    # metadata in addition to tensors.  PyTorch 2.6 defaults to
+    # ``weights_only=True``, which rejects that metadata before we can select
+    # the ``model`` state dict.
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     state = ckpt.get("model", ckpt) if isinstance(ckpt, dict) else ckpt
     missing, unexpected = model.load_state_dict(state, strict=False)
     print(f"[load] missing={len(missing)} unexpected={len(unexpected)}", flush=True)
