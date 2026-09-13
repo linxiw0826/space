@@ -7,7 +7,7 @@ PER_DEVICE_TRAIN_BATCH_SIZE="2"
 GRAD_ACCUM="6"
 LEARNING_RATE="1e-5"
 LR_SCHEDULER_TYPE="cosine"
-SPACE_ROOT="${SPACE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+SPACE_ROOT="${SPACE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
 source "${SPACE_ROOT}/scripts/_common/env/activate.sh"
 
 export CUDA_VISIBLE_DEVICES NPROC_PER_NODE
