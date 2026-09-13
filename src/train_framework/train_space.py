@@ -897,6 +897,18 @@ def train(attn_implementation="flash_attention_2"):
         for p in model.parameters():
             p.requires_grad = False
 
+        lora_kwargs = {}
+        lora_last_n = int(os.environ.get("MOPE_LORA_LAST_N", "0"))
+        if lora_last_n > 0:
+            _layers = getattr(getattr(model, "model", None), "language_model", None)
+            _layers = getattr(_layers, "layers", None)
+            if _layers is None or len(_layers) < lora_last_n:
+                raise ValueError(f"Cannot select last {lora_last_n} LLM layers for LoRA")
+            lora_kwargs.update(
+                layers_to_transform=list(range(len(_layers) - lora_last_n, len(_layers))),
+                layers_pattern="layers",
+            )
+            rank0_print(f"[Space Sensing] LoRA restricted to last {lora_last_n} language layers")
         lora_config = LoraConfig(
             r=training_args.lora_r or 64,
             lora_alpha=training_args.lora_alpha or 128,
@@ -904,8 +916,16 @@ def train(attn_implementation="flash_attention_2"):
             target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
             bias="none",
             task_type=TaskType.CAUSAL_LM,
+            **lora_kwargs,
         )
         model = get_peft_model(model, lora_config)
+
+        # MoPE-new E-04b installs a stricter projector+LoRA freeze contract in
+        # the entry point.  Invoke it only after PEFT wrapping, since the
+        # adapters do not exist before get_peft_model().
+        _mope_new_post_lora = globals().get("_mope_new_post_lora_trainability")
+        if _mope_new_post_lora is not None:
+            _mope_new_post_lora(model)
 
         # Re-enable MoPEProjector after LoRA wrapping froze everything
         # (unless freeze_mope_projector is set for two-stage training).
@@ -1135,6 +1155,22 @@ def train(attn_implementation="flash_attention_2"):
             # E-10b v2.1: real gate-logit grad norm captured by the backward hook
             # registered in _gate_anticollapse_loss (change 2). -1 = not yet seen.
             self._last_gate_logit_gnorm = -1.0
+
+        def create_optimizer(self):
+            super().create_optimizer()
+            # E-04b uses a smaller LR for Qwen LoRA adapters while keeping the
+            # MoPE projector at the base learning rate.  Trainer's default
+            # grouping has already handled weight decay; adjust only adapter
+            # groups after creation by matching parameter identities.
+            lora_lr = os.environ.get("MOPE_LORA_LR")
+            if lora_lr and self.optimizer is not None:
+                name_by_id = {id(p): n for n, p in self.model.named_parameters()}
+                target = float(lora_lr)
+                for group in self.optimizer.param_groups:
+                    if any("lora_" in name_by_id.get(id(p), "").lower() for p in group["params"]):
+                        group["lr"] = target
+                rank0_print(f"[MoPE-new] optimizer LoRA learning rate={target:g}")
+            return self.optimizer
 
         def _save_checkpoint(self, model, trial):
             if self.args.predelete_oldest_checkpoint:

@@ -16,7 +16,7 @@ from model.mope_new_encoder import (
 )
 
 
-EXPERIMENTS = {"e02c-new", "e04a-new"}
+EXPERIMENTS = {"e02c-new", "e04a-new", "e04a-quarter", "e04b-quarter"}
 E04A_PROJECTOR_PARAMETERS = 10_494_976
 
 
@@ -48,7 +48,7 @@ def configure_trainability(model, experiment: str) -> dict[str, int]:
     if experiment not in EXPERIMENTS:
         raise ValueError(f"unknown MoPE-new experiment: {experiment}")
     inner = model.model
-    if experiment == "e04a-new":
+    if experiment in {"e04a-new", "e04a-quarter"}:
         # E-04a is a residual adapter on top of the completed E-01 SFT model.
         # Freeze *every* loaded E-01 parameter first (including parameters not
         # covered by GUIDE's tune_mm_* switches), then open only the freshly
@@ -71,7 +71,7 @@ def configure_trainability(model, experiment: str) -> dict[str, int]:
         ),
     }
     trainable_names = [name for name, parameter in model.named_parameters() if parameter.requires_grad]
-    if experiment == "e04a-new":
+    if experiment in {"e04a-new", "e04a-quarter"}:
         invalid_names = [
             name for name in trainable_names
             if not name.startswith("model._mope_projector.")
@@ -85,6 +85,12 @@ def configure_trainability(model, experiment: str) -> dict[str, int]:
                 "invalid E-04a projector-only trainability: "
                 f"counts={counts}, unexpected_trainable={invalid_names[:8]}"
             )
+    elif experiment == "e04b-quarter":
+        # LoRA wrapping freezes the base model; re-open only PEFT adapters and
+        # the MoPE projector.  The hook is installed by train_space.py after
+        # get_peft_model, so this path is checked there at runtime.
+        if counts["encoder"] != 0 or counts["projector"] == 0 or counts["other"] == 0:
+            raise RuntimeError(f"invalid E-04b projector+LoRA trainability: {counts}")
     elif counts["encoder"] != 0 or counts["projector"] == 0 or counts["other"] == 0:
         raise RuntimeError(f"invalid MoPE-new trainability: {counts}")
     return counts
@@ -103,8 +109,8 @@ def main() -> None:
     checkpoint = _arg_value(remaining, "--mope_checkpoint_path")
     if not checkpoint:
         raise ValueError("--mope_checkpoint_path is required for MoPE-new")
-    if Path(checkpoint).name != "checkpoint-50.pth" and os.environ.get("MOPE_NEW_ALLOW_FAKE_CKPT") != "1":
-        raise ValueError(f"MoPE-new requires checkpoint-50.pth, got {checkpoint}")
+    if Path(checkpoint).name not in {"checkpoint-50.pth", "checkpoint-73.pth"} and os.environ.get("MOPE_NEW_ALLOW_FAKE_CKPT") != "1":
+        raise ValueError(f"MoPE-new requires checkpoint-50.pth or checkpoint-73.pth, got {checkpoint}")
     if _arg_value(remaining, "--mope_all_frames", "16") != "16":
         raise ValueError("MoPE-new requires --mope_all_frames 16")
     output_dir = _arg_value(remaining, "--output_dir")
@@ -154,7 +160,7 @@ def main() -> None:
             f"frames=16, sampling=4x4_uniform_segments_rint, input=224, "
             f"position=3d_sincos, pool=temporal, expected_tokens=8"
         )
-        if new_args.mope_new_experiment == "e04a-new":
+        if new_args.mope_new_experiment in {"e04a-new", "e04a-quarter"}:
             base.rank0_print(
                 "[E-04a] SFT-first residual adapter: fresh zero-init CrossAttn, "
                 "gate=False, frozen E-01 backbone, projector-only training."
@@ -182,6 +188,21 @@ def main() -> None:
 
     base._attach_mope_to_model = attach
     base.set_model = set_model_and_verify
+    # LoRA mode bypasses base.set_model; the post-wrap hook lets us enforce the
+    # same freeze contract after PEFT has attached its adapters.
+    def post_lora_trainability(model):
+        if new_args.mope_new_experiment != "e04b-quarter":
+            return
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+        for name, parameter in model.named_parameters():
+            if "lora_" in name.lower():
+                parameter.requires_grad_(True)
+        for parameter in model.model._mope_projector.parameters():
+            parameter.requires_grad_(True)
+        counts = configure_trainability(model, new_args.mope_new_experiment)
+        base.rank0_print(f"[MoPE-new] verified E-04b trainable parameter counts: {counts}")
+    base._mope_new_post_lora_trainability = post_lora_trainability
     data_wrapper._load_mope_frames = load_frames
     data_wrapper._STRICT_MOPE_LOADING = True
     base.train(attn_implementation="flash_attention_2")

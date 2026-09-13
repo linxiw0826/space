@@ -50,6 +50,20 @@ case "${MOPE_NEW_EXPERIMENT}" in
     GRAD_ACCUM="${GRAD_ACCUM:-6}"
     WARMSTART=""
     ;;
+  e04a-quarter)
+    OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_ROOT}/train/mope73_projector_quarter_lr1e5_4b}"
+    GUIDE_CKPT_PATH="${GUIDE_CKPT_PATH:-${OUTPUT_ROOT}/train/baseline_quarter_4b}"
+    TUNE_LLM=False
+    GRAD_ACCUM="${GRAD_ACCUM:-6}"
+    WARMSTART=""
+    ;;
+  e04b-quarter)
+    OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_ROOT}/train/mope73_projector_lora_quarter_lr1e5_4b}"
+    GUIDE_CKPT_PATH="${GUIDE_CKPT_PATH:-${OUTPUT_ROOT}/train/baseline_quarter_4b}"
+    TUNE_LLM=False
+    GRAD_ACCUM="${GRAD_ACCUM:-6}"
+    WARMSTART=""
+    ;;
   *) echo "Unknown MoPE-new experiment: ${MOPE_NEW_EXPERIMENT}" >&2; exit 2 ;;
 esac
 
@@ -138,6 +152,9 @@ COMMAND=(python -m torch.distributed.run "--nproc_per_node=${NPROC_PER_NODE}" "-
   --mope_new_groups 4 --mope_new_frames_per_group 4
   --mope_new_input_size 224 --mope_new_pool_mode temporal
   --group_by_modality_length True)
+if [[ "${MOPE_NEW_EXPERIMENT}" == "e04b-quarter" ]]; then
+  COMMAND+=(--lora_enable True --lora_r 8 --lora_alpha 16 --lora_dropout 0.05)
+fi
 if [[ "${PREDELETE_OLDEST_CHECKPOINT}" == "1" ]]; then
   COMMAND+=(--predelete_oldest_checkpoint True)
 fi
