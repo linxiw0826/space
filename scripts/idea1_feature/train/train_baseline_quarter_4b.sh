@@ -25,6 +25,7 @@ export VSI590K_DATA_ROOT="${VSI590K_DATA_ROOT:-/data2/wlx/data/vsi590k_processed
 OUTPUT_DIR="${OUTPUT_DIR:-${SPACE_OUTPUT_ROOT:-/data2/wlx/output}/train/baseline_quarter_4b}"
 GUIDE_CKPT_PATH="${GUIDE_CKPT_PATH:-${SPACE_OUTPUT_ROOT:-/data2/wlx/output}/train/guide_reproduced/4b}"
 LOG_FILE="${LOG_FILE:-${SPACE_LOG_ROOT:-/data2/wlx/logs}/train/baseline_quarter_4b_$(date +%Y%m%d_%H%M%S).log}"
+RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
 mkdir -p "${OUTPUT_DIR}" "$(dirname "${LOG_FILE}")"
 
 COMMAND=(python -m torch.distributed.run "--nproc_per_node=${NPROC_PER_NODE}" "--master_port=${MASTER_PORT:-29511}"
@@ -45,6 +46,14 @@ COMMAND=(python -m torch.distributed.run "--nproc_per_node=${NPROC_PER_NODE}" "-
   --geometry_encoder_type vggt --geometry_encoder_path "${VGGT_PATH:-/data2/wlx/models/VGGT-1B}"
   --use_mope False --group_by_modality_length True --overwrite_output_dir)
 
-echo "Experiment=baseline-quarter init=${GUIDE_CKPT_PATH} manifest=${VSI590K_SPAR_ANN} lr=${LEARNING_RATE} scheduler=${LR_SCHEDULER_TYPE} effective_batch=$((2*4*6))"
+if [[ -n "${RESUME_FROM_CHECKPOINT}" ]]; then
+  [[ -d "${RESUME_FROM_CHECKPOINT}" ]] || {
+    echo "Resume checkpoint does not exist: ${RESUME_FROM_CHECKPOINT}" >&2
+    exit 2
+  }
+  COMMAND+=(--resume_from_checkpoint "${RESUME_FROM_CHECKPOINT}")
+fi
+
+echo "Experiment=baseline-quarter init=${GUIDE_CKPT_PATH} manifest=${VSI590K_SPAR_ANN} lr=${LEARNING_RATE} scheduler=${LR_SCHEDULER_TYPE} effective_batch=$((2*4*6)) resume=${RESUME_FROM_CHECKPOINT:-none}"
 printf 'COMMAND:'; printf ' %q' "${COMMAND[@]}"; printf '\n'
 exec "${COMMAND[@]}" >"${LOG_FILE}" 2>&1
