@@ -88,7 +88,8 @@ mkdir -p "${OUTPUT_PATH}"
 # Log file — independent log directory, tee'd to stdout
 LOG_DIR=${LOG_DIR:-${SPACE_LOG_ROOT}/eval}
 mkdir -p "${LOG_DIR}"
-LOG_FILE="${LOG_DIR}/e01_vsibench_${MODEL_SIZE}_$(date +%Y%m%d_%H%M%S).log"
+LOG_PREFIX="${LOG_PREFIX:-e01}"
+LOG_FILE="${LOG_DIR}/${LOG_PREFIX}_vsibench_${MODEL_SIZE}_$(date +%Y%m%d_%H%M%S).log"
 
 # GPU configuration
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}

@@ -88,7 +88,8 @@ mkdir -p "${OUTPUT_PATH}"
 # Log file
 LOG_DIR=${LOG_DIR:-${SPACE_LOG_ROOT}/eval}
 mkdir -p "${LOG_DIR}"
-LOG_FILE="${LOG_DIR}/e01_vlm4d_${MODEL_SIZE}_$(date +%Y%m%d_%H%M%S).log"
+LOG_PREFIX="${LOG_PREFIX:-e01}"
+LOG_FILE="${LOG_DIR}/${LOG_PREFIX}_vlm4d_${MODEL_SIZE}_$(date +%Y%m%d_%H%M%S).log"
 
 # GPU configuration
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
