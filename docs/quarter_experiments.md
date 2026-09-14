@@ -27,3 +27,23 @@ final515k 3D-sincos recipe:
 `eval_{baseline,mope73_projector,mope73_projector_lora}_quarter_{vsibench,vlm4d}.sh`.
 They enforce isolated result paths and the PhysBench-posttrained checkpoint for
 MoPE runs. No feature scaling is applied in these experiments.
+
+## Naming and path contract
+
+Training, evaluation, log, and result identifiers must remain aligned:
+
+| experiment | training script | checkpoint | eval scripts |
+|---|---|---|---|
+| `baseline_quarter_4b` | `train_baseline_quarter_4b.sh` | `/data2/wlx/output/train/baseline_quarter_4b` | `eval_baseline_quarter_{vsibench,vlm4d}.sh` |
+| `mope73_projector_quarter_lr1e5_4b` | `train_mope73_projector_quarter_lr1e5.sh` | `/data2/wlx/output/train/mope73_projector_quarter_lr1e5_4b` | `eval_mope73_projector_quarter_{vsibench,vlm4d}.sh` |
+| `mope73_projector_lora_quarter_lr1e5_4b` | `train_mope73_projector_lora_quarter_lr1e5.sh` | `/data2/wlx/output/train/mope73_projector_lora_quarter_lr1e5_4b` | `eval_mope73_projector_lora_quarter_{vsibench,vlm4d}.sh` |
+
+Each eval writes to the matching `/data2/wlx/output/eval/{vsibench,vlm4d}/<experiment>` directory and uses an `<experiment>_*` log prefix. Wrappers must use canonical `/data2/wlx/output` and `/data2/wlx/logs` paths, never a path derived from the source checkout. Quarter wrappers must set the quarter-stratified manifest internally; variables inherited from `activate.sh` must not override explicit checkpoint, output, manifest, or log paths.
+
+Verify before launch:
+
+```bash
+git diff --check
+bash -n scripts/idea1_feature/train/train_*quarter*.sh scripts/idea1_feature/eval/eval_*quarter*.sh
+test -f /data2/wlx/data/vsi590k_processed/vsi590k_spar_590k_quarter_stratified.json
+```
