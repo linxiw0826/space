@@ -47,3 +47,31 @@ git diff --check
 bash -n scripts/idea1_feature/train/train_*quarter*.sh scripts/idea1_feature/eval/eval_*quarter*.sh
 test -f /data2/wlx/data/vsi590k_processed/vsi590k_spar_590k_quarter_stratified.json
 ```
+
+## Final full-LLM adaptation experiment (post-E04a)
+
+After the quarter comparison, the final adaptation experiment uses the **full
+VSI-590K manifest** (`/data2/wlx/data/vsi590k_processed/vsi590k_spar_590k_final515k.json`),
+not the quarter subset. It initializes from the completed E04a
+projector-only checkpoint and keeps the learned MoPE projector fixed. The
+purpose is to measure language-model adaptation alone, so this is deliberately
+**not** the LoRA experiment.
+
+* MoPE encoder: frozen, using
+  `checkpoint-73-posttrain-physbench-fullmope-epoch44.pth`.
+* MoPE projector: frozen at its E04a-trained weights (no further projector
+  updates).
+* Qwen language model: fully unfrozen and trainable, initial learning rate
+  `1e-6`.
+* Vision encoder/VGGT geometry path: frozen as in E04a.
+* One epoch, cosine schedule with warmup ratio `0.03`; retain the established
+  batch/gradient-accumulation settings where memory permits.
+* This run requires a fresh experiment/checkpoint name distinct from the
+  quarter and LoRA runs. Before launch, confirm ZeRO-3 (or equivalent memory
+  sharding) and gradient checkpointing are enabled; four-GPU full-LLM training
+  may otherwise OOM.
+
+The full manifest and final E04a checkpoint must be asserted before launch.
+Evaluation should use the same VSI-Bench and VLM4D task definitions and output
+contracts as the other experiments, with names and paths aligned to the new
+experiment identifier.
