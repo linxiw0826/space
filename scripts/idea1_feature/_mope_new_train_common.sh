@@ -69,6 +69,14 @@ case "${MOPE_NEW_EXPERIMENT}" in
     GRAD_ACCUM="${GRAD_ACCUM:-6}"
     WARMSTART=""
     ;;
+  e05a-full)
+    MOPE_NEW_CKPT="${MOPE_NEW_CKPT:-${QUARTER_MOPE_CKPT}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_ROOT}/train/e05a_mope73_full_llm_4b}"
+    GUIDE_CKPT_PATH="${GUIDE_CKPT_PATH:-${OUTPUT_ROOT}/train/e04a_mope_new_e01_projector_only_4b}"
+    TUNE_LLM=True
+    GRAD_ACCUM="${GRAD_ACCUM:-6}"
+    WARMSTART=""
+    ;;
   *) echo "Unknown MoPE-new experiment: ${MOPE_NEW_EXPERIMENT}" >&2; exit 2 ;;
 esac
 
@@ -150,7 +158,7 @@ COMMAND=(python -m torch.distributed.run "--nproc_per_node=${NPROC_PER_NODE}" "-
   --mope_feed_features True
   --mope_use_gate False --mope_feed_causal_mask False
   --mope_feed_temporal_pe False --load_mope_projector_from_ckpt False
-  --freeze_mope_projector False
+  --freeze_mope_projector "$([[ "${MOPE_NEW_EXPERIMENT}" == "e05a-full" ]] && echo True || echo False)"
   --mope_checkpoint_path "${MOPE_NEW_CKPT}" --mope_all_frames 16
   --mope_new_experiment "${MOPE_NEW_EXPERIMENT}"
   --mope_new_source_root "${MOPE_NEW_SOURCE_ROOT}"

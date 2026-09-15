@@ -37,12 +37,14 @@ case "${MOPE_NEW_EXPERIMENT}" in
   e04a-new) DEFAULT_NAME=e04a_mope_new_e01_projector_only_4b ;;
   e04a-quarter) DEFAULT_NAME=mope73_projector_quarter_lr1e5_4b ;;
   e04b-quarter) DEFAULT_NAME=mope73_projector_lora_quarter_lr1e5_4b ;;
-  *) echo "final515k eval only supports e02c-new/e04a-new; old E-00b/E-03a wrappers are historical" >&2; exit 2 ;;
+  e05a-full) DEFAULT_NAME=e05a_mope73_full_llm_4b ;;
+  *) echo "final515k eval only supports the registered experiments" >&2; exit 2 ;;
 esac
 NAME="${MOPE_NEW_EVAL_NAME:-${DEFAULT_NAME}}"
 if [[ "${NAME}" != "${DEFAULT_NAME}" ]]; then
   [[ "${MOPE_NEW_EXPERIMENT}" == "e04a-new" && "${NAME}" == "e04a_mope_new_e01_projector_only_lr1e4_constant_bs2_diag_4b" ||
      "${MOPE_NEW_EXPERIMENT}" == "e04a-quarter" && "${NAME}" == "mope73_projector_quarter_lr1e5_4b" ||
+     "${MOPE_NEW_EXPERIMENT}" == "e05a-full" && "${NAME}" == "e05a_mope73_full_llm_4b" ||
      "${MOPE_NEW_EXPERIMENT}" == "e04b-quarter" && "${NAME}" == "mope73_projector_lora_quarter_lr1e5_4b" ]] || {
     echo "Unsupported MOPE_NEW_EVAL_NAME override: ${NAME}" >&2
     exit 2
