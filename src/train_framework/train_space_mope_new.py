@@ -200,7 +200,14 @@ def main() -> None:
         for name, parameter in model.named_parameters():
             if "lora_" in name.lower():
                 parameter.requires_grad_(True)
-        for parameter in model.model._mope_projector.parameters():
+        projector = getattr(getattr(model, "model", None), "_mope_projector", None)
+        if projector is None:
+            base = getattr(model, "base_model", None)
+            nested = getattr(getattr(base, "model", None), "model", None)
+            projector = getattr(nested, "_mope_projector", None)
+        if projector is None:
+            raise AttributeError("MoPE projector not found after LoRA wrapping")
+        for parameter in projector.parameters():
             parameter.requires_grad_(True)
         counts = configure_trainability(model, new_args.mope_new_experiment)
         base.rank0_print(f"[MoPE-new] verified E-04b trainable parameter counts: {counts}")

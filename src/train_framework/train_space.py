@@ -76,6 +76,19 @@ _SRC_ROOT = _THIS_DIR.parent
 if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
+
+def _get_mope_projector(model):
+    """Return the projector before or after PEFT wraps the model."""
+    direct = getattr(getattr(model, "model", None), "_mope_projector", None)
+    if direct is not None:
+        return direct
+    base = getattr(model, "base_model", None)
+    nested = getattr(getattr(base, "model", None), "model", None)
+    projector = getattr(nested, "_mope_projector", None)
+    if projector is not None:
+        return projector
+    raise AttributeError("MoPE projector not found on model or PEFT base model")
+
 # ---------------------------------------------------------------------------
 # Imports from GUIDE (unchanged)
 # ---------------------------------------------------------------------------
@@ -930,7 +943,7 @@ def train(attn_implementation="flash_attention_2"):
         # Re-enable MoPEProjector after LoRA wrapping froze everything
         # (unless freeze_mope_projector is set for two-stage training).
         if mope_args.use_mope:
-            projector = model.model._mope_projector
+            projector = _get_mope_projector(model)
             for p in projector.parameters():
                 p.requires_grad = not mope_args.freeze_mope_projector
             _proj_status = "frozen (two-stage)" if mope_args.freeze_mope_projector else "re-enabled"
@@ -955,7 +968,7 @@ def train(attn_implementation="flash_attention_2"):
                 p.requires_grad = False
             # Projector: trainable by default, frozen when freeze_mope_projector is set
             # (Phase 2 two-stage: projector pre-trained in Stage 1, LLM trains in Stage 2).
-            for p in model.model._mope_projector.parameters():
+            for p in _get_mope_projector(model).parameters():
                 p.requires_grad = not mope_args.freeze_mope_projector
             _proj_status = "frozen (two-stage)" if mope_args.freeze_mope_projector else "trainable"
             rank0_print(f"[Space Sensing] MoPEEncoder frozen, MoPEProjector {_proj_status}.")
@@ -990,7 +1003,7 @@ def train(attn_implementation="flash_attention_2"):
             lm_total = sum(p.numel() for p in _lm_mod.parameters()) if _lm_mod else -1
             proj_trainable = -1
             if mope_args.use_mope and hasattr(model.model, "_mope_projector"):
-                proj_trainable = sum(p.numel() for p in model.model._mope_projector.parameters() if p.requires_grad)
+                proj_trainable = sum(p.numel() for p in _get_mope_projector(model).parameters() if p.requires_grad)
             print(
                 f"[Space Sensing DIAG] Trainable params: {trainable_p:,} / {total_p:,}\n"
                 f"  LLM: {lm_trainable:,} / {lm_total:,} trainable\n"
