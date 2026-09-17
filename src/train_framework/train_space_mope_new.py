@@ -16,7 +16,7 @@ from model.mope_new_encoder import (
 )
 
 
-EXPERIMENTS = {"e02c-new", "e04a-new", "e04a-quarter", "e04b-quarter", "e05a-full"}
+EXPERIMENTS = {"e02c-new", "e04a-new", "e04a-quarter", "e04b-quarter", "e05a-full", "e05a-quarter"}
 E04A_PROJECTOR_PARAMETERS = 10_494_976
 FINAL515K_POSTTRAIN_MOPE_BASENAME = "checkpoint-73-posttrain-physbench-fullmope-epoch44.pth"
 
@@ -58,7 +58,7 @@ def configure_trainability(model, experiment: str) -> dict[str, int]:
             parameter.requires_grad_(False)
         for parameter in inner._mope_projector.parameters():
             parameter.requires_grad_(True)
-    elif experiment == "e05a-full":
+    elif experiment in {"e05a-full", "e05a-quarter"}:
         # E-05a adapts the SFT language model to the already learned MoPE
         # representation.  Keep both MoPE modules and the vision tower fixed;
         # only the language model (and lm_head) is updated.
@@ -101,7 +101,7 @@ def configure_trainability(model, experiment: str) -> dict[str, int]:
         # get_peft_model, so this path is checked there at runtime.
         if counts["encoder"] != 0 or counts["projector"] == 0 or counts["other"] == 0:
             raise RuntimeError(f"invalid E-04b projector+LoRA trainability: {counts}")
-    elif experiment == "e05a-full":
+    elif experiment in {"e05a-full", "e05a-quarter"}:
         if counts["encoder"] != 0 or counts["projector"] != 0 or counts["other"] == 0:
             raise RuntimeError(f"invalid E-05a full-LLM trainability: {counts}")
     elif counts["encoder"] != 0 or counts["projector"] == 0 or counts["other"] == 0:

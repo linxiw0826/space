@@ -16,6 +16,7 @@ LOG_DIR="${LOG_DIR:-${SPACE_LOG_ROOT:-${SPACE_ROOT}/logs}/train}"
 MOPE_NEW_SOURCE_ROOT="${MOPE_NEW_SOURCE_ROOT:-${SPACE_ROOT}/refs/mope-jepa-native-final515k}"
 MOPE_NEW_CKPT="${MOPE_NEW_CKPT:-}"
 QUARTER_MOPE_CKPT="/data2/mope-jepa-assets/jepa_checkpoints/native_mope_b_dense8_moe8_top1_shared1_anchor1_final515k_3dpos_ep100_warm3_cos_lr75e6_min25e6/checkpoint-73-posttrain-physbench-fullmope-epoch44.pth"
+QUARTER_MOPE69_CKPT="/data2/mope-jepa-assets/jepa_checkpoints/native_mope_b_dense8_moe8_top1_shared1_anchor1_final515k_3dpos_ep100_warm3_cos_lr75e6_min25e6/checkpoint-69-posttrain-calibrated-epoch28.pth"
 GUIDE_CKPT_PATH="${GUIDE_CKPT_PATH:-}"
 VGGT_PATH="${VGGT_PATH:-/data2/wlx/models/VGGT-1B}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
@@ -54,8 +55,8 @@ case "${MOPE_NEW_EXPERIMENT}" in
     WARMSTART=""
     ;;
   e04a-quarter)
-    MOPE_NEW_CKPT="${MOPE_NEW_CKPT:-${QUARTER_MOPE_CKPT}}"
-    OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_ROOT}/train/mope73_projector_quarter_lr1e5_4b}"
+    MOPE_NEW_CKPT="${MOPE_NEW_CKPT:-${QUARTER_MOPE69_CKPT}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_ROOT}/train/mope69_projector_quarter_lr1e5_4b}"
     GUIDE_CKPT_PATH="${GUIDE_CKPT_PATH:-${OUTPUT_ROOT}/train/baseline_quarter_4b}"
     TUNE_LLM=False
     GRAD_ACCUM="${GRAD_ACCUM:-6}"
@@ -73,6 +74,14 @@ case "${MOPE_NEW_EXPERIMENT}" in
     MOPE_NEW_CKPT="${MOPE_NEW_CKPT:-${QUARTER_MOPE_CKPT}}"
     OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_ROOT}/train/e05a_mope73_full_llm_4b}"
     GUIDE_CKPT_PATH="${GUIDE_CKPT_PATH:-${OUTPUT_ROOT}/train/e04a_mope_new_e01_projector_only_4b}"
+    TUNE_LLM=True
+    GRAD_ACCUM="${GRAD_ACCUM:-6}"
+    WARMSTART=""
+    ;;
+  e05a-quarter)
+    MOPE_NEW_CKPT="${MOPE_NEW_CKPT:-${QUARTER_MOPE69_CKPT}}"
+    OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_ROOT}/train/mope69_full_llm_quarter_4b}"
+    GUIDE_CKPT_PATH="${GUIDE_CKPT_PATH:-${OUTPUT_ROOT}/train/mope69_projector_quarter_lr1e5_4b}"
     TUNE_LLM=True
     GRAD_ACCUM="${GRAD_ACCUM:-6}"
     WARMSTART=""
@@ -174,8 +183,8 @@ if [[ "${MOPE_NEW_EXPERIMENT}" == *-quarter ]]; then
     echo "Quarter experiments require the source-stratified quarter manifest: ${VSI590K_SPAR_ANN}" >&2
     exit 2
   }
-  [[ "$(basename "${MOPE_NEW_CKPT}")" == "checkpoint-73-posttrain-physbench-fullmope-epoch44.pth" ]] || {
-    echo "Quarter MoPE experiments require the PhysBench posttrain checkpoint: ${MOPE_NEW_CKPT}" >&2
+  [[ "$(basename "${MOPE_NEW_CKPT}")" == "checkpoint-69-posttrain-calibrated-epoch28.pth" ]] || {
+    echo "Quarter E04A/E05A experiments require the calibrated MoPE checkpoint: ${MOPE_NEW_CKPT}" >&2
     exit 2
   }
 fi

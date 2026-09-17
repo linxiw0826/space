@@ -17,7 +17,9 @@ ALLOW_MISSING="${MOPE_NEW_ALLOW_MISSING_ASSETS:-0}"
 OUTPUT_ROOT="${SPACE_OUTPUT_ROOT:-${SPACE_ROOT}/output}"
 LOG_DIR="${LOG_DIR:-${SPACE_LOG_ROOT:-${SPACE_ROOT}/logs}/eval}"
 MOPE_NEW_SOURCE_ROOT="${MOPE_NEW_SOURCE_ROOT:-${SPACE_ROOT}/refs/mope-jepa-native-final515k}"
-if [[ "${MOPE_NEW_EXPERIMENT}" == *-quarter || "${MOPE_NEW_EXPERIMENT}" == "e05a-full" ]]; then
+if [[ "${MOPE_NEW_EXPERIMENT}" == "e04a-quarter" || "${MOPE_NEW_EXPERIMENT}" == "e05a-quarter" ]]; then
+  DEFAULT_MOPE_NEW_CKPT=/data2/mope-jepa-assets/jepa_checkpoints/native_mope_b_dense8_moe8_top1_shared1_anchor1_final515k_3dpos_ep100_warm3_cos_lr75e6_min25e6/checkpoint-69-posttrain-calibrated-epoch28.pth
+elif [[ "${MOPE_NEW_EXPERIMENT}" == "e05a-full" ]]; then
   DEFAULT_MOPE_NEW_CKPT=/data2/mope-jepa-assets/jepa_checkpoints/native_mope_b_dense8_moe8_top1_shared1_anchor1_final515k_3dpos_ep100_warm3_cos_lr75e6_min25e6/checkpoint-73-posttrain-physbench-fullmoe-epoch44.pth
 else
   DEFAULT_MOPE_NEW_CKPT=/data2/mope-jepa-assets/jepa_checkpoints/native_mope_b_dense8_moe8_top1_shared1_anchor1_final515k_3dpos_ep100_warm3_cos_lr75e6_min25e6/checkpoint-50.pth
@@ -39,6 +41,7 @@ case "${MOPE_NEW_EXPERIMENT}" in
   e04a-quarter) DEFAULT_NAME=mope73_projector_quarter_lr1e5_4b ;;
   e04b-quarter) DEFAULT_NAME=mope73_projector_lora_quarter_lr1e5_4b ;;
   e05a-full) DEFAULT_NAME=e05a_mope73_full_llm_4b ;;
+  e05a-quarter) DEFAULT_NAME=mope69_full_llm_quarter_4b ;;
   *) echo "final515k VLM4D eval only supports e02c-new/e04a-new; old wrappers are historical" >&2; exit 2 ;;
 esac
 NAME="${MOPE_NEW_EVAL_NAME:-${DEFAULT_NAME}}"
