@@ -19,6 +19,7 @@ from model.mope_new_encoder import (
 EXPERIMENTS = {"e02c-new", "e04a-new", "e04a-quarter", "e04b-quarter", "e05a-full", "e05a-quarter"}
 E04A_PROJECTOR_PARAMETERS = 10_494_976
 FINAL515K_POSTTRAIN_MOPE_BASENAME = "checkpoint-73-posttrain-physbench-fullmope-epoch44.pth"
+FINAL515K_CALIBRATED_MOPE_BASENAME = "checkpoint-69-posttrain-calibrated-epoch28.pth"
 
 
 def _take_new_args(argv: list[str]):
@@ -122,7 +123,12 @@ def main() -> None:
     checkpoint = _arg_value(remaining, "--mope_checkpoint_path")
     if not checkpoint:
         raise ValueError("--mope_checkpoint_path is required for MoPE-new")
-    allowed_checkpoints = {"checkpoint-50.pth", "checkpoint-73.pth", FINAL515K_POSTTRAIN_MOPE_BASENAME}
+    allowed_checkpoints = {
+        "checkpoint-50.pth",
+        "checkpoint-73.pth",
+        FINAL515K_POSTTRAIN_MOPE_BASENAME,
+        FINAL515K_CALIBRATED_MOPE_BASENAME,
+    }
     if Path(checkpoint).name not in allowed_checkpoints and os.environ.get("MOPE_NEW_ALLOW_FAKE_CKPT") != "1":
         raise ValueError(f"MoPE-new requires a verified final515k checkpoint, got {checkpoint}")
     if _arg_value(remaining, "--mope_all_frames", "16") != "16":
