@@ -167,7 +167,7 @@ COMMAND=(python -m torch.distributed.run "--nproc_per_node=${NPROC_PER_NODE}" "-
   --mope_feed_features True
   --mope_use_gate False --mope_feed_causal_mask False
   --mope_feed_temporal_pe False --load_mope_projector_from_ckpt False
-  --freeze_mope_projector "$([[ "${MOPE_NEW_EXPERIMENT}" == "e05a-full" ]] && echo True || echo False)"
+  --freeze_mope_projector "$([[ "${MOPE_NEW_EXPERIMENT}" == "e05a-full" || "${MOPE_NEW_EXPERIMENT}" == "e05a-quarter" ]] && echo True || echo False)"
   --mope_checkpoint_path "${MOPE_NEW_CKPT}" --mope_all_frames 16
   --mope_new_experiment "${MOPE_NEW_EXPERIMENT}"
   --mope_new_source_root "${MOPE_NEW_SOURCE_ROOT}"
