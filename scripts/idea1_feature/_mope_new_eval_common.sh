@@ -27,11 +27,11 @@ MOPE_NEW_CKPT="${MOPE_NEW_CKPT:-${DEFAULT_MOPE_NEW_CKPT}}"
 GUIDE_LMMS_EVAL="${GUIDE_LMMS_EVAL:-${SPACE_ROOT}/src/vendor/lmms-eval}"
 VSIBENCH_VIDEO_ROOT="${VSIBENCH_VIDEO_ROOT:-/data2/wlx/data/VSIBench}"
 VSIBENCH_JSONL="${VSIBENCH_JSONL:-${VSIBENCH_VIDEO_ROOT}/test.jsonl}"
-QUARTER_MANIFEST="${VSI590K_SPAR_ANN:-/data2/wlx/data/vsi590k_processed/vsi590k_spar_590k_quarter_stratified.json}"
+QUARTER_MANIFEST="${MOPE_NEW_SPAR_ANN:-/data2/wlx/data/vsi590k_processed/vsi590k_spar_590k_quarter_stratified.json}"
 export VSIBENCH_VIDEO_ROOT VSIBENCH_JSONL
 if [[ "${MOPE_NEW_EXPERIMENT}" == *-quarter ]]; then
   [[ -f "${QUARTER_MANIFEST}" && "${QUARTER_MANIFEST}" == *quarter_stratified.json ]] || { echo "Quarter eval requires ${QUARTER_MANIFEST}" >&2; exit 2; }
-  [[ "$(basename "${MOPE_NEW_CKPT}")" == "checkpoint-73-posttrain-physbench-fullmope-epoch44.pth" ]] || { echo "Quarter eval requires the PhysBench posttrain checkpoint: ${MOPE_NEW_CKPT}" >&2; exit 2; }
+  [[ "$(basename "${MOPE_NEW_CKPT}")" == "checkpoint-69-posttrain-calibrated-epoch28.pth" ]] || { echo "Quarter eval requires the calibrated MoPE checkpoint: ${MOPE_NEW_CKPT}" >&2; exit 2; }
 fi
 
 case "${MOPE_NEW_EXPERIMENT}" in
