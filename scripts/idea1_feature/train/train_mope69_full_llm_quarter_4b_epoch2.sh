@@ -8,9 +8,15 @@ MOPE_NEW_SPAR_ANN="${MOPE_NEW_SPAR_ANN:-/data2/wlx/data/vsi590k_processed/vsi590
 # with a fresh optimizer/LR schedule, equivalent in effect to a 2nd epoch.
 EPOCH1_OUTPUT_DIR="${EPOCH1_OUTPUT_DIR:-/data2/wlx/output/train/mope69_full_llm_quarter_4b}"
 if [[ -z "${GUIDE_CKPT_PATH:-}" ]]; then
-  LATEST_EPOCH1_CKPT="$(ls -d "${EPOCH1_OUTPUT_DIR}"/checkpoint-* 2>/dev/null | sort -t- -k2 -n | tail -1)"
-  [[ -n "${LATEST_EPOCH1_CKPT}" ]] || { echo "No checkpoint-* found under ${EPOCH1_OUTPUT_DIR}; set GUIDE_CKPT_PATH explicitly" >&2; exit 2; }
-  GUIDE_CKPT_PATH="${LATEST_EPOCH1_CKPT}"
+  if [[ -f "${EPOCH1_OUTPUT_DIR}/preprocessor_config.json" && -f "${EPOCH1_OUTPUT_DIR}/config.json" ]]; then
+    # Training finished; the final HF-format save (with processor/tokenizer files)
+    # lives at the output_dir root, not in a checkpoint-N subdir.
+    GUIDE_CKPT_PATH="${EPOCH1_OUTPUT_DIR}"
+  else
+    LATEST_EPOCH1_CKPT="$(ls -d "${EPOCH1_OUTPUT_DIR}"/checkpoint-* 2>/dev/null | sort -t- -k2 -n | tail -1)"
+    [[ -n "${LATEST_EPOCH1_CKPT}" ]] || { echo "No completed run or checkpoint-* found under ${EPOCH1_OUTPUT_DIR}; set GUIDE_CKPT_PATH explicitly" >&2; exit 2; }
+    GUIDE_CKPT_PATH="${LATEST_EPOCH1_CKPT}"
+  fi
 fi
 OUTPUT_DIR="${OUTPUT_DIR:-/data2/wlx/output/train/mope69_full_llm_quarter_4b_epoch2}"
 MOPE_NEW_EXPERIMENT=e05a-quarter
