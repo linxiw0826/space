@@ -48,6 +48,7 @@ if [[ "${NAME}" != "${DEFAULT_NAME}" ]]; then
   [[ "${MOPE_NEW_EXPERIMENT}" == "e04a-new" && "${NAME}" == "e04a_mope_new_e01_projector_only_lr1e4_constant_bs2_diag_4b" ||
      "${MOPE_NEW_EXPERIMENT}" == "e04a-quarter" && "${NAME}" == "mope73_projector_quarter_lr1e5_4b" ||
      "${MOPE_NEW_EXPERIMENT}" == "e05a-full" && "${NAME}" == "e05a_mope73_full_llm_4b" ||
+     "${MOPE_NEW_EXPERIMENT}" == "e05a-quarter" && "${NAME}" == "e05_quarter_epoch2" ||
      "${MOPE_NEW_EXPERIMENT}" == "e04b-quarter" && "${NAME}" == "mope73_projector_lora_quarter_lr1e5_4b" ]] || {
     echo "Unsupported MOPE_NEW_EVAL_NAME override: ${NAME}" >&2
     exit 2
