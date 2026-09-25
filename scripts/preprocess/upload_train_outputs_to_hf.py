@@ -28,6 +28,14 @@ EXCLUDE_PATTERNS = [
     "*.work.*",
     "*.staged.*",
     "*.backup.*",
+    # DeepSpeed ZeRO native checkpoint shards — raw optimizer/model state used
+    # only to resume training, duplicates of the HF-format safetensors weights
+    # and typically far larger (fp32 optimizer moments, per-rank shards).
+    "*optim_states.pt",
+    "*model_states.pt",
+    "global_step*/**",
+    "latest",
+    "zero_to_fp32.py",
 ]
 
 
