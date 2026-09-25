@@ -79,6 +79,7 @@ def main() -> None:
                     "video_path": video_path,
                     "question_type": c["question_type"],
                     "question": c["question"],
+                    "options": c.get("options"),
                     "ground_truth": gt,
                     "correct_model_prediction": c["prediction"],
                     "wrong_model_prediction": w["prediction"],
@@ -95,6 +96,10 @@ def main() -> None:
         print(f"--- case {i} (doc_id={case['doc_id']}, type={case['question_type']}) ---")
         print(f"video: {case['video_path']}")
         print(f"question: {case['question']}")
+        if case["options"]:
+            print("options:")
+            for opt in case["options"]:
+                print(f"  {opt}")
         print(f"ground_truth: {case['ground_truth']}")
         print(f"correct model prediction: {case['correct_model_prediction']}")
         print(f"wrong model prediction: {case['wrong_model_prediction']}")
